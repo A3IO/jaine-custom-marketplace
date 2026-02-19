@@ -1,0 +1,61 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "jaine-custom",
+  "description": "JAINE custom plugins - vendor analysis, automation, and AI workflows",
+  "owner": {
+    "name": "JAINE",
+    "email": "jaine@local"
+  },
+  "plugins": [
+    {
+      "name": "vendor-analyzer",
+      "description": "Exhaustive vendor codebase analysis with 5-agent pipeline generating Obsidian-compatible documentation vault",
+      "author": {
+        "name": "JAINE",
+        "email": "jaine@local"
+      },
+      "source": "./plugins/vendor-analyzer",
+      "category": "development"
+    },
+    {
+      "name": "git-workflow",
+      "description": "Git workflow automation with skills: changelog generation (ISO 8601, clickable links, code verification, Mermaid diagrams)",
+      "author": {
+        "name": "JAINE",
+        "email": "jaine@local"
+      },
+      "source": "./plugins/git-workflow",
+      "category": "development"
+    },
+    {
+      "name": "jhookify",
+      "description": "Enhanced hookify: Claude-visible warnings (additionalContext), block reasons (permissionDecisionReason), global rules, UserPromptSubmit fixes",
+      "author": {
+        "name": "JAINE",
+        "email": "jaine@local"
+      },
+      "source": "./plugins/jhookify",
+      "category": "development"
+    },
+    {
+      "name": "ask",
+      "description": "Track and query industry experts — news aggregation, Q&A from public sources, configurable search sequences",
+      "author": {
+        "name": "JAINE",
+        "email": "jaine@local"
+      },
+      "source": "./plugins/ask",
+      "category": "research"
+    },
+    {
+      "name": "claude-light",
+      "description": "Lightweight Claude Code launcher with task picker — cl (minimal) and clp (with plugins) shell commands",
+      "author": {
+        "name": "JAINE",
+        "email": "jaine@local"
+      },
+      "source": "./plugins/claude-light",
+      "category": "utilities"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "ask",
+  "version": "0.1.1",
+  "description": "Track and query industry experts — news aggregation, Q&A from public sources, configurable search sequences",
+  "author": {
+    "name": "JAINE",
+    "email": "jaine@local"
+  }
+}

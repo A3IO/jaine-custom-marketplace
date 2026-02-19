@@ -1,0 +1,16 @@
+# === Assembly branch .gitignore ===
+# This branch contains assembled plugins (not worktree mounts)
+
+# === OS / IDE ===
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+
+# === Tools ===
+.serena/

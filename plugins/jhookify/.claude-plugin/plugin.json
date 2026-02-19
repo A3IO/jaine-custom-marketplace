@@ -1,0 +1,9 @@
+{
+  "name": "jhookify",
+  "version": "1.0.0",
+  "description": "Enhanced hookify with Claude-visible warnings (additionalContext), block reasons (permissionDecisionReason), global rules support, and UserPromptSubmit bug fixes. Fork of hookify by JAINE.",
+  "author": {
+    "name": "JAINE",
+    "email": "jaine@local"
+  }
+}

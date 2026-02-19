@@ -1,0 +1,9 @@
+{
+  "name": "git-workflow",
+  "version": "1.8.1",
+  "description": "Git workflow automation with skills: changelog generation (ISO 8601 filenames, clickable Issue/PR links, code verification, numstat validation, issue/PR distinction, Mermaid diagrams). Russian by default.",
+  "author": {
+    "name": "JAINE",
+    "email": "jaine@local"
+  }
+}

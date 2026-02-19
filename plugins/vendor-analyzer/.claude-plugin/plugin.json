@@ -1,0 +1,9 @@
+{
+  "name": "vendor-analyzer",
+  "version": "0.1.1",
+  "description": "Exhaustive vendor codebase analysis with 5-agent pipeline. Generates Obsidian-compatible documentation vault with modules, dependencies, algorithms, and executive summary.",
+  "author": {
+    "name": "JAINE",
+    "email": "jaine@local"
+  }
+}

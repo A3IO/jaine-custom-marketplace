@@ -1,0 +1,9 @@
+{
+  "name": "claude-light",
+  "version": "1.1.0",
+  "description": "Lightweight Claude Code launcher with task picker — cl (minimal) and clp (with plugins)",
+  "author": {
+    "name": "JAINE",
+    "email": "jaine@local"
+  }
+}
