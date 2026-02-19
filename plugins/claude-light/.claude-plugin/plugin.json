@@ -1,7 +1,7 @@
 {
   "name": "claude-light",
-  "version": "1.1.0",
-  "description": "Lightweight Claude Code launcher with task picker — cl (minimal) and clp (with plugins)",
+  "version": "2026.02.20",
+  "description": "Lightweight Claude Code launcher with task picker \u2014 cl (minimal) and clp (with plugins)",
   "author": {
     "name": "JAINE",
     "email": "jaine@local"
