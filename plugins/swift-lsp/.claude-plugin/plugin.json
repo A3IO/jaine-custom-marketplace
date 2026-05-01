@@ -1,0 +1,12 @@
+{
+  "name": "swift-lsp",
+  "version": "2026.05.01",
+  "description": "Swift/Objective-C language server (sourcekit-lsp) for code intelligence",
+  "author": {
+    "name": "JAINE",
+    "email": "jaine@local"
+  },
+  "repository": "https://github.com/swiftlang/sourcekit-lsp",
+  "license": "Apache-2.0",
+  "keywords": ["swift", "objective-c", "lsp", "language-server", "sourcekit"]
+}
