@@ -3,7 +3,9 @@
         "command": "sourcekit-lsp",
         "args": [],
         "extensionToLanguage": {
-            ".swift": "swift"
+            ".swift": "swift",
+            ".m": "objective-c",
+            ".mm": "objective-cpp"
         },
         "transport": "stdio",
         "initializationOptions": {},
