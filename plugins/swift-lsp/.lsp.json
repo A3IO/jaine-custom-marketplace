@@ -5,7 +5,9 @@
         "extensionToLanguage": {
             ".swift": "swift",
             ".m": "objective-c",
-            ".mm": "objective-cpp"
+            ".mm": "objective-cpp",
+            ".h": "objective-c",
+            ".c": "c"
         },
         "transport": "stdio",
         "initializationOptions": {},
