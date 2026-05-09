@@ -1,6 +1,6 @@
 {
   "name": "adversarial-review",
-  "version": "0.1.0",
+  "version": "2026.05.09.1",
   "description": "Iterative adversarial review loop with external AI reviewer (Codex CLI) — verify, fix, repeat until GO",
   "author": {
     "name": "JAINE",

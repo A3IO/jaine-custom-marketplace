@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Update .adversarial-review/state.json after a round completes."""
 import json
+import os
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
@@ -19,8 +20,8 @@ def main():
     depth = sys.argv[7] if len(sys.argv) > 7 else "standard"
     reviewer = sys.argv[8] if len(sys.argv) > 8 else "codex/gpt-5.5"
 
-    state_dir = Path(".adversarial-review")
-    state_dir.mkdir(exist_ok=True)
+    state_dir = Path(os.environ.get("ADVERSARIAL_REVIEW_DIR", ".adversarial-review"))
+    state_dir.mkdir(parents=True, exist_ok=True)
     state_file = state_dir / "state.json"
 
     if state_file.exists():

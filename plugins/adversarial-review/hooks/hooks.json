@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo \"$(date -Iseconds) | event=invoke | round=0 | artifact= | verdict= | findings=0 | fixed=0 | fp=0 | reviewer= | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)\" >> ~/.adversarial-review.log"
+            "command": "echo \"$(date -Iseconds) | event=invoke | round=0 | artifact= | verdict= | findings=0 | fixed=0 | fp=0 | reviewer= | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)\" >> ~/.claude/hooks/adversarial-review.log"
           }
         ]
       }

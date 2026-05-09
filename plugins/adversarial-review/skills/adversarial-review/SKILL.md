@@ -16,15 +16,27 @@ Proven: 37 real issues found in 7 rounds, 0 false positives.
 - Documentation claims before publishing (are facts verified?)
 - Any artifact where "wrong = costly" and a second opinion helps
 
-**Do NOT use for:** Quick questions, trivial edits, code that has tests covering it.
+**Do NOT use for:** Quick questions, trivial edits, code that has tests covering it, free-form prompts without a concrete artifact.
+
+## Artifact Types
+
+The artifact must be something codex can read from the filesystem and something you can fix between rounds:
+
+| Type | Example | Review dir name |
+|------|---------|-----------------|
+| File | `docs/specs/auth-design.md` | `{session}-auth-design` |
+| Directory | `src/gateway/` | `{session}-gateway` |
+| Git diff | current branch changes | `{session}-diff-{branch}` |
+
+Free-form prompts without a file/dir/diff are NOT supported — the iterative fix→re-review loop requires a concrete artifact.
 
 ## Depth Levels
 
-| Level | Max rounds | When |
-|-------|-----------|------|
-| `quick` | 1 | Sanity check, low stakes |
-| `standard` | 3 | Normal work, moderate stakes |
-| `exhaustive` | until GO (cap 10) | High stakes, spec drives automation |
+| Level | Max rounds | Reviewer prompt style | When |
+|-------|-----------|----------------------|------|
+| `quick` | 1 | "BLOCKERS only" from round 1 | Sanity check, low stakes |
+| `standard` | 3 | Round 1 wide, rounds 2-3 "BLOCKERS only" | Normal work, moderate stakes |
+| `exhaustive` | until GO (cap 10) | Round 1 wide, rest "BLOCKERS only" | High stakes, spec drives automation |
 
 Default: `standard`. Override via argument: `/adversarial-review exhaustive`
 
@@ -33,17 +45,17 @@ Default: `standard`. Override via argument: `/adversarial-review exhaustive`
 ```dot
 digraph review_loop {
   rankdir=TB;
-  "Capture baseline state" -> "Send to reviewer";
-  "Send to reviewer" -> "Parse findings";
-  "Parse findings" -> "GO verdict?" [label=""];
+  "Setup review dir" -> "Send to reviewer";
+  "Send to reviewer" -> "Read verdict file";
+  "Read verdict file" -> "GO verdict?" [label=""];
   "GO verdict?" -> "Done — log summary" [label="yes"];
   "GO verdict?" -> "Verify each finding\nempirically in code" [label="no"];
   "Verify each finding\nempirically in code" -> "Real or false positive?";
   "Real or false positive?" -> "Fix confirmed issues" [label="real"];
   "Real or false positive?" -> "Note as false positive" [label="false"];
-  "Fix confirmed issues" -> "Commit fixes";
-  "Note as false positive" -> "Commit fixes";
-  "Commit fixes" -> "Round < max?" [label=""];
+  "Fix confirmed issues" -> "Commit + log round";
+  "Note as false positive" -> "Commit + log round";
+  "Commit + log round" -> "Round < max?" [label=""];
   "Round < max?" -> "Send to reviewer" [label="yes"];
   "Round < max?" -> "Report: max rounds hit" [label="no"];
 }
@@ -51,30 +63,35 @@ digraph review_loop {
 
 ### Step-by-step
 
-**1. Setup** — create state file, capture baseline:
+**1. Setup** — create per-review directory using session ID + artifact name:
 ```bash
-mkdir -p .adversarial-review
-echo '{"round":0,"artifact":"","findings_total":0,"fixed_total":0,"false_positives":0,"history":[]}' > .adversarial-review/state.json
+SESSION="${CLAUDE_CODE_SESSION_ID:0:8}"
+ARTIFACT_NAME=$(basename "$ARTIFACT_PATH" .md)  # or dirname, or branch name for diff
+REVIEW_DIR=".adversarial-review/${SESSION}-${ARTIFACT_NAME}"
+mkdir -p "$REVIEW_DIR"
 ```
 
-**2. Send to reviewer** — use `codex exec` with read-only sandbox:
+Each review gets its own isolated directory — no collisions between sessions or artifacts.
+
+**2. Send to reviewer** — use `codex exec` with `-o` to capture clean verdict:
 ```bash
-codex exec -s read-only -C "$(git rev-parse --show-toplevel)" \
-  "Round N review. Read <ARTIFACT_PATH>. [CONTEXT]. GO/NO-GO — BLOCKERS only." \
-  2>&1 | tee .adversarial-review/last-review.txt
+codex exec -s read-only \
+  -o "${REVIEW_DIR}/verdict-r${ROUND}.txt" \
+  -C "$(git rev-parse --show-toplevel)" \
+  "Round $ROUND review. Read <ARTIFACT_PATH>. [CONTEXT]. GO/NO-GO — BLOCKERS only." \
+  > "${REVIEW_DIR}/full-r${ROUND}.txt" 2>&1
 ```
 
-Key rules for the prompt:
-- Tell the reviewer what round this is
-- Give context about what was fixed since last round
-- Ask for GO/NO-GO verdict
-- Say "BLOCKERS only" to avoid style bikeshedding
-- Use `-C` to set correct working directory (avoid wrong-cwd false NO-GO)
+- `verdict-r{N}.txt` — clean final answer only (via `-o` flag). **Read this.**
+- `full-r{N}.txt` — complete output with all tool calls (for debugging only)
 
-**3. Parse findings** — extract from reviewer output:
-- Find the final `codex` response block (last occurrence of `^codex$` marker in output)
-- Extract verdict (GO / NO-GO)
-- Extract numbered findings with severity
+**Do NOT parse `full-r{N}.txt` for the verdict.** The `-o` flag gives you clean output directly.
+
+**3. Read verdict** — just read the clean file:
+```bash
+Read "${REVIEW_DIR}/verdict-r${ROUND}.txt"
+```
+Extract: verdict (GO / NO-GO) and numbered findings with severity.
 
 **4. Verify each finding** — use `/receiving-code-review` discipline:
 - For each finding, run the specific command or grep that would confirm/deny it
@@ -95,64 +112,49 @@ Key rules for the prompt:
 docs: artifact-name vN+1 (Mth review, K findings fixed)
 ```
 
-**6. Update state** — append round to history:
-```json
-{"round": 3, "verdict": "NO-GO", "findings": 2, "fixed": 2, "false_positives": 0}
+**6. Log round + update state** — one command does both:
+```bash
+ADVERSARIAL_REVIEW_DIR="$REVIEW_DIR" \
+"${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/scripts/log-round.sh" \
+  "$ROUND" "$ARTIFACT" "$VERDICT" "$FINDINGS" "$FIXED" "$FP" "$REVIEWER"
 ```
+`ADVERSARIAL_REVIEW_DIR` tells the script which per-review dir to write `state.json` into. Must match the dir from step 1.
+You MUST call this AFTER EVERY round (not just the last one).
 
 **7. Loop or stop:**
 - Verdict GO → done, write summary
 - Round < max → go to step 2
 - Round = max → report "max rounds reached, N open findings remain"
 
-### Resuming a prior session
+### Resuming a prior codex session
 
-If codex supports session resume (`codex exec resume --last`), prefer resuming — the reviewer retains context from prior rounds. If it starts from a different cwd or stale checkout, start a fresh session instead.
+If codex supports session resume (`codex exec resume --last`), prefer resuming — the reviewer retains context from prior rounds. If it starts from a different cwd or stale checkout, start a fresh session instead. Use `-o` with resume too.
 
-## State File
+## Review Directory Layout
 
-`.adversarial-review/state.json` — managed by Claude, not the user:
-
-```json
-{
-  "round": 3,
-  "artifact": "docs/specs/auth-design.md",
-  "depth": "standard",
-  "started_at": "2026-05-09T10:30:00Z",
-  "reviewer": "codex/gpt-5.5",
-  "findings_total": 15,
-  "fixed_total": 13,
-  "false_positives": 2,
-  "history": [
-    {"round": 1, "verdict": "NO-GO", "findings": 8, "fixed": 7, "fp": 1},
-    {"round": 2, "verdict": "NO-GO", "findings": 5, "fixed": 4, "fp": 1},
-    {"round": 3, "verdict": "GO", "findings": 0, "fixed": 0, "fp": 0}
-  ]
-}
+```
+.adversarial-review/                        # gitignore this entire dir
+  bf5a38d6-auth-design/                     # session prefix + artifact
+    state.json                              # round state (managed by scripts)
+    verdict-r1.txt                          # clean codex answer round 1
+    verdict-r2.txt                          # clean codex answer round 2
+    full-r1.txt                             # full codex output (debug)
+    full-r2.txt
+  e34e20d7-preset-name-storage/             # different session, different artifact
+    state.json
+    verdict-r1.txt
 ```
 
 ## Logging
 
-**Deterministic log file:** `~/.adversarial-review.log`
+**Deterministic log file:** `~/.claude/hooks/adversarial-review.log`
 
 Every round appends one line (append-only, never truncated):
 ```
-2026-05-09T10:30:00+03:00 | round=1 | artifact=docs/specs/auth.md | verdict=NO-GO | findings=8 | fixed=7 | fp=1 | reviewer=codex/gpt-5.5 | project=/path/to/repo
+2026-05-09T10:30:00+03:00 | session=bf5a38d6 | round=1 | artifact=docs/specs/auth.md | verdict=NO-GO | findings=8 | fixed=7 | fp=1 | reviewer=codex/gpt-5.5 | project=/path/to/repo
 ```
 
-Write this AFTER each round completes using the bundled script:
-```bash
-"${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/scripts/log-round.sh" \
-  "$ROUND" "$ARTIFACT" "$VERDICT" "$FINDINGS" "$FIXED" "$FP" "$REVIEWER"
-```
-
-Then update state:
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/adversarial-review/scripts/update-state.py" \
-  "$ROUND" "$VERDICT" "$FINDINGS" "$FIXED" "$FP" "$ARTIFACT" "$DEPTH" "$REVIEWER"
-```
-
-To review history: `column -t -s'|' ~/.adversarial-review.log`
+To review history: `column -t -s'|' ~/.claude/hooks/adversarial-review.log`
 
 ## Configuration
 
@@ -188,7 +190,7 @@ would cause runtime failures or incorrect results. Style is not a blocker.
 
 ### Final (after GO)
 ```
-(No more prompts. Write summary to state file and log.)
+(No more prompts. Log final round and write summary.)
 ```
 
 ## Common Mistakes
@@ -197,11 +199,12 @@ would cause runtime failures or incorrect results. Style is not a blocker.
 |---------|-----|
 | Trusting reviewer blindly | Verify EVERY finding with grep/read/run before fixing |
 | Not using `-C` flag | Codex may run from wrong directory → false NO-GO |
-| Inlining full codex output | Write to file, read selectively (output can be 100K+) |
+| Parsing full output instead of `-o` | Use `-o verdict-rN.txt` — clean answer, zero parsing |
 | Fixing style issues | Tell reviewer "BLOCKERS only" — style is noise |
 | Stopping after round 1 | Round 1 typically finds 30-50% of issues; iterate |
 | Not committing between rounds | Reviewer needs to see the updated file |
-| Losing state on compaction | State is in `.adversarial-review/state.json`, not memory |
+| Losing state on compaction | State is in review dir, not conversation memory |
+| Not calling log-round.sh every round | State becomes incomplete — call EVERY round |
 
 ## Red Flags — STOP and Reassess
 
@@ -209,6 +212,7 @@ would cause runtime failures or incorrect results. Style is not a blocker.
 - Same finding reappears after you "fixed" it (your fix was wrong — re-verify)
 - Round > 5 with new HIGH findings each time (artifact may need redesign, not patching)
 - Reviewer output is empty or errors (check `codex --version`, network, rate limits)
+- `verdict-rN.txt` is empty (codex crashed or `-o` path wrong)
 
 ## Integration with Other Skills
 
