@@ -66,6 +66,16 @@
       },
       "source": "./plugins/swift-lsp",
       "category": "development"
+    },
+    {
+      "name": "adversarial-review",
+      "description": "Iterative adversarial review loop with external AI reviewer (Codex CLI) — verify, fix, repeat until GO",
+      "author": {
+        "name": "JAINE",
+        "email": "jaine@local"
+      },
+      "source": "./plugins/adversarial-review",
+      "category": "development"
     }
   ]
 }
