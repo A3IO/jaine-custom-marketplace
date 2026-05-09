@@ -14,9 +14,9 @@ LOG_FILE="${BULLDOZER_LOG:-$HOME/.claude/hooks/bulldozer.log}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPTH="${BULLDOZER_DEPTH:-standard}"
 
-echo "$(date -Iseconds) | session=${SESSION:-unknown} | round=${ROUND} | artifact=${ARTIFACT} | verdict=${VERDICT} | findings=${FINDINGS} | fixed=${FIXED} | fp=${FP} | reviewer=${REVIEWER} | project=${PROJECT}" >> "$LOG_FILE"
-
 BULLDOZER_REVIEW_DIR="${BULLDOZER_REVIEW_DIR:-.bulldozer}" \
 python3 "$SCRIPT_DIR/update-state.py" \
     "$ROUND" "$VERDICT" "$FINDINGS" "$FIXED" "$FP" "$ARTIFACT" "$DEPTH" "$REVIEWER" \
     > /dev/null
+
+echo "$(date -Iseconds) | session=${SESSION:-unknown} | round=${ROUND} | artifact=${ARTIFACT} | verdict=${VERDICT} | findings=${FINDINGS} | fixed=${FIXED} | fp=${FP} | reviewer=${REVIEWER} | project=${PROJECT}" >> "$LOG_FILE"
