@@ -39,23 +39,13 @@
     },
     {
       "name": "ask",
-      "description": "Track and query industry experts \u2014 news aggregation, Q&A from public sources, configurable search sequences",
+      "description": "Track and query industry experts — news aggregation, Q&A from public sources, configurable search sequences",
       "author": {
         "name": "JAINE",
         "email": "jaine@local"
       },
       "source": "./plugins/ask",
       "category": "research"
-    },
-    {
-      "name": "claude-light",
-      "description": "Lightweight Claude Code launcher with task picker \u2014 cl (minimal) and clp (with plugins) shell commands",
-      "author": {
-        "name": "JAINE",
-        "email": "jaine@local"
-      },
-      "source": "./plugins/claude-light",
-      "category": "utilities"
     },
     {
       "name": "swift-lsp",
