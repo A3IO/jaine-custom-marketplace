@@ -68,13 +68,13 @@
       "category": "development"
     },
     {
-      "name": "adversarial-review",
+      "name": "bulldozer",
       "description": "Iterative adversarial review loop with external AI reviewer (Codex CLI) — verify, fix, repeat until GO",
       "author": {
         "name": "JAINE",
         "email": "jaine@local"
       },
-      "source": "./plugins/adversarial-review",
+      "source": "./plugins/bulldozer",
       "category": "development"
     }
   ]
