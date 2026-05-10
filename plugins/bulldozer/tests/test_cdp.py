@@ -156,6 +156,194 @@ def test_f6_cdp_error_responses_checked():
     raise AssertionError("ws_send function not found in cdp.py")
 
 
+# ── NEW: AppleScript fallback and multi-channel tests ──
+
+
+def test_has_websocket_detection():
+    """has_websocket() must exist and return bool."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def has_websocket" in source, "Missing has_websocket() function"
+    assert "HAS_WEBSOCKET" in source, "Missing HAS_WEBSOCKET cache variable"
+
+
+def test_channel_function_exists():
+    """channel() must return 'cdp' or 'applescript'."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def channel()" in source, "Missing channel() function"
+    assert '"cdp"' in source and '"applescript"' in source, (
+        "channel() must return 'cdp' or 'applescript'"
+    )
+
+
+def test_applescript_bridge_exists():
+    """as_js_main_world() must exist for DOM injection bridge."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def as_js_main_world" in source, "Missing as_js_main_world() function"
+    assert "createElement" in source, (
+        "as_js_main_world must use DOM injection (createElement script)"
+    )
+    assert "dataset" in source, (
+        "as_js_main_world must read result via dataset (DOM bridge)"
+    )
+
+
+def test_native_screenshot_exists():
+    """native_screenshot() must exist for macOS screencapture fallback."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def native_screenshot" in source, "Missing native_screenshot() function"
+    assert "screencapture" in source, "native_screenshot must use macOS screencapture"
+
+
+def test_screenshot_has_fallback():
+    """cmd_screenshot must try native screenshot when websocket unavailable."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_screenshot":
+            func_src = "\n".join(source.splitlines()[node.lineno - 1 : node.end_lineno])
+            assert "native_screenshot" in func_src, (
+                "cmd_screenshot must fallback to native_screenshot when websocket unavailable"
+            )
+            assert "has_websocket" in func_src, (
+                "cmd_screenshot must check has_websocket() to decide channel"
+            )
+            return
+    raise AssertionError("cmd_screenshot function not found")
+
+
+def test_cmd_click_exists():
+    """click command must exist."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def cmd_click" in source, "Missing cmd_click() function"
+    assert '"click"' in source and "cmd_click" in source, "click not in COMMANDS dict"
+
+
+def test_cmd_fill_exists():
+    """fill command must exist."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def cmd_fill" in source, "Missing cmd_fill() function"
+    assert '"fill"' in source and "cmd_fill" in source, "fill not in COMMANDS dict"
+
+
+def test_cmd_fill_dispatches_events():
+    """fill must dispatch input+change events for React/Vue compatibility."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "dispatchEvent" in source, "cmd_fill must dispatch DOM events after setting value"
+    assert "input" in source and "change" in source, (
+        "cmd_fill must dispatch both 'input' and 'change' events"
+    )
+
+
+def test_cmd_console_exists():
+    """console command must exist."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def cmd_console" in source, "Missing cmd_console()"
+    assert '"console"' in source and "cmd_console" in source, "console not in COMMANDS"
+
+
+def test_cmd_network_exists():
+    """network command must exist."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def cmd_network" in source, "Missing cmd_network()"
+    assert '"network"' in source and "cmd_network" in source, "network not in COMMANDS"
+
+
+def test_cmd_pdf_exists():
+    """pdf command must exist."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def cmd_pdf" in source, "Missing cmd_pdf()"
+    assert "printToPDF" in source, "cmd_pdf must use Page.printToPDF CDP method"
+
+
+def test_cmd_viewport_exists():
+    """viewport command must exist."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def cmd_viewport" in source, "Missing cmd_viewport()"
+
+
+def test_cmd_window_exists():
+    """window command must exist with bounds/upper/lower/activate."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def cmd_window" in source, "Missing cmd_window()"
+    for action in ["bounds", "upper", "lower", "activate"]:
+        assert '"{}"'.format(action) in source, (
+            "cmd_window must handle '{}' action".format(action)
+        )
+
+
+def test_status_shows_channel():
+    """status must report which channel (cdp/applescript) is active."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_status":
+            func_src = "\n".join(source.splitlines()[node.lineno - 1 : node.end_lineno])
+            assert "channel" in func_src, (
+                "cmd_status must show active channel (cdp or applescript)"
+            )
+            return
+    raise AssertionError("cmd_status function not found")
+
+
+def test_all_commands_registered():
+    """All 17 commands must be in COMMANDS dict."""
+    expected = {
+        "status", "tabs", "screenshot", "js", "navigate", "open",
+        "title", "html", "reload", "wait", "click", "fill",
+        "console", "network", "pdf", "viewport", "window",
+    }
+    source = Path(CDP_SCRIPT).read_text()
+    for cmd in expected:
+        assert '"{}"'.format(cmd) in source, (
+            "'{}' not found in COMMANDS dict".format(cmd)
+        )
+
+
+def test_log_includes_channel():
+    """Log entries must include channel= field."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert 'channel=' in source, "Log calls must include channel= for analytics"
+
+
+def test_js_fallback_to_applescript():
+    """cmd_js must fallback to as_js_main_world when websocket unavailable."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_js":
+            func_src = "\n".join(source.splitlines()[node.lineno - 1 : node.end_lineno])
+            assert "as_js_main_world" in func_src, (
+                "cmd_js must fallback to as_js_main_world when websocket unavailable"
+            )
+            assert "has_websocket" in func_src, (
+                "cmd_js must check has_websocket() to decide channel"
+            )
+            return
+    raise AssertionError("cmd_js function not found")
+
+
+def test_navigate_fallback_to_applescript():
+    """cmd_navigate must fallback to AppleScript when websocket unavailable."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_navigate":
+            func_src = "\n".join(source.splitlines()[node.lineno - 1 : node.end_lineno])
+            assert "as_navigate" in func_src or "has_websocket" in func_src, (
+                "cmd_navigate must fallback to AppleScript"
+            )
+            return
+    raise AssertionError("cmd_navigate function not found")
+
+
+def test_help_shows_all_commands():
+    """--help must list all 17 commands."""
+    r = run_cdp(["--help"])
+    for cmd in ["screenshot", "js", "click", "fill", "console", "network",
+                 "pdf", "viewport", "window"]:
+        assert cmd in r.stdout, f"--help missing '{cmd}' command"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = failed = 0

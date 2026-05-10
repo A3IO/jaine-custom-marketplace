@@ -1,120 +1,144 @@
 ---
 name: look
-description: Use when you need to see a web page, verify UI visually, take a screenshot, execute JS in browser, check if a page loads correctly, or interact with the JAINE Browser via CDP. Triggers on "open this in browser", "take a screenshot", "check if this page works", "what does this look like", "run JS in browser", visual verification of HTML/dashboard.
+description: Use when you need to see a web page, verify UI visually, take a screenshot, execute JS in browser, click elements, fill forms, check console errors, monitor network, or interact with the JAINE Browser. Triggers on "open in browser", "take screenshot", "check if page works", "what does this look like", "run JS", "click button", "fill form", visual verification.
 ---
 
-# JAINE Browser — Visual Verification
+# JAINE Browser — Multi-Channel Browser Automation
 
-**Core principle:** See what the user sees. CDP :9333 is your eyes — screenshot, JS execution, DOM inspection, navigation. No extensions needed, no manual setup.
+**Core principle:** See what the user sees. Three channels — CDP WebSocket (primary), AppleScript + DOM injection (fallback), macOS native (screenshot). No extensions needed.
 
-## When to Use
+## Channels
 
-- Verify HTML/dashboard renders correctly after changes
-- Screenshot a page for visual comparison
-- Execute JS to check page state (DOM, variables, errors)
-- Navigate to URL and inspect result
-- Wait for element to appear after async load
-- Debug why a page looks wrong
-- Visual QA before showing to user
+| Channel | When | Capabilities |
+|---------|------|-------------|
+| **CDP WebSocket** | websocket-client installed | Everything: screenshot, JS, DOM, network, console, PDF |
+| **AppleScript + DOM injection** | websocket-client missing | JS in main world, navigate, reload, click, fill, wait |
+| **macOS native** | screenshot without websocket | screencapture via window ID |
+| **AppleScript window** | always | bounds, move between monitors, activate |
 
-## Quick Start
+Auto-detected: `cdp.py status` shows active channel. Fallback is transparent — same commands work in both modes.
+
+**Zero dependencies:** websocket-client is bundled in `scripts/vendor/`. Works from any Python, any directory, no installs needed.
+
+**Known Chrome behavior (Chromium #543437):** AppleScript `execute javascript` runs in isolated world — page variables invisible. Our DOM injection bridge solves this: injects `<script>` tag (runs in main world), writes result to `dataset`, reads back. Automatic in `cdp.py js`.
+
+## Quick Reference — 17 Commands
 
 ```bash
-# Check browser is running
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" status
+CDP="${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py"
 
-# Not running? Launch it:
-"${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/launch.sh" "http://localhost:9401"
+# Status & tabs
+python3 "$CDP" status                    # ONLINE/OFFLINE + channel info
+python3 "$CDP" tabs                      # list all tabs
 
-# Screenshot current page
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" screenshot /tmp/page.png
-# Then: Read /tmp/page.png (you see the image)
+# Navigation
+python3 "$CDP" navigate URL              # go to URL
+python3 "$CDP" open URL                  # new tab with URL
+python3 "$CDP" reload                    # reload (cache bypass)
 
-# Execute JS
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" js "document.title"
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" js "document.querySelectorAll('.error').length"
+# See
+python3 "$CDP" screenshot [FILE]         # screenshot → /tmp/jaine-screenshot.png
+python3 "$CDP" title                     # page title
+python3 "$CDP" html                      # full HTML (CDP only)
 
-# Navigate
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" navigate "http://localhost:9401/page.html"
+# Execute
+python3 "$CDP" js 'EXPRESSION'           # JS in main world
+python3 "$CDP" wait SELECTOR [TIMEOUT]   # wait for CSS selector
+python3 "$CDP" click SELECTOR            # click element
+python3 "$CDP" fill SELECTOR VALUE       # fill input + dispatch events
 
-# Open in new tab
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" open "http://example.com"
+# Debug
+python3 "$CDP" console                   # console messages (CDP only)
+python3 "$CDP" network                   # network requests (CDP only)
 
-# Wait for element
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" wait ".content-loaded" 15
+# Generate
+python3 "$CDP" pdf [FILE]                # save as PDF (CDP only)
+python3 "$CDP" viewport WIDTH HEIGHT     # change viewport size
 
-# Reload (cache bypass)
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" reload
-
-# List tabs
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" tabs
-
-# Get full HTML
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" html
+# Window management
+python3 "$CDP" window bounds             # get current bounds
+python3 "$CDP" window upper              # move to upper monitor
+python3 "$CDP" window lower              # move to lower monitor
+python3 "$CDP" window activate           # bring to front
 ```
 
 ## Browser Setup
 
-JAINE Browser = separate Chrome instance with dedicated profile:
-- **CDP port:** 9333 (always)
-- **Profile:** `/0/.jaine/.browser/profile/` (no extensions, no sync)
+JAINE Browser = separate Chrome instance, dark mode, no extensions:
+- **CDP port:** 9333
+- **Profile:** `/0/.jaine/.browser/profile/`
 - **Launcher:** `${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/launch.sh [URL]`
-- Dark mode, force-dark for all pages
 
-If `cdp.py status` shows OFFLINE — run `launch.sh` once. Browser persists until killed.
-
-## Workflow: Screenshot → Read → See
-
+If `status` shows OFFLINE:
 ```bash
-# 1. Take screenshot
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" screenshot /tmp/check.png
-# 2. See the screenshot (Claude Code multimodal)
+"${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/launch.sh" "http://localhost:9401"
+```
+
+## Workflows
+
+### Screenshot → Read → See
+```bash
+python3 "$CDP" screenshot /tmp/check.png
 Read /tmp/check.png
-# 3. Analyze what you see, report to user
 ```
 
-This is the primary visual verification loop. Use it after ANY UI change.
-
-## Workflow: JS State Check
-
+### Click through UI
 ```bash
-# Check page data
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" js "(function(){ return JSON.stringify({title: document.title, errors: document.querySelectorAll('.error').length, ready: typeof DATA !== 'undefined'}) })()"
+python3 "$CDP" navigate "http://localhost:9401/dashboard.html"
+python3 "$CDP" wait ".tab" 5
+python3 "$CDP" click ".tab[data-tab='sessions']"
+python3 "$CDP" screenshot /tmp/sessions.png
 ```
 
-## Window Placement
-
-Move browser to specific monitor via AppleScript (if enabled):
+### Fill form and submit
 ```bash
-osascript -e 'tell application "Google Chrome" to set bounds of window 1 to {0, -1080, 3840, 0}'
+python3 "$CDP" fill "#search-input" "Харли память"
+python3 "$CDP" click "#search-button"
+python3 "$CDP" wait ".results" 10
 ```
-Upper Odyssey monitor: `{0, -1080, 3840, 0}`. Main (lower): `{0, 0, 3840, 1080}`.
 
-## Remote Machines (kosm4)
+### Debug page errors
+```bash
+python3 "$CDP" console
+python3 "$CDP" network
+python3 "$CDP" js "document.querySelectorAll('.error').length"
+```
+
+### Responsive testing
+```bash
+python3 "$CDP" viewport 375 812    # iPhone
+python3 "$CDP" screenshot /tmp/mobile.png
+python3 "$CDP" viewport 1440 900   # desktop
+python3 "$CDP" screenshot /tmp/desktop.png
+```
+
+## Remote Machines
 
 For Vivaldi on kosm4 (CDP :9222):
 ```bash
-ssh kosm4 'python3.13 /tmp/cdp_script.py'
+CDP_PORT=9222 ssh kosm4 'python3.13 cdp.py screenshot /tmp/shot.png'
 ```
-Or use CDP via SSH tunnel: `ssh -L 9222:localhost:9222 kosm4`
+Or SSH tunnel: `ssh -L 9222:localhost:9222 kosm4`
 
 ## Logging
 
-All actions logged to `~/.claude/hooks/bulldozer-look.log`:
+All actions → `~/.claude/hooks/bulldozer-look.log`:
 ```
-2026-05-10T12:30:00+0700 | event=screenshot | path=/tmp/page.png | size=339006 | url=http://localhost:9401
-2026-05-10T12:30:05+0700 | event=js | expr=document.title | type=string
-2026-05-10T12:30:10+0700 | event=navigate | url=http://localhost:9401/new-page.html
+2026-05-11T03:30:00+0700 | event=screenshot | channel=cdp | path=/tmp/page.png | size=339006
+2026-05-11T03:30:05+0700 | event=js | channel=applescript | expr=document.title
+2026-05-11T03:30:10+0700 | event=click | channel=cdp | selector=.tab
 ```
 
 Review: `column -t -s'|' ~/.claude/hooks/bulldozer-look.log`
 
-## Common Mistakes
+## Fallback Matrix
 
-| Mistake | Fix |
-|---------|-----|
-| Browser not running | `cdp.py status` first, then `launch.sh` if OFFLINE |
-| Wrong browser (Yandex/Safari) | JAINE Browser = Chrome on :9333. User's browser is separate |
-| Screenshot too fast after navigate | Add `sleep 2` or use `cdp.py wait SELECTOR` |
-| CORS on fetch in page | Asset server must have `Access-Control-Allow-Origin: *` |
-| AppleScript "disabled" error | AppleScript needs manual one-time enable. Use CDP instead |
+| Command | CDP (websocket) | AppleScript fallback | macOS native |
+|---------|:-:|:-:|:-:|
+| status, tabs, open | HTTP only | — | — |
+| js, title, click, fill, wait | WebSocket | DOM injection | — |
+| navigate, reload | WebSocket | AppleScript | — |
+| screenshot | WebSocket | — | screencapture |
+| html, console, network, pdf | WebSocket | unavailable | — |
+| viewport | WebSocket | set bounds | — |
+| window | — | — | AppleScript |

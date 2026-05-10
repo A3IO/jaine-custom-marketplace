@@ -24,7 +24,20 @@ Open URL in JAINE Browser (CDP :9333), take screenshot, show it.
 /bulldozer:look http://localhost:9401                # open URL, screenshot
 ```
 
-**CDP commands:** status, tabs, screenshot, js, navigate, open, title, html, wait, reload.
+**17 CDP commands (zero dependencies — websocket-client bundled):**
+
+| Category | Commands |
+|----------|----------|
+| Status | `status`, `tabs` |
+| Navigation | `navigate`, `open`, `reload` |
+| See | `screenshot`, `title`, `html` |
+| Execute | `js`, `wait`, `click`, `fill` |
+| Debug | `console`, `network` |
+| Generate | `pdf`, `viewport` |
+| Window | `window [bounds\|upper\|lower\|activate]` |
+
+Multi-channel: CDP WebSocket (primary) → AppleScript + DOM injection (fallback) → macOS screencapture (screenshot fallback). 13/17 commands work without websocket.
+
 **Log:** `~/.claude/hooks/bulldozer-look.log`
 
 ## Supported Artifact Types
