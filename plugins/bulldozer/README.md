@@ -1,10 +1,12 @@
 # bulldozer
 
-Iterative adversarial review loop with external AI reviewer.
+Adversarial review loop with external AI reviewer + visual browser verification via JAINE Browser CDP.
+
+## Commands
+
+### /bulldozer:check — Adversarial Review
 
 Send artifact to reviewer (Codex CLI) → parse findings → verify each empirically → fix confirmed → re-send → repeat until GO.
-
-## Usage
 
 ```
 /bulldozer:check                                    # standard (3 rounds max), ask for artifact
@@ -12,6 +14,18 @@ Send artifact to reviewer (Codex CLI) → parse findings → verify each empiric
 /bulldozer:check standard src/gateway/              # 3 rounds, review a directory
 /bulldozer:check exhaustive docs/design.md          # until GO (max 10)
 ```
+
+### /bulldozer:look — Visual Browser Verification
+
+Open URL in JAINE Browser (CDP :9333), take screenshot, show it.
+
+```
+/bulldozer:look                                     # screenshot current tab
+/bulldozer:look http://localhost:9401                # open URL, screenshot
+```
+
+**CDP commands:** status, tabs, screenshot, js, navigate, open, title, html, wait, reload.
+**Log:** `~/.claude/hooks/bulldozer-look.log`
 
 ## Supported Artifact Types
 

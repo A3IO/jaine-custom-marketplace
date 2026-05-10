@@ -1,7 +1,7 @@
 {
   "name": "bulldozer",
   "version": "2026.05.09.1",
-  "description": "Iterative adversarial review loop with external AI reviewer (Codex CLI) — verify, fix, repeat until GO",
+  "description": "Adversarial review loop with external AI reviewer (Codex CLI) + visual browser verification via JAINE Browser CDP",
   "author": {
     "name": "JAINE",
     "email": "jaine@local"
