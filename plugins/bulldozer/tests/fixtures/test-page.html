@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>JAINE Test Page</title>
+    <style>
+        body { font-family: system-ui, sans-serif; padding: 2rem; background: #1a1a2e; color: #e0e0e0; }
+        h1 { color: #00d4ff; }
+        button { padding: 0.5rem 1rem; margin: 0.5rem; cursor: pointer; background: #16213e; color: #e0e0e0; border: 1px solid #0f3460; border-radius: 4px; }
+        button:hover { background: #0f3460; }
+        input { padding: 0.5rem; background: #16213e; color: #e0e0e0; border: 1px solid #0f3460; border-radius: 4px; }
+        .status { margin: 1rem 0; padding: 0.5rem; background: #0f3460; border-radius: 4px; font-family: monospace; }
+        .delayed-element { display: none; color: #00ff88; margin-top: 1rem; }
+    </style>
+</head>
+<body>
+    <h1>JAINE Test Page</h1>
+    <p>Deterministic test page for e2e CDP command verification.</p>
+
+    <section>
+        <h2>Click Test</h2>
+        <button id="test-btn" onclick="this.dataset.clicked='true'; document.getElementById('click-status').textContent='clicked'">
+            Click Me
+        </button>
+        <div id="click-status" class="status">not clicked</div>
+    </section>
+
+    <section>
+        <h2>Console Test</h2>
+        <button id="console-btn" onclick="console.log('TEST_MARKER')">
+            Log to Console
+        </button>
+        <div id="console-status" class="status">heartbeat active</div>
+    </section>
+
+    <section>
+        <h2>Fill Test</h2>
+        <input id="test-input" type="text" placeholder="Type here..."
+               oninput="this.dataset.inputFired='true'"
+               onchange="this.dataset.changeFired='true'">
+        <div id="fill-status" class="status">empty</div>
+    </section>
+
+    <section>
+        <h2>Wait Test</h2>
+        <div class="delayed-element">I appeared after 2 seconds!</div>
+    </section>
+
+    <section>
+        <h2>Network Test</h2>
+        <div id="network-status" class="status">fetching...</div>
+    </section>
+
+    <script>
+        // Delayed element — appears after 2s (for wait command test)
+        setTimeout(function() {
+            document.querySelector('.delayed-element').style.display = 'block';
+        }, 2000);
+
+        // Self-fetch — triggers a network request (for network command test)
+        fetch('test-page.html').then(function(r) {
+            document.getElementById('network-status').textContent = 'fetched: ' + r.status;
+        }).catch(function(e) {
+            document.getElementById('network-status').textContent = 'error: ' + e.message;
+        });
+
+        // Periodic heartbeat — cmd_console opens a new WS connection and listens
+        // for 3s. Messages must fire DURING that window, not before.
+        setInterval(function() {
+            console.log('CONSOLE_HEARTBEAT');
+        }, 500);
+    </script>
+</body>
+</html>

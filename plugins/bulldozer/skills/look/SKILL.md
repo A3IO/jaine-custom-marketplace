@@ -14,11 +14,11 @@ description: Use when you need to see a web page, verify UI visually, take a scr
 | **CDP WebSocket** | websocket-client installed | Everything: screenshot, JS, DOM, network, console, PDF |
 | **AppleScript + DOM injection** | websocket-client missing | JS in main world, navigate, reload, click, fill, wait |
 | **macOS native** | screenshot without websocket | screencapture via window ID |
-| **AppleScript window** | always | bounds, move between monitors, activate |
+| **AppleScript window** | macOS + Google Chrome | bounds, move between monitors, activate |
 
 Auto-detected: `cdp.py status` shows active channel. Fallback is transparent — same commands work in both modes.
 
-**Zero dependencies:** websocket-client is bundled in `scripts/vendor/`. Works from any Python, any directory, no installs needed.
+**No pip installs needed:** websocket-client is bundled in `scripts/vendor/`. Native screenshot fallback uses Quartz (PyObjC) — available in system/homebrew Python on macOS.
 
 **Known Chrome behavior (Chromium #543437):** AppleScript `execute javascript` runs in isolated world — page variables invisible. Our DOM injection bridge solves this: injects `<script>` tag (runs in main world), writes result to `dataset`, reads back. Automatic in `cdp.py js`.
 
@@ -116,9 +116,9 @@ python3 "$CDP" screenshot /tmp/desktop.png
 
 For Vivaldi on kosm4 (CDP :9222):
 ```bash
-CDP_PORT=9222 ssh kosm4 'python3.13 cdp.py screenshot /tmp/shot.png'
+ssh kosm4 'CDP_PORT=9222 python3.13 cdp.py screenshot /tmp/shot.png'
 ```
-Or SSH tunnel: `ssh -L 9222:localhost:9222 kosm4`
+Or SSH tunnel (run cdp.py locally): `ssh -L 9222:localhost:9222 kosm4`
 
 ## Logging
 
@@ -126,8 +126,9 @@ All actions → `~/.claude/hooks/bulldozer-look.log`:
 ```
 2026-05-11T03:30:00+0700 | event=screenshot | channel=cdp | path=/tmp/page.png | size=339006
 2026-05-11T03:30:05+0700 | event=js | channel=applescript | expr=document.title
-2026-05-11T03:30:10+0700 | event=click | channel=cdp | selector=.tab
+2026-05-11T03:30:10+0700 | event=open | url=http://localhost:9401
 ```
+Note: `channel=` is present on commands with CDP/AppleScript fallback (screenshot, js, navigate, reload, click, fill). Commands that use a single channel (open, wait, console, network, pdf, viewport, window) omit it.
 
 Review: `column -t -s'|' ~/.claude/hooks/bulldozer-look.log`
 
@@ -140,5 +141,5 @@ Review: `column -t -s'|' ~/.claude/hooks/bulldozer-look.log`
 | navigate, reload | WebSocket | AppleScript | — |
 | screenshot | WebSocket | — | screencapture |
 | html, console, network, pdf | WebSocket | unavailable | — |
-| viewport | WebSocket | set bounds | — |
-| window | — | — | AppleScript |
+| viewport | WebSocket | window bounds (approximate) | — |
+| window | — | AppleScript | — |

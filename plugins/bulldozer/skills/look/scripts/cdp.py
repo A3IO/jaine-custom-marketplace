@@ -94,13 +94,20 @@ def get_tab(url_filter=None):
 
 def ws_send(ws_url, method, params=None):
     import websocket
-    ws = websocket.create_connection(ws_url, timeout=30)
+    try:
+        ws = websocket.create_connection(ws_url, timeout=30)
+    except (websocket.WebSocketException, OSError, ConnectionError) as e:
+        print("WebSocket connect failed: {}".format(e), file=sys.stderr)
+        return None
     try:
         msg = {"id": 1, "method": method}
         if params:
             msg["params"] = params
         ws.send(json.dumps(msg))
         result = json.loads(ws.recv())
+    except (websocket.WebSocketException, json.JSONDecodeError, OSError) as e:
+        print("WebSocket I/O error: {}".format(e), file=sys.stderr)
+        return None
     finally:
         ws.close()
     if "error" in result:
@@ -117,17 +124,21 @@ def cdp_js(expr):
         "returnByValue": True,
     })
     if r is None:
-        return {}
+        return None
     return r.get("result", {}).get("result", {})
 
 # --- AppleScript bridge (DOM injection → main world) ---
 
 def osascript(script):
-    r = subprocess.run(["osascript", "-e", script],
-                       capture_output=True, text=True, timeout=10)
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        print("ERROR: AppleScript timed out — Chrome may be unresponsive", file=sys.stderr)
+        return None
     if r.returncode != 0:
         err = r.stderr.strip()
-        if "AppleScript" in err and "отключено" in err:
+        if "AppleScript" in err and any(m in err for m in ("отключено", "turned off", "disabled", "not allowed")):
             print("ERROR: AppleScript JS disabled in Chrome. Enable: View > Developer > Allow JavaScript from Apple Events", file=sys.stderr)
             return None
         print("AppleScript error: " + err, file=sys.stderr)
@@ -138,12 +149,13 @@ def as_js_main_world(expr):
     """Execute JS in main world via DOM injection bridge.
     Chrome AppleScript runs in isolated world (known Chromium issue #543437).
     Workaround: inject <script> tag which runs in main world, write result to dataset."""
-    safe_expr = json.dumps(expr)[1:-1]
+    safe_expr = json.dumps(expr)[1:-1].replace("'", "\\'")
+
     script = '''
 tell application "{app}"
     tell window 1
         tell active tab
-            execute javascript "var _s=document.createElement('script');_s.textContent='document.body.dataset._jresult=JSON.stringify((function(){{try{{return {expr}}}catch(e){{return \\"ERR: \\"+e.message}}}})())';document.head.appendChild(_s);_s.remove();"
+            execute javascript "delete document.body.dataset._jresult;var _s=document.createElement('script');_s.textContent='document.body.dataset._jresult=JSON.stringify((function(){{try{{return {expr}}}catch(e){{return \\"ERR: \\"+e.message}}}})())';document.head.appendChild(_s);_s.remove();"
             set r to execute javascript "document.body.dataset._jresult"
         end tell
     end tell
@@ -180,19 +192,27 @@ end tell'''.format(app=CHROME_APP)) is not None
 
 # --- macOS native screenshot ---
 
-def get_chrome_window_id():
-    r = subprocess.run(
-        ["osascript", "-e",
-         'tell application "System Events" to get id of window 1 of process "{}"'.format(CHROME_APP)],
-        capture_output=True, text=True, timeout=5)
-    if r.returncode == 0:
-        return r.stdout.strip()
-    return None
-
 def native_screenshot(path):
-    wid = get_chrome_window_id()
+    _quartz_code = (
+        "import Quartz as Q; ws=Q.CGWindowListCopyWindowInfo("
+        "Q.kCGWindowListOptionOnScreenOnly|Q.kCGWindowListExcludeDesktopElements,"
+        "Q.kCGNullWindowID);\n"
+        "wid=next((w['kCGWindowNumber'] for w in ws "
+        "if '{owner}' in str(w.get('kCGWindowOwnerName','')) "
+        "and w.get('kCGWindowName','')),None)\n"
+        "print(wid if wid is not None else '')"
+    ).format(owner=CHROME_APP.split()[0])
+    wid = ""
+    for pybin in [sys.executable, "/opt/homebrew/bin/python3", "/usr/local/bin/python3"]:
+        if pybin != sys.executable and not os.path.exists(pybin):
+            continue
+        r = subprocess.run([pybin, "-c", _quartz_code],
+                           capture_output=True, text=True, timeout=5)
+        wid = r.stdout.strip() if r.returncode == 0 else ""
+        if wid:
+            break
     if not wid:
-        print("ERROR: cannot find Chrome window for screenshot", file=sys.stderr)
+        print("ERROR: cannot find Chrome CGWindowID for screenshot", file=sys.stderr)
         return False
     r = subprocess.run(["screencapture", "-l", wid, "-o", "-x", path],
                        capture_output=True, timeout=10)
@@ -232,7 +252,7 @@ def cmd_screenshot(args):
         img = base64.b64decode(data)
         with open(path, "wb") as f:
             f.write(img)
-        log("screenshot", channel="cdp", path=path, size=len(img))
+        log("screenshot", channel="cdp", path=path, size=len(img), url=tab.get("url", "?")[:80])
     else:
         if not native_screenshot(path):
             print("ERROR: native screenshot failed", file=sys.stderr)
@@ -248,6 +268,8 @@ def cmd_js(args):
     expr = args[0]
     if has_websocket():
         result = cdp_js(expr)
+        if result is None:
+            return 1
         val = result.get("value")
         if val is not None:
             print(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False))
@@ -299,6 +321,8 @@ def cmd_open(args):
 def cmd_title(args):
     if has_websocket():
         result = cdp_js("document.title")
+        if result is None:
+            return 1
         print(result.get("value", "?"))
     else:
         val = as_js_main_world("document.title")
@@ -308,6 +332,8 @@ def cmd_title(args):
 def cmd_html(args):
     if has_websocket():
         result = cdp_js("document.documentElement.outerHTML")
+        if result is None:
+            return 1
         print(result.get("value", ""))
     else:
         print("ERROR: html requires websocket-client (too large for AppleScript bridge)", file=sys.stderr)
@@ -319,12 +345,18 @@ def cmd_wait(args):
         print("Usage: cdp.py wait SELECTOR [TIMEOUT]")
         return 1
     selector = args[0]
-    timeout = int(args[1]) if len(args) > 1 else 10
+    try:
+        timeout = int(args[1]) if len(args) > 1 else 10
+    except ValueError:
+        print("ERROR: TIMEOUT must be an integer, got: {}".format(args[1]), file=sys.stderr)
+        return 1
     expr = "!!document.querySelector({})".format(json.dumps(selector))
     start = time.time()
     while time.time() - start < timeout:
         if has_websocket():
             r = cdp_js(expr)
+            if r is None:
+                return 1
             found = r.get("value") is True
         else:
             val = as_js_main_world(expr)
@@ -358,9 +390,13 @@ def cmd_click(args):
     expr = "(function(){{ var el=document.querySelector({sel}); if(!el) return 'NOT_FOUND'; el.click(); return 'clicked ' + el.tagName }})()".format(sel=json.dumps(selector))
     if has_websocket():
         result = cdp_js(expr)
+        if result is None:
+            return 1
         val = result.get("value", "?")
     else:
-        val = as_js_main_world(expr) or "?"
+        val = as_js_main_world(expr)
+        if val is None:
+            return 1
     if val == "NOT_FOUND":
         print("ERROR: '{}' not found".format(selector), file=sys.stderr)
         return 1
@@ -377,9 +413,13 @@ def cmd_fill(args):
         sel=json.dumps(selector), val=json.dumps(value))
     if has_websocket():
         result = cdp_js(expr)
+        if result is None:
+            return 1
         val = result.get("value", "?")
     else:
-        val = as_js_main_world(expr) or "?"
+        val = as_js_main_world(expr)
+        if val is None:
+            return 1
     if val == "NOT_FOUND":
         print("ERROR: '{}' not found".format(selector), file=sys.stderr)
         return 1

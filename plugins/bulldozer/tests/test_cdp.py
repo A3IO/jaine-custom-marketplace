@@ -156,6 +156,185 @@ def test_f6_cdp_error_responses_checked():
     raise AssertionError("ws_send function not found in cdp.py")
 
 
+# ── B2: ws_send must catch connection errors, not just I/O errors ──
+
+def test_b2_ws_send_catches_connection_errors():
+    """ws_send must not let ConnectionRefusedError propagate as traceback.
+    StubHandler returns tab list with ws://localhost:1 (unreachable WS port)."""
+    server, port = start_stub_server()
+    try:
+        r = run_cdp(["navigate", "http://example.com"], env_override={"CDP_PORT": str(port)})
+        assert "Traceback" not in r.stderr, (
+            "ws_send should catch connection errors gracefully, got traceback:\n" + r.stderr
+        )
+        assert r.returncode != 0, "Should fail when WebSocket unreachable"
+    finally:
+        server.shutdown()
+
+
+# ── B3+B4: cdp_js must propagate None, callers must not treat "?" as success ──
+
+def test_b3_cdp_js_propagates_none():
+    """cdp_js must return None (not {}) when ws_send fails."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cdp_js":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            assert "return {}" not in func_src, (
+                "cdp_js must return None on failure, not {} — "
+                "callers can't distinguish CDP error from JS undefined"
+            )
+            assert "return None" in func_src, (
+                "cdp_js must explicitly return None when ws_send fails"
+            )
+            return
+    raise AssertionError("cdp_js function not found")
+
+
+def test_b4_click_fails_on_cdp_error():
+    """cmd_click must return nonzero when CDP fails (not print '?' and exit 0)."""
+    server, port = start_stub_server()
+    try:
+        r = run_cdp(["click", "#test"], env_override={"CDP_PORT": str(port)})
+        assert r.returncode != 0, (
+            "click should fail when WebSocket is unreachable, got rc=0 stdout={}".format(r.stdout)
+        )
+    finally:
+        server.shutdown()
+
+
+# ── D4: screenshot log must include url= ──
+
+def test_d4_screenshot_log_includes_url():
+    """CDP screenshot log call must include url= for analytics."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_screenshot":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            cdp_log_lines = [l for l in func_src.splitlines()
+                             if 'log("screenshot"' in l and 'channel="cdp"' in l]
+            assert cdp_log_lines, "cmd_screenshot must have a CDP log call"
+            assert "url=" in cdp_log_lines[0], (
+                "CDP screenshot log must include url= field for analytics"
+            )
+            return
+    raise AssertionError("cmd_screenshot function not found")
+
+
+# ── B9: as_js_main_world must clear stale dataset before injection ──
+
+def test_b9_as_js_main_world_clears_stale_result():
+    """as_js_main_world must delete dataset._jresult before injecting new script."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "as_js_main_world":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            assert "delete" in func_src and "_jresult" in func_src, (
+                "as_js_main_world must clear dataset._jresult before injection "
+                "to prevent stale data from previous calls"
+            )
+            return
+    raise AssertionError("as_js_main_world function not found")
+
+
+# ── B6: osascript must catch TimeoutExpired ──
+
+def test_b6_osascript_catches_timeout():
+    """osascript() must handle subprocess.TimeoutExpired, not let it propagate."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "osascript":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            assert "TimeoutExpired" in func_src or "timeout" in func_src.lower().split("except")[1] if "except" in func_src else False, (
+                "osascript must catch TimeoutExpired — Chrome hang should not crash with traceback"
+            )
+            return
+    raise AssertionError("osascript function not found")
+
+
+# ── B7: cmd_wait must handle non-integer timeout ──
+
+def test_b7_wait_invalid_timeout_friendly_error():
+    """cdp.py wait .foo abc must give clean error, not ValueError traceback."""
+    r = run_cdp(["wait", ".foo", "abc"], env_override={"CDP_PORT": "19111"})
+    assert "Traceback" not in r.stderr, (
+        "Non-integer timeout should give friendly error:\n" + r.stderr
+    )
+    assert r.returncode != 0
+
+
+# ── B8: AppleScript JS-disabled detection must work in English ──
+
+def test_b8_applescript_detects_english_disabled():
+    """osascript() must detect JS-disabled error in both Russian and English."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "osascript":
+            src_lines = source.splitlines()[node.lineno - 1 : node.end_lineno]
+            condition_lines = [l for l in src_lines if "in err" in l]
+            condition_text = " ".join(condition_lines)
+            has_russian = "отключено" in condition_text
+            has_english = "turned off" in condition_text or "disabled" in condition_text or "not allowed" in condition_text
+            assert has_russian and has_english, (
+                "osascript error detection must check both Russian and English locale strings. "
+                "Condition lines: {}".format(condition_text)
+            )
+            return
+    raise AssertionError("osascript function not found")
+
+
+# ── B5: native_screenshot must not print multiple window IDs ──
+
+def test_b5_native_screenshot_single_window_id():
+    """Quartz window lookup must return exactly one ID, not print() side-effects."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "native_screenshot":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            assert "[print(" not in func_src, (
+                "native_screenshot must not use [print(w[...]) for w in ws][:1] — "
+                "print() is a side-effect, [:1] slices the list of Nones, not the iteration. "
+                "Use next() or explicit loop with break."
+            )
+            return
+    raise AssertionError("native_screenshot function not found")
+
+
+# ── B1: as_js_main_world must escape single quotes for AppleScript ──
+
+def test_b1_as_js_main_world_escapes_single_quotes():
+    """Single quotes in JS expressions must be escaped for AppleScript textContent='...'."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "as_js_main_world":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            assert ".replace(" in func_src and "'" in func_src, (
+                "as_js_main_world must escape single quotes after json.dumps — "
+                "unescaped ' breaks AppleScript textContent='...' wrapping"
+            )
+            return
+    raise AssertionError("as_js_main_world function not found")
+
+
 # ── NEW: AppleScript fallback and multi-channel tests ──
 
 
@@ -339,8 +518,9 @@ def test_navigate_fallback_to_applescript():
 def test_help_shows_all_commands():
     """--help must list all 17 commands."""
     r = run_cdp(["--help"])
-    for cmd in ["screenshot", "js", "click", "fill", "console", "network",
-                 "pdf", "viewport", "window"]:
+    for cmd in ["status", "tabs", "screenshot", "js", "navigate", "open",
+                 "title", "html", "reload", "wait", "click", "fill",
+                 "console", "network", "pdf", "viewport", "window"]:
         assert cmd in r.stdout, f"--help missing '{cmd}' command"
 
 
