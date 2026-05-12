@@ -214,7 +214,9 @@ def native_screenshot(path):
     if not wid:
         print("ERROR: cannot find Chrome CGWindowID for screenshot", file=sys.stderr)
         return False
-    r = subprocess.run(["screencapture", "-l", wid, "-o", "-x", path],
+    ext = os.path.splitext(path)[1].lower()
+    fmt = {"jpg": "jpg", "jpeg": "jpg", "png": "png", "pdf": "pdf", "tiff": "tiff"}.get(ext.lstrip("."), "png")
+    r = subprocess.run(["screencapture", "-l", wid, "-o", "-x", "-t", fmt, path],
                        capture_output=True, timeout=10)
     return r.returncode == 0
 
@@ -241,10 +243,10 @@ def cmd_tabs(args):
                 t["id"][:12], t.get("title", "?")[:40], t.get("url", "?")[:60]))
 
 def cmd_screenshot(args):
-    path = args[0] if args else "/tmp/jaine-screenshot.png"
+    path = args[0] if args else "/tmp/jaine-screenshot.jpg"
     if has_websocket():
         tab = get_tab()
-        r = ws_send(tab["webSocketDebuggerUrl"], "Page.captureScreenshot", {"format": "png"})
+        r = ws_send(tab["webSocketDebuggerUrl"], "Page.captureScreenshot", {"format": "jpeg", "quality": 80})
         data = (r or {}).get("result", {}).get("data", "")
         if not data:
             print("ERROR: empty screenshot", file=sys.stderr)
@@ -257,7 +259,7 @@ def cmd_screenshot(args):
         if not native_screenshot(path):
             print("ERROR: native screenshot failed", file=sys.stderr)
             return 1
-        log("screenshot", channel="native", path=path)
+        log("screenshot", channel="native", path=path, size=os.path.getsize(path))
     print(path)
     return 0
 
@@ -537,7 +539,7 @@ def cmd_viewport(args):
     if has_websocket():
         tab = get_tab()
         if ws_send(tab["webSocketDebuggerUrl"], "Emulation.setDeviceMetricsOverride", {
-            "width": w, "height": h, "deviceScaleFactor": 2, "mobile": False,
+            "width": w, "height": h, "deviceScaleFactor": 1, "mobile": False,
         }) is None:
             return 1
     else:

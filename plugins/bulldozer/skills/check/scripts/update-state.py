@@ -21,10 +21,16 @@ def main():
         print(f"error: numeric argument expected: {e}", file=sys.stderr)
         sys.exit(1)
 
+    if findings < 0 or fixed < 0 or fp < 0:
+        print(f"error: counts must be >= 0 (got findings={findings}, fixed={fixed}, fp={fp})", file=sys.stderr)
+        sys.exit(1)
+    if fixed + fp > findings:
+        print(f"warning: fixed+fp ({fixed + fp}) exceeds findings ({findings})", file=sys.stderr)
+
     verdict = sys.argv[2]
     artifact = sys.argv[6] if len(sys.argv) > 6 else ""
     depth = sys.argv[7] if len(sys.argv) > 7 else "standard"
-    reviewer = sys.argv[8] if len(sys.argv) > 8 else "codex/gpt-5.5"
+    reviewer = sys.argv[8] if len(sys.argv) > 8 else "codex/unknown"
 
     state_dir = Path(os.environ.get("BULLDOZER_REVIEW_DIR", ".bulldozer"))
     try:
@@ -40,6 +46,18 @@ def main():
         except json.JSONDecodeError as e:
             print(f"error: {state_file} corrupted: {e}", file=sys.stderr)
             print(f"hint: backup and remove {state_file} to start fresh", file=sys.stderr)
+            sys.exit(1)
+        state.setdefault("findings_total", 0)
+        state.setdefault("fixed_total", 0)
+        state.setdefault("false_positives", 0)
+        state.setdefault("history", [])
+        for key in ("findings_total", "fixed_total", "false_positives"):
+            if not isinstance(state.get(key), int):
+                print(f"error: {state_file} has invalid {key} (expected int, got {type(state.get(key)).__name__})", file=sys.stderr)
+                print(f"hint: backup and remove {state_file} to start fresh", file=sys.stderr)
+                sys.exit(1)
+        if not isinstance(state.get("history"), list):
+            print(f"error: {state_file} has invalid history (expected list)", file=sys.stderr)
             sys.exit(1)
     else:
         state = {

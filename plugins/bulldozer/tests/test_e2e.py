@@ -60,15 +60,15 @@ def test_reload_succeeds(test_page_url):
 
 
 def test_screenshot_creates_file(test_page_url, tmp_path):
-    path = str(tmp_path / "shot.png")
+    path = str(tmp_path / "shot.jpg")
     r = run_cdp(["screenshot", path])
     assert r.returncode == 0, "screenshot failed: {}".format(r.stderr)
     assert os.path.exists(path), "Screenshot file not created"
     size = os.path.getsize(path)
-    assert size > 10_000, "Screenshot too small ({}B), likely empty".format(size)
+    assert size > 5_000, "Screenshot too small ({}B), likely empty".format(size)
     with open(path, "rb") as f:
-        header = f.read(4)
-    assert header == b'\x89PNG', "Not a valid PNG file"
+        header = f.read(3)
+    assert header == b'\xff\xd8\xff', "Not a valid JPEG file (header={!r})".format(header)
 
 
 def test_title_returns_page_title(test_page_url):

@@ -26,7 +26,7 @@ Skip step 3 if you just launched the browser in step 2 (it already opened the UR
 
 4. Screenshot + show:
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" screenshot /tmp/jaine-look.png
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" screenshot /tmp/jaine-look.jpg
 ```
 Then Read the screenshot file to see it.
 

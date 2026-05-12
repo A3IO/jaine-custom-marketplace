@@ -37,7 +37,7 @@ python3 "$CDP" open URL                  # new tab with URL
 python3 "$CDP" reload                    # reload (cache bypass)
 
 # See
-python3 "$CDP" screenshot [FILE]         # screenshot → /tmp/jaine-screenshot.png
+python3 "$CDP" screenshot [FILE]         # screenshot → /tmp/jaine-screenshot.jpg
 python3 "$CDP" title                     # page title
 python3 "$CDP" html                      # full HTML (CDP only)
 
@@ -78,8 +78,8 @@ If `status` shows OFFLINE:
 
 ### Screenshot → Read → See
 ```bash
-python3 "$CDP" screenshot /tmp/check.png
-Read /tmp/check.png
+python3 "$CDP" screenshot /tmp/check.jpg
+Read /tmp/check.jpg
 ```
 
 ### Click through UI
@@ -87,7 +87,7 @@ Read /tmp/check.png
 python3 "$CDP" navigate "http://localhost:9401/dashboard.html"
 python3 "$CDP" wait ".tab" 5
 python3 "$CDP" click ".tab[data-tab='sessions']"
-python3 "$CDP" screenshot /tmp/sessions.png
+python3 "$CDP" screenshot /tmp/sessions.jpg
 ```
 
 ### Fill form and submit
@@ -107,16 +107,16 @@ python3 "$CDP" js "document.querySelectorAll('.error').length"
 ### Responsive testing
 ```bash
 python3 "$CDP" viewport 375 812    # iPhone
-python3 "$CDP" screenshot /tmp/mobile.png
+python3 "$CDP" screenshot /tmp/mobile.jpg
 python3 "$CDP" viewport 1440 900   # desktop
-python3 "$CDP" screenshot /tmp/desktop.png
+python3 "$CDP" screenshot /tmp/desktop.jpg
 ```
 
 ## Remote Machines
 
 For Vivaldi on kosm4 (CDP :9222):
 ```bash
-ssh kosm4 'CDP_PORT=9222 python3.13 cdp.py screenshot /tmp/shot.png'
+ssh kosm4 'CDP_PORT=9222 python3.13 cdp.py screenshot /tmp/shot.jpg'
 ```
 Or SSH tunnel (run cdp.py locally): `ssh -L 9222:localhost:9222 kosm4`
 
@@ -124,7 +124,7 @@ Or SSH tunnel (run cdp.py locally): `ssh -L 9222:localhost:9222 kosm4`
 
 All actions → `~/.claude/hooks/bulldozer-look.log`:
 ```
-2026-05-11T03:30:00+0700 | event=screenshot | channel=cdp | path=/tmp/page.png | size=339006
+2026-05-11T03:30:00+0700 | event=screenshot | channel=cdp | path=/tmp/page.jpg | size=92847
 2026-05-11T03:30:05+0700 | event=js | channel=applescript | expr=document.title
 2026-05-11T03:30:10+0700 | event=open | url=http://localhost:9401
 ```

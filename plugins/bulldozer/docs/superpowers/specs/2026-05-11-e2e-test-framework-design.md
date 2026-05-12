@@ -57,7 +57,7 @@ test_open_creates_new_tab        — open test-page.html, tabs count increases
 test_reload_succeeds             — rc=0, "Reloaded" in stdout
 
 # See
-test_screenshot_creates_file     — file exists, >10KB, valid PNG header
+test_screenshot_creates_file     — file exists, >5KB, valid JPEG header
 test_title_returns_page_title    — "JAINE Test Page"
 test_html_returns_content        — "JAINE Test Page" in output
 

@@ -9,7 +9,8 @@ FIXED="${5:?}"
 FP="${6:?}"
 REVIEWER="${7:-codex/unknown}"
 PROJECT="${8:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
-SESSION="${CLAUDE_CODE_SESSION_ID:0:8}"
+SESSION="${CLAUDE_CODE_SESSION_ID:-unknown}"
+SESSION="${SESSION:0:8}"
 LOG_FILE="${BULLDOZER_LOG:-$HOME/.claude/hooks/bulldozer.log}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPTH="${BULLDOZER_DEPTH:-standard}"
@@ -19,4 +20,7 @@ python3 "$SCRIPT_DIR/update-state.py" \
     "$ROUND" "$VERDICT" "$FINDINGS" "$FIXED" "$FP" "$ARTIFACT" "$DEPTH" "$REVIEWER" \
     > /dev/null
 
-echo "$(date -Iseconds) | session=${SESSION:-unknown} | round=${ROUND} | artifact=${ARTIFACT} | verdict=${VERDICT} | findings=${FINDINGS} | fixed=${FIXED} | fp=${FP} | reviewer=${REVIEWER} | project=${PROJECT}" >> "$LOG_FILE"
+mkdir -p "$(dirname "$LOG_FILE")"
+if ! echo "$(date -Iseconds) | session=${SESSION} | round=${ROUND} | artifact=${ARTIFACT} | verdict=${VERDICT} | findings=${FINDINGS} | fixed=${FIXED} | fp=${FP} | reviewer=${REVIEWER} | project=${PROJECT}" >> "$LOG_FILE"; then
+    echo "warning: state.json updated but log append to $LOG_FILE failed — audit trail incomplete" >&2
+fi

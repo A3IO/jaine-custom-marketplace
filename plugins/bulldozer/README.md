@@ -60,6 +60,7 @@ Each review gets an isolated directory — no collisions between sessions or art
 ```
 .bulldozer/                                 # gitignore this entire dir
   bf5a38d6-auth-design/                     # {session_id_prefix}-{artifact_basename}
+    review-ledger.yml                       # cumulative ledger (inter-round context)
     state.json                              # round state
     verdict-r1.txt                          # clean codex answer (via -o flag)
     verdict-r2.txt
@@ -79,12 +80,14 @@ View: `column -t -s'|' ~/.claude/hooks/bulldozer.log`
 
 ## How It Works
 
-1. **Send** artifact to codex via `codex exec -s read-only -o verdict-rN.txt`
-2. **Read** clean verdict from `verdict-rN.txt` (no parsing of noisy full output)
-3. **Verify** each finding empirically (grep/read/run — using `/receiving-code-review`)
-4. **Fix** confirmed issues, commit
-5. **Log** round via `log-round.sh` (writes log + updates state.json)
-6. **Repeat** until GO or max rounds
+1. **Select model** — `codex debug models` → AskUserQuestion (every launch)
+2. **Send** artifact to codex in FOREGROUND via `codex exec -s read-only -c model_reasoning_effort=... -o verdict-rN.txt`
+3. **Read** clean verdict from `verdict-rN.txt` (no parsing of noisy full output)
+4. **Extract** `LEDGER_PATCH` from verdict → apply to `review-ledger.yml` (cumulative inter-round context)
+5. **Verify** each finding empirically (grep/read/run — using `/receiving-code-review`)
+6. **Fix** confirmed issues, commit
+7. **Log** round via `log-round.sh` (writes log + updates state.json)
+8. **Repeat** with ledger + previous verdict as appendix, until GO or max rounds
 
 ## Origin
 

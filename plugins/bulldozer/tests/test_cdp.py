@@ -227,6 +227,26 @@ def test_d4_screenshot_log_includes_url():
     raise AssertionError("cmd_screenshot function not found")
 
 
+def test_native_screenshot_log_includes_size():
+    """Native screenshot log must include size= for parity with CDP path."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_screenshot":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            native_log_lines = [l for l in func_src.splitlines()
+                                if 'log("screenshot"' in l and 'channel="native"' in l]
+            assert native_log_lines, "cmd_screenshot must have a native log call"
+            assert "size=" in native_log_lines[0], (
+                "Native screenshot log must include size= — "
+                "without it, the JPEG size savings are unobservable on the fallback path"
+            )
+            return
+    raise AssertionError("cmd_screenshot function not found")
+
+
 # ── B9: as_js_main_world must clear stale dataset before injection ──
 
 def test_b9_as_js_main_world_clears_stale_result():
@@ -522,6 +542,105 @@ def test_help_shows_all_commands():
                  "title", "html", "reload", "wait", "click", "fill",
                  "console", "network", "pdf", "viewport", "window"]:
         assert cmd in r.stdout, f"--help missing '{cmd}' command"
+
+
+# ── #47: Screenshot optimization — JPEG q80 + deviceScaleFactor 1 ──
+
+
+def test_screenshot_uses_jpeg_format():
+    """CDP screenshot must use JPEG format (not PNG) for smaller file sizes."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_screenshot":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            assert '"format": "jpeg"' in func_src, (
+                "cmd_screenshot must use format 'jpeg' for CDP capture, not 'png'. "
+                "JPEG q80 is 3-5× smaller with zero visual quality loss for Claude."
+            )
+            assert '"format": "png"' not in func_src, (
+                "cmd_screenshot CDP path must not use 'png' format"
+            )
+            return
+    raise AssertionError("cmd_screenshot function not found")
+
+
+def test_screenshot_jpeg_quality_80():
+    """CDP screenshot must specify quality: 80 for JPEG compression."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_screenshot":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            assert '"quality": 80' in func_src, (
+                "cmd_screenshot must pass quality: 80 to CDP captureScreenshot "
+                "(Playwright MCP re-encodes at 80 after resize — proven sweet spot)"
+            )
+            return
+    raise AssertionError("cmd_screenshot function not found")
+
+
+def test_screenshot_default_path_is_jpg():
+    """Default screenshot path must use .jpg extension (not .png)."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_screenshot":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            default_lines = [l for l in func_src.splitlines() if "jaine-screenshot" in l]
+            assert default_lines, "cmd_screenshot must have a default path"
+            assert ".jpg" in default_lines[0], (
+                "Default screenshot path must be .jpg (not .png) — "
+                "CDP emits JPEG, native_screenshot passes -t to screencapture"
+            )
+            return
+    raise AssertionError("cmd_screenshot function not found")
+
+
+def test_native_screenshot_passes_format_flag():
+    """native_screenshot must pass -t to screencapture so format matches extension.
+    Without -t, screencapture defaults to PNG regardless of file extension."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "native_screenshot":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            assert '"-t"' in func_src, (
+                "native_screenshot must pass -t flag to screencapture — "
+                "without it, screencapture always writes PNG regardless of extension"
+            )
+            return
+    raise AssertionError("native_screenshot function not found")
+
+
+def test_viewport_device_scale_factor_1():
+    """Viewport must use deviceScaleFactor 1 (not 2) to avoid Retina bloat.
+    Claude's vision API downscales to ~1456×819 anyway — 2x wastes 4× pixels."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_viewport":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno]
+            )
+            assert '"deviceScaleFactor": 1' in func_src, (
+                "cmd_viewport must use deviceScaleFactor 1. "
+                "Retina 2x produces 2880×1626 but Claude downscales to ~1456×819 — "
+                "1440×813 at 1x is near-optimal."
+            )
+            assert '"deviceScaleFactor": 2' not in func_src, (
+                "deviceScaleFactor must not be 2 — Retina bloat wastes 4× pixels"
+            )
+            return
+    raise AssertionError("cmd_viewport function not found")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ Adversarial review (`/bulldozer:check`) + visual browser verification (`/bulldoz
 
 | Skill | Command | What it does |
 |-------|---------|-------------|
-| check | `/bulldozer:check` | Adversarial review loop with external AI reviewer |
+| check | `/bulldozer:check` | Adversarial review loop with external AI reviewer (model selection → `-c` reasoning overrides → structured ledger) |
 | look | `/bulldozer:look [URL]` | Browser automation via CDP, AppleScript, macOS native |
 
 ## Architecture: /look
@@ -58,6 +58,16 @@ Every new `cmd_*` function in `cdp.py` MUST have:
 
 No command ships without all 4.
 
+## Architecture: /check
+
+Codex reasoning via `-c` overrides (profiles not supported in Codex 0.130.0):
+- quick: `-c model_reasoning_effort=medium --ephemeral` + prompt `SKIP SKILLS.`
+- standard/exhaustive: `-c model_reasoning_effort=xhigh`
+
+Inter-round context: structured `review-ledger.yml` (cumulative, append-only) + full previous verdict as appendix. Codex outputs `LEDGER_PATCH` YAML block at the end of each verdict — Claude applies it to the ledger.
+
+**CRITICAL:** Codex exec runs in FOREGROUND only. `-o` verdict file is written last — background + polling causes false truncation diagnosis.
+
 ## Known Issues (2026-05-11 review)
 
 ### Open
@@ -68,4 +78,4 @@ No known issues.
 
 All findings from 2026-05-11 review resolved: B1-B9 bugfixes, D1-D6 documentation fixes. See git log for details.
 
-*Version: 1.3.0 | Last Updated: 2026-05-11*
+*Version: 1.5.0 | Last Updated: 2026-05-12*
