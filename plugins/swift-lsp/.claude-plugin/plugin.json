@@ -1,6 +1,6 @@
 {
   "name": "swift-lsp",
-  "version": "2026.05.01",
+  "version": "2026.05.16",
   "description": "Swift/Objective-C language server (sourcekit-lsp) for code intelligence",
   "author": {
     "name": "JAINE",
