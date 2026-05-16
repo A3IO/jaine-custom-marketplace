@@ -188,3 +188,101 @@ def test_window_bounds_returns_coords(jaine_browser):
     r = run_cdp(["window", "bounds"])
     assert r.returncode == 0, "window bounds failed: {}".format(r.stderr)
     assert "," in r.stdout, "Expected comma-separated bounds, got: {}".format(r.stdout)
+
+
+# ── Issue #55: --clip, --scale, dimensions in stdout ──
+
+# Import the production helper from cdp.py so tests stay in sync with the
+# source-of-truth parser (no drift if _image_dimensions gains bugfixes).
+def _load_image_dimensions():
+    import importlib.util
+    from conftest import CDP_SCRIPT  # noqa: E402
+    spec = importlib.util.spec_from_file_location("_cdp_under_test", CDP_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod._image_dimensions
+
+
+_read_jpeg_dimensions = _load_image_dimensions()
+
+
+def test_screenshot_clip_captures_region(test_page_url, tmp_path):
+    """--clip X Y W H captures the requested CSS-pixel region at native DPR (issue #55).
+
+    Default --clip produces native-DPR output (Retina 2× preserves UI detail —
+    the skill's primary use case is verifying fine UI details). Output
+    dimensions = CSS-pixel size × devicePixelRatio.
+    """
+    run_cdp(["viewport", "1440", "900"])
+    dpr_r = run_cdp(["js", "window.devicePixelRatio"])
+    try:
+        dpr = float(dpr_r.stdout.strip())
+    except ValueError:
+        dpr = 1.0
+
+    path = str(tmp_path / "clip.jpg")
+    r = run_cdp(["screenshot", path, "--clip", "100", "100", "200", "150"])
+    assert r.returncode == 0, "screenshot --clip failed: {}".format(r.stderr)
+    dims = _read_jpeg_dimensions(path)
+    assert dims is not None, "Could not parse JPEG dimensions from {}".format(path)
+    w, h = dims
+    expected_w = int(round(200 * dpr))
+    expected_h = int(round(150 * dpr))
+    assert w == expected_w and h == expected_h, (
+        "Clip dimensions wrong: got {}×{}, expected {}×{} (200×150 CSS × DPR={})".format(
+            w, h, expected_w, expected_h, dpr
+        )
+    )
+
+
+def test_screenshot_prints_dimensions_to_stdout(test_page_url, tmp_path):
+    """screenshot prints dimensions in the canonical 'PATH  W×H' format (issue #55).
+
+    Tight format guard: the path is followed by two spaces and W×H using the
+    U+00D7 multiplication sign. Agents and downstream parsers can rely on it.
+    """
+    path = str(tmp_path / "dim.jpg")
+    r = run_cdp(["screenshot", path])
+    assert r.returncode == 0, "screenshot failed: {}".format(r.stderr)
+    import re
+    pattern = re.escape(path) + r"\s\s+\d+×\d+"
+    assert re.search(pattern, r.stdout), (
+        "screenshot stdout should match '{}  W×H' (two spaces, U+00D7). Got: {!r}".format(path, r.stdout)
+    )
+
+
+def test_screenshot_scale_one_produces_css_pixel_output(test_page_url, tmp_path):
+    """--scale 1 produces 1:1 (CSS-pixel) screenshot via clip.scale = 1 / devicePixelRatio (issue #55).
+
+    Starts from a known 1440×900 viewport. --scale 1 is the opt-in path for
+    explicit 1:1 output — width must not exceed ~1500 px regardless of native DPR
+    (on Retina the 2× capture is divided by setting clip.scale = 0.5).
+    """
+    run_cdp(["viewport", "1440", "900"])
+    path = str(tmp_path / "scale1.jpg")
+    r = run_cdp(["screenshot", path, "--scale", "1"])
+    assert r.returncode == 0, "screenshot --scale 1 failed: {}".format(r.stderr)
+    dims = _read_jpeg_dimensions(path)
+    assert dims is not None, "Could not parse JPEG dimensions"
+    w, _ = dims
+    assert w <= 1500, (
+        "Width {} suggests DPR > 1; --scale 1 should produce ~1440px-wide image".format(w)
+    )
+
+
+def test_screenshot_clip_and_scale_combined(test_page_url, tmp_path):
+    """--clip + --scale 1 produces region capture at CSS-pixel resolution (issue #55).
+
+    Regression guard for the combined-path: --scale must override the clip.scale=1
+    that --clip pre-fills. Without this, a refactor that loses the override would
+    silently produce DPR-scaled clip output (e.g. 400×300 instead of 200×150 on Retina).
+    """
+    run_cdp(["viewport", "1440", "900"])
+    path = str(tmp_path / "combo.jpg")
+    r = run_cdp(["screenshot", path, "--clip", "0", "0", "200", "150", "--scale", "1"])
+    assert r.returncode == 0, "screenshot --clip + --scale failed: {}".format(r.stderr)
+    dims = _read_jpeg_dimensions(path)
+    assert dims == (200, 150), (
+        "Combined --clip + --scale 1 must produce CSS-pixel output (200×150), got {}".format(dims)
+    )

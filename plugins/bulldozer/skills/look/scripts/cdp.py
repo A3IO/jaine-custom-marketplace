@@ -3,7 +3,12 @@
 
 Usage:
   cdp.py status                    — check if browser is running
-  cdp.py screenshot [FILE]         — capture page screenshot
+  cdp.py screenshot [FILE] [--full-page] [--clip X Y W H] [--scale N]
+                                   — capture screenshot
+                                     --full-page : whole document (below-fold included)
+                                     --clip X Y W H : CSS-pixel region (mutex with --full-page)
+                                     --scale N : DPR override (1 = CSS pixels)
+                                     stdout always prints "PATH  W×H"
   cdp.py js 'EXPRESSION'           — execute JS in main world
   cdp.py navigate URL              — navigate to URL
   cdp.py open URL                  — open URL in new tab
@@ -11,10 +16,10 @@ Usage:
   cdp.py title                     — get page title
   cdp.py html                      — get full page HTML
   cdp.py reload                    — reload current page (cache bypass)
-  cdp.py wait SELECTOR [TIMEOUT]   — wait for CSS selector (default 10s)
+  cdp.py wait [--js] SELECTOR_OR_EXPR [TIMEOUT]  — wait for CSS selector or JS expression (--js)
   cdp.py click SELECTOR            — click element by CSS selector
   cdp.py fill SELECTOR VALUE       — fill input/textarea
-  cdp.py console                   — read console messages
+  cdp.py console                   — console messages + uncaught exceptions
   cdp.py network                   — recent network requests
   cdp.py pdf [FILE]                — save page as PDF
   cdp.py viewport WIDTH HEIGHT     — change viewport size
@@ -242,11 +247,168 @@ def cmd_tabs(args):
             print("{}  {:40s}  {}".format(
                 t["id"][:12], t.get("title", "?")[:40], t.get("url", "?")[:60]))
 
+def _image_dimensions(path):
+    """Read W×H from a JPEG or PNG file by parsing its header. Returns (w, h) or None.
+
+    Avoids a hard dependency on Pillow — we already produce only JPEG (CDP) and
+    PNG (native screencapture fallback), so a few bytes of header parsing is enough.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read(65536)
+    except OSError:
+        return None
+    if data[:3] == b"\xff\xd8\xff":
+        i = 2
+        n = len(data)
+        while i < n - 8:
+            if data[i] != 0xFF:
+                return None
+            marker = data[i + 1]
+            # SOF markers, excluding DHT/JPG/DAC
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                h = (data[i + 5] << 8) | data[i + 6]
+                w = (data[i + 7] << 8) | data[i + 8]
+                return (w, h) if w > 0 and h > 0 else None
+            length = (data[i + 2] << 8) | data[i + 3]
+            if length < 2:
+                return None
+            i += 2 + length
+        return None
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        w = int.from_bytes(data[16:20], "big")
+        h = int.from_bytes(data[20:24], "big")
+        return (w, h) if w > 0 and h > 0 else None
+    return None
+
+
 def cmd_screenshot(args):
+    args = list(args)
+
+    full_page = "--full-page" in args
+    args = [a for a in args if a != "--full-page"]
+
+    # --clip X Y W H (CSS pixels). Mutually exclusive with --full-page.
+    clip = None
+    if "--clip" in args:
+        i = args.index("--clip")
+        try:
+            vals = [float(v) for v in args[i + 1 : i + 5]]
+            if len(vals) != 4:
+                raise ValueError("expected 4 numeric args (X Y W H)")
+        except (IndexError, ValueError) as e:
+            print("ERROR: --clip needs 4 numbers (X Y W H): {}".format(e), file=sys.stderr)
+            return 1
+        if vals[2] <= 0 or vals[3] <= 0:
+            print("ERROR: --clip width and height must be positive (got W={}, H={})".format(vals[2], vals[3]), file=sys.stderr)
+            return 1
+        clip = {"x": vals[0], "y": vals[1], "width": vals[2], "height": vals[3], "scale": 1}
+        del args[i : i + 5]
+    if full_page and clip:
+        print("ERROR: --clip and --full-page are mutually exclusive", file=sys.stderr)
+        return 1
+
+    # --scale N — output at N × CSS-pixel resolution.
+    # Implemented via clip.scale = N / native_dpr. setDeviceMetricsOverride
+    # does NOT change Page.captureScreenshot output size (empirically verified:
+    # on a Retina display, even after viewport sets deviceScaleFactor=1, capture
+    # still returns native-device pixels). clip.scale is the only CDP knob that
+    # affects output dimensions.
+    scale_override = None
+    if "--scale" in args:
+        i = args.index("--scale")
+        try:
+            scale_override = float(args[i + 1])
+        except (IndexError, ValueError) as e:
+            print("ERROR: --scale needs a numeric arg: {}".format(e), file=sys.stderr)
+            return 1
+        import math
+        if not math.isfinite(scale_override):
+            print("ERROR: --scale must be a finite number (got {!r})".format(args[i + 1]), file=sys.stderr)
+            return 1
+        if scale_override <= 0:
+            print("ERROR: --scale must be positive (got {})".format(scale_override), file=sys.stderr)
+            return 1
+        del args[i : i + 2]
+
     path = args[0] if args else "/tmp/jaine-screenshot.jpg"
+
     if has_websocket():
         tab = get_tab()
-        r = ws_send(tab["webSocketDebuggerUrl"], "Page.captureScreenshot", {"format": "jpeg", "quality": 80})
+        ws_url = tab["webSocketDebuggerUrl"]
+        params = {"format": "jpeg", "quality": 80}
+
+        if clip:
+            params["clip"] = clip
+        elif full_page:
+            metrics = cdp_js("JSON.stringify({w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight})")
+            if not metrics or not metrics.get("value"):
+                print("WARNING: --full-page could not read page dimensions, capturing viewport only", file=sys.stderr)
+            else:
+                try:
+                    dims = json.loads(metrics["value"])
+                    w, h = int(dims["w"]), int(dims["h"])
+                    if w > 0 and h > 0:
+                        params["captureBeyondViewport"] = True
+                        params["clip"] = {"x": 0, "y": 0, "width": w, "height": h, "scale": 1}
+                    else:
+                        print("WARNING: --full-page got {}x{}, capturing viewport only".format(w, h), file=sys.stderr)
+                except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+                    print("WARNING: --full-page metrics parse failed ({}), capturing viewport only".format(e), file=sys.stderr)
+
+        if scale_override is not None:
+            # Read DPR via Runtime.evaluate on the SAME ws_url as the eventual capture.
+            # Opening a separate WebSocket via a fresh get_tab() lookup would risk
+            # targeting a different tab in a multi-tab JAINE Browser.
+            dpr_response = ws_send(ws_url, "Runtime.evaluate", {
+                "expression": "window.devicePixelRatio",
+                "returnByValue": True,
+            })
+            dpr_r = (dpr_response or {}).get("result", {}).get("result")
+            if dpr_r is None:
+                print(
+                    "WARNING: --scale could not read window.devicePixelRatio (CDP error). "
+                    "Assuming 1.0 — output may be larger than expected on Retina.",
+                    file=sys.stderr,
+                )
+                native_dpr = 1.0
+            else:
+                try:
+                    native_dpr = float(dpr_r.get("value", 1))
+                except (TypeError, ValueError):
+                    print(
+                        "WARNING: --scale got unexpected devicePixelRatio response {!r}, assuming 1.0".format(dpr_r),
+                        file=sys.stderr,
+                    )
+                    native_dpr = 1.0
+            if native_dpr <= 0:
+                print(
+                    "WARNING: --scale got non-positive devicePixelRatio={}, assuming 1.0".format(native_dpr),
+                    file=sys.stderr,
+                )
+                native_dpr = 1.0
+            effective_scale = scale_override / native_dpr
+            if "clip" in params:
+                params["clip"]["scale"] = effective_scale
+            else:
+                vp_response = ws_send(ws_url, "Runtime.evaluate", {
+                    "expression": "JSON.stringify({w: window.innerWidth, h: window.innerHeight})",
+                    "returnByValue": True,
+                })
+                vp = (vp_response or {}).get("result", {}).get("result")
+                if not vp or not vp.get("value"):
+                    print("ERROR: --scale could not read viewport to build implicit clip", file=sys.stderr)
+                    return 1
+                try:
+                    d = json.loads(vp["value"])
+                    params["clip"] = {"x": 0, "y": 0, "width": int(d["w"]), "height": int(d["h"]), "scale": effective_scale}
+                except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+                    print("ERROR: --scale viewport parse failed: {}".format(e), file=sys.stderr)
+                    return 1
+            print("NOTE: --scale {} via clip.scale={:.3f} (native devicePixelRatio={})".format(
+                scale_override, effective_scale, native_dpr), file=sys.stderr)
+
+        r = ws_send(ws_url, "Page.captureScreenshot", params)
         data = (r or {}).get("result", {}).get("data", "")
         if not data:
             print("ERROR: empty screenshot", file=sys.stderr)
@@ -254,13 +416,22 @@ def cmd_screenshot(args):
         img = base64.b64decode(data)
         with open(path, "wb") as f:
             f.write(img)
-        log("screenshot", channel="cdp", path=path, size=len(img), url=tab.get("url", "?")[:80])
+        log("screenshot", channel="cdp", path=path, size=len(img), url=tab.get("url", "?")[:80], clip=bool(clip), scale=scale_override)
     else:
+        if clip is not None or scale_override is not None:
+            print("ERROR: --clip and --scale require CDP (websocket-client unavailable)", file=sys.stderr)
+            return 1
         if not native_screenshot(path):
             print("ERROR: native screenshot failed", file=sys.stderr)
             return 1
         log("screenshot", channel="native", path=path, size=os.path.getsize(path))
-    print(path)
+
+    dims = _image_dimensions(path)
+    if dims:
+        print("{}  {}×{}".format(path, dims[0], dims[1]))
+    else:
+        print("WARNING: could not parse image dimensions from {}".format(path), file=sys.stderr)
+        print(path)
     return 0
 
 def cmd_js(args):
@@ -346,13 +517,21 @@ def cmd_wait(args):
     if not args:
         print("Usage: cdp.py wait SELECTOR [TIMEOUT]")
         return 1
-    selector = args[0]
-    try:
-        timeout = int(args[1]) if len(args) > 1 else 10
-    except ValueError:
-        print("ERROR: TIMEOUT must be an integer, got: {}".format(args[1]), file=sys.stderr)
+    is_js = "--js" in args
+    filtered = [a for a in args if a != "--js"]
+    selector = filtered[0] if filtered else ""
+    if not selector:
+        print("Usage: cdp.py wait [--js] SELECTOR_OR_EXPR [TIMEOUT]")
         return 1
-    expr = "!!document.querySelector({})".format(json.dumps(selector))
+    try:
+        timeout = int(filtered[1]) if len(filtered) > 1 else 10
+    except ValueError:
+        print("ERROR: TIMEOUT must be an integer, got: {}".format(filtered[1]), file=sys.stderr)
+        return 1
+    if is_js:
+        expr = "!!({})".format(selector)
+    else:
+        expr = "!!document.querySelector({})".format(json.dumps(selector))
     start = time.time()
     while time.time() - start < timeout:
         if has_websocket():
@@ -366,7 +545,7 @@ def cmd_wait(args):
         if found:
             elapsed = int((time.time() - start) * 1000)
             print("Found '{}' in {}ms".format(selector, elapsed))
-            log("wait", selector=selector, elapsed_ms=elapsed)
+            log("wait", channel=channel(), selector=selector, elapsed_ms=elapsed)
             return 0
         time.sleep(0.5)
     print("Timeout: '{}' not found after {}s".format(selector, timeout), file=sys.stderr)
@@ -439,7 +618,9 @@ def cmd_console(args):
     try:
         ws.send(json.dumps({"id": 1, "method": "Console.enable"}))
         ws.recv()
-        ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate", "params": {
+        ws.send(json.dumps({"id": 2, "method": "Runtime.enable"}))
+        ws.recv()
+        ws.send(json.dumps({"id": 3, "method": "Runtime.evaluate", "params": {
             "expression": "console.log('__CDP_PING__')"
         }}))
         deadline = time.time() + 3
@@ -454,6 +635,19 @@ def cmd_console(args):
                     if text != "__CDP_PING__":
                         level = entry.get("level", "log")
                         messages.append("[{}] {}".format(level, text))
+                elif msg.get("method") == "Runtime.exceptionThrown":
+                    exc = msg.get("params", {}).get("exceptionDetails") or {}
+                    text = exc.get("text", "")
+                    ex_obj = exc.get("exception") or {}
+                    desc = ex_obj.get("description") or ex_obj.get("value") or ""
+                    line_num = exc.get("lineNumber", 0) + 1
+                    col_num = exc.get("columnNumber", 0) + 1
+                    url = exc.get("url") or ""
+                    if url and "/" in url:
+                        loc = "{}:{}:{}".format(url.rsplit("/", 1)[-1], line_num, col_num)
+                    else:
+                        loc = "line {}:{}".format(line_num, col_num)
+                    messages.append("[exception] {} — {}".format(desc or text or "(no description)", loc))
             except websocket.WebSocketTimeoutException:
                 break
             except (json.JSONDecodeError, OSError) as e:

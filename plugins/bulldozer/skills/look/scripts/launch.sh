@@ -38,8 +38,6 @@ fi
   --disable-component-update \
   --window-size=${WINDOW_WIDTH},${WINDOW_HEIGHT} \
   --window-position=100,100 \
-  --force-dark-mode \
-  --enable-features=WebContentsForceDark \
   "$URL" \
   >> /0/.jaine/.browser/chrome.log 2>&1 &
 

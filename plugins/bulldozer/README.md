@@ -20,8 +20,9 @@ Send artifact to reviewer (Codex CLI) → parse findings → verify each empiric
 Open URL in JAINE Browser (CDP :9333), take screenshot, show it.
 
 ```
-/bulldozer:look                                     # screenshot current tab
-/bulldozer:look http://localhost:9401                # open URL, screenshot
+/bulldozer:look                                                     # screenshot current tab
+/bulldozer:look http://localhost:9401                                # open URL, screenshot
+/bulldozer:look file:///tmp/page.html — проверить рендеринг таблицы  # URL + task description (description is your own brief, not passed to scripts)
 ```
 
 **17 CDP commands (zero dependencies — websocket-client bundled):**
@@ -30,11 +31,13 @@ Open URL in JAINE Browser (CDP :9333), take screenshot, show it.
 |----------|----------|
 | Status | `status`, `tabs` |
 | Navigation | `navigate`, `open`, `reload` |
-| See | `screenshot`, `title`, `html` |
+| See | `screenshot [FILE] [--full-page] [--clip X Y W H] [--scale N]`, `title`, `html` |
 | Execute | `js`, `wait`, `click`, `fill` |
 | Debug | `console`, `network` |
 | Generate | `pdf`, `viewport` |
 | Window | `window [bounds\|upper\|lower\|activate]` |
+
+Screenshot prints `PATH  W×H` to stdout. Default output is at native DPR (Retina ≈ 2×); `--clip X Y W H` captures a CSS-pixel region; `--scale 1` forces CSS-pixel output via `clip.scale = 1 / window.devicePixelRatio`.
 
 Multi-channel: CDP WebSocket (primary) → AppleScript + DOM injection (fallback) → macOS screencapture (screenshot fallback). 13/17 commands work without websocket.
 

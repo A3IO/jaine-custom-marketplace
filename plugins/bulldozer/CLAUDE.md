@@ -7,7 +7,7 @@ Adversarial review (`/bulldozer:check`) + visual browser verification (`/bulldoz
 | Skill | Command | What it does |
 |-------|---------|-------------|
 | check | `/bulldozer:check` | Adversarial review loop with external AI reviewer (model selection → `-c` reasoning overrides → structured ledger) |
-| look | `/bulldozer:look [URL]` | Browser automation via CDP, AppleScript, macOS native |
+| look | `/bulldozer:look [URL] [task description]` | Browser automation via CDP, AppleScript, macOS native |
 
 ## Architecture: /look
 
@@ -20,6 +20,12 @@ Adversarial review (`/bulldozer:check`) + visual browser verification (`/bulldoz
 | macOS native | screenshot without websocket | screenshot only |
 
 JAINE Browser = separate Chrome instance on CDP port 9333.
+
+**Design principle:** cdp.py is used by JAINE (Claude Code agent), not a human. Design accordingly:
+- Explicit flags (`--js`, `--full-page`) over heuristic auto-detection
+- Parseable, stable output format over pretty formatting
+- No silent fallbacks — warn on stderr when requested behavior degrades
+- SKILL.md = API docs for the agent; if a capability isn't described there, JAINE won't use it
 
 ## Testing
 
@@ -68,6 +74,32 @@ Inter-round context: structured `review-ledger.yml` (cumulative, append-only) + 
 
 **CRITICAL:** Codex exec runs in FOREGROUND only. `-o` verdict file is written last — background + polling causes false truncation diagnosis.
 
+## Feedback Protocol
+
+Before working on skill improvements, check for feedback issues from other JAINE sessions:
+
+```bash
+gh issue list --repo A3IO/jaine-plugins --label feedback,bulldozer --state open
+```
+
+Feedback issues are created by JAINE-consumer sessions that encountered friction while using bulldozer skills. Each issue follows a structured template: what was attempted, what went wrong, workaround used, and plugin version.
+
+When fixing a feedback issue:
+1. Read the issue body for reproduction context
+2. Fix the skill/code/documentation
+3. Refresh consumer's plugin cache (`jaine-sync plugins update` or `rm -rf ~/.claude/plugins/cache/jaine-custom/bulldozer/`)
+4. Close the issue with a reference to the fix commit
+
+**CRITICAL:** Step 3 prevents stale cache — the root cause of false positives in issue #46 where 3/6 feedback items were invalid because JAINE-consumer was running an old plugin version.
+
+## Versioning
+
+`plugin.json` version auto-bumps on every merge to `bulldozer/main` via the `auto-calver` post-merge hook. Format: `YYYY.MM.DD` (first merge of the day) → `YYYY.MM.DD.N` (subsequent merges same day). **Do NOT bump manually** — it causes double-bump (your bump + auto-bump = `.1` suffix for a cosmetic-only PR).
+
+## Architecture: skills-only
+
+Plugin uses `skills/` directory exclusively. No `commands/` directory — per Claude Code docs, commands and skills are the same mechanism, and having both with the same name causes one to be silently dropped. Each `/bulldozer:*` invocation loads `skills/*/SKILL.md` directly.
+
 ## Known Issues (2026-05-11 review)
 
 ### Open
@@ -76,6 +108,13 @@ No known issues.
 
 ### Fixed
 
-All findings from 2026-05-11 review resolved: B1-B9 bugfixes, D1-D6 documentation fixes. See git log for details.
+- **2026-05-16:** Three feedback issues from a JAINE-consumer session in `/0/SANDBOX/BRANCHLAB` (PR #57):
+  - **#54** — `launch.sh` no longer passes `--force-dark-mode` or `--enable-features=WebContentsForceDark`. WebContentsForceDark was the sole cause of content recoloring; `--force-dark-mode` was verified inert on Dark-OS for CDP screenshots (chrome is never captured) and a latent risk on Light-OS — both dropped.
+  - **#55** — `screenshot` gained `--clip X Y W H` (CSS-pixel region capture, mutex with `--full-page`) and `--scale N` (opt-in output resolution via `clip.scale = N / window.devicePixelRatio`). Every screenshot prints `PATH  W×H` on stdout. Empirical lesson encoded in cdp.py comments: `Emulation.setDeviceMetricsOverride{deviceScaleFactor:1}` does **not** change `Page.captureScreenshot` output size — only `clip.scale` does.
+  - **#56** — SKILL.md Quick Invoke now instructs the agent to parse `$ARGUMENTS` into "URL token + task description". Previously the whole string was substituted into the URL slot, producing malformed navigation when a description was present.
+  - **Post-review polish** (silent-failure-hunter + pr-test-analyzer + code-reviewer + comment-analyzer found 21 real findings, 1 FP): `_image_dimensions` rejects 0×0 from truncated headers (M2); WARN on stderr when `devicePixelRatio` read fails (SF1) or `_image_dimensions` returns None (SF3); `log("screenshot", …)` records `clip=`/`scale=` (M1); +14 structural tests covering arg-parse error paths, zero-DPR guard, native-path rejection of `--clip/--scale`; +5 unit tests for `_image_dimensions` (truncated JPEG/PNG, non-image, missing file, valid PNG); +1 e2e combo test (`--clip + --scale 1` → exact CSS-pixel output); tightened stdout format regex; `test_e2e.py` now imports `_image_dimensions` from `cdp.py` instead of duplicating the JPEG SOF parser; SKILL.md description/argument-hint updated per `/en/skills` docs (added triggers `capture region`, `check if X is aligned`, `захватить область`, `UI detail check`; argument-hint `[URL] [task description]`).
 
-*Version: 1.5.0 | Last Updated: 2026-05-12*
+- **2026-05-14:** Commands/skills architecture — `commands/` directory removed, content merged into `skills/*/SKILL.md`. Root cause: `commands/check.md` and `skills/check/SKILL.md` both registered `/bulldozer:check`, only one loaded — consumer never saw Feedback section, Anti-patterns, Red Flags (336 lines of dead content). Same bug in look. (PR #51)
+- **2026-05-11:** B1-B9 bugfixes, D1-D6 documentation fixes. See git log for details.
+
+*Version: 1.8.0 | Last Updated: 2026-05-16*

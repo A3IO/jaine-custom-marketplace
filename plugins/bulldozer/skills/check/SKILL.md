@@ -1,6 +1,8 @@
 ---
 name: check
-description: Use when a spec, design doc, or code artifact needs rigorous verification before execution — especially when correctness matters more than speed, when the artifact will drive automated actions (scripts, pipelines), or when you want a second opinion from a different AI model before committing to a plan
+description: "Adversarial review of specs, designs, configs, or code via external AI reviewer (Codex CLI). Triggers on \"review this spec\", \"adversarial review\", \"check this design\", \"second opinion\", \"проверь спеку\", \"ревью артефакта\", \"bulldozer check\". Do NOT use for quick questions, trivial edits, or code with existing test coverage."
+argument-hint: "[quick|standard|exhaustive] [file|dir|diff]"
+allowed-tools: ["Bash", "Read", "Edit", "Write", "AskUserQuestion"]
 ---
 
 # Adversarial Review Loop
@@ -17,6 +19,80 @@ Proven: 37 real issues found in 7 rounds, 0 false positives.
 - Any artifact where "wrong = costly" and a second opinion helps
 
 **Do NOT use for:** Quick questions, trivial edits, code that has tests covering it, free-form prompts without a concrete artifact.
+
+## Step 1: Model Selection (EVERY launch)
+
+Before any other action, discover available models and ask the user which one to use.
+
+**1a. Get available models** — run:
+```bash
+if ! codex_output=$(codex debug models 2>&1); then
+    echo "ERROR: 'codex debug models' failed. Check: codex installed? logged in? (codex login)" >&2
+    exit 1
+fi
+printf '%s' "$codex_output" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except (json.JSONDecodeError, ValueError):
+    print('ERROR: codex returned non-JSON output', file=sys.stderr)
+    sys.exit(1)
+models = data.get('models', [])
+if not models:
+    print('ERROR: empty model catalog', file=sys.stderr)
+    sys.exit(1)
+listed = [m for m in models if m.get('visibility') == 'list']
+if not listed:
+    print(f'ERROR: no models with visibility=list ({len(models)} models found, schema may have changed)', file=sys.stderr)
+    sys.exit(1)
+for m in listed:
+    slug = m.get('slug')
+    if not slug: continue
+    name = m.get('display_name', slug)
+    print(f'{slug}|{name}|{m.get(\"priority\", 999)}')
+"
+```
+
+If the snippet exits non-zero, tell the user to check `codex --version` and `codex login`, then ask them to type a model name manually.
+
+**1b. Read saved preference** — if `.bulldozer/config.md` exists, read `reviewer_model` from its YAML frontmatter. If the file is malformed or missing the key, warn the user ("`.bulldozer/config.md` unreadable — ignoring saved preference") and let them pick fresh. Mark the saved model as "(Recommended)" in options.
+
+**1c. Ask user** — via AskUserQuestion, show 4 models. Selection rules (in order):
+1. **ALWAYS** include current global model from `~/.codex/config.toml` (line 1: `model = "..."`)
+2. **ALWAYS** include last used model from `.bulldozer/config.md` (if different from global)
+3. Fill remaining slots from: gpt-5.5, gpt-5.3-codex-spark, gpt-5.4-mini (skip gpt-5.4 and gpt-5.3-codex — redundant)
+4. If global = last used, you get 3 slots for the above
+
+This guarantees the user's configured model is never hidden by priority sorting.
+
+**1d. Save choice** — update ONLY `reviewer_model` in `.bulldozer/config.md`, preserving any other keys. Pass to codex exec via `-m <model>`.
+
+## Step 2: Parse Arguments
+
+If no arguments provided, explain to the user:
+
+> **Bulldozer** sends ваш артефакт (спеку, код, конфиг) на ревью внешнему AI-рецензенту (Codex CLI), затем каждый finding проверяется эмпирически в коде, фиксится, и отправляется на повторное ревью — и так до вердикта GO.
+>
+> **Использование:**
+> ```
+> /bulldozer:check path/to/spec.md              — standard (до 3 раундов)
+> /bulldozer:check quick path/to/config.json     — один раунд, только блокеры
+> /bulldozer:check exhaustive docs/design.md     — до полного GO (макс 10 раундов)
+> /bulldozer:check standard src/gateway/         — ревью директории
+> ```
+>
+> **Уровни глубины:**
+> - `quick` — один раунд, только критичные проблемы
+> - `standard` — до 3 раундов, баланс глубины и скорости (по умолчанию)
+> - `exhaustive` — крутится пока рецензент не скажет GO (для спек, управляющих автоматизацией)
+
+Then ask: what artifact to review, and which depth level.
+
+If arguments provided, parse depth and artifact from $ARGUMENTS:
+- First word matching `quick|standard|exhaustive` → depth (default: `standard`)
+- Remaining → artifact path (file or directory)
+- If only depth given, ask for artifact
+- If only path given, use `standard` depth
 
 ## Artifact Types
 
@@ -40,15 +116,11 @@ Free-form prompts without a file/dir/diff are NOT supported — the iterative fi
 
 Default: `standard`. Override via argument: `/bulldozer:check exhaustive`
 
-## Process
-
-Note: "Ask model" happens in `commands/check.md` Step 1 before the skill is invoked. The skill assumes model is already chosen.
-
 ```dot
 digraph review_loop {
   rankdir=TB;
-  "Resolve project root" -> "Auto-gitignore";
-  "Auto-gitignore" -> "Setup review dir";
+  "Resolve project root" -> "Self-ignore .bulldozer";
+  "Self-ignore .bulldozer" -> "Setup review dir";
   "Setup review dir" -> "Send to reviewer (FOREGROUND)";
   "Send to reviewer (FOREGROUND)" -> "Read verdict file";
   "Read verdict file" -> "Empty?" [label=""];
@@ -93,12 +165,12 @@ PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
 If this fails, STOP the review — do not proceed with empty `$PROJECT_ROOT`.
 Use `$PROJECT_ROOT` in all `-C` flags and paths below.
 
-**1c. Auto-gitignore** — ensure `.bulldozer/` is in the project's `.gitignore`:
+**1c. Self-ignoring `.bulldozer/`** — drop a single-line `.gitignore` inside `.bulldozer/` so the directory hides its own contents from git, without touching the consumer's project-level `.gitignore`. Same pattern as `.remember/`. Idempotent. Path is cwd-relative for parity with `REVIEW_DIR` (Step 1) and the downstream scripts (`log-round.sh`, `update-state.py`) that all assume `cwd == $PROJECT_ROOT` when the skill runs.
 ```bash
-GITIGNORE="$PROJECT_ROOT/.gitignore"
-if ! grep -Eq '^/?\.bulldozer/?$' "$GITIGNORE" 2>/dev/null; then
-    if ! echo '.bulldozer/' >> "$GITIGNORE" 2>/dev/null; then
-        echo "WARNING: could not write to $GITIGNORE. Add '.bulldozer/' manually." >&2
+mkdir -p .bulldozer
+if [[ ! -f .bulldozer/.gitignore ]]; then
+    if ! echo '*' > .bulldozer/.gitignore 2>/dev/null; then
+        echo "WARNING: could not write .bulldozer/.gitignore — check permissions on $(pwd)/.bulldozer. Re-run after fixing." >&2
     fi
 fi
 ```
@@ -332,7 +404,8 @@ findings:
 ## Review Directory Layout
 
 ```
-.bulldozer/                                    # gitignore this entire dir
+.bulldozer/                                    # .gitignore inside ('*') hides this dir from git — no project-level entry needed
+  .gitignore                                  # one line: *
   bf5a38d6-auth-design/                        # session prefix + artifact
     review-ledger.yml                          # cumulative ledger (managed by Claude)
     verdict-r1.txt                             # clean codex answer round 1
@@ -393,7 +466,7 @@ reviewer_model: gpt-5.5
 | Not calling log-round.sh every round | State becomes incomplete — call EVERY round |
 | Claude summarizing findings in prose for next round | Use ledger + full previous verdict as appendix — don't lose nuance |
 | Telling reviewer to "verify files exist" for a design spec | Spec describes FUTURE state — check consistency and feasibility, not filesystem |
-| Not adding `.bulldozer/` to project .gitignore | Step 1c does this automatically using `$PROJECT_ROOT/.gitignore` |
+| Modifying the consumer's project `.gitignore` | Step 1c writes a self-ignoring `.bulldozer/.gitignore` instead — no project-level changes |
 
 ## Red Flags — STOP and Reassess
 
@@ -408,3 +481,48 @@ reviewer_model: gpt-5.5
 - **`/receiving-code-review`** — REQUIRED for the verification step. Prevents blind implementation.
 - **`/verification-before-completion`** — use after final GO to confirm artifact is truly ready.
 - **`/brainstorming`** — use BEFORE this skill to design the artifact; this skill reviews it.
+
+## Feedback
+
+If you encounter friction while using this skill — documentation mismatch, missing capability, unclear error, or need a workaround — create a GitHub issue so JAINE-developer can fix it in real-time.
+
+**Create issue when:**
+1. SKILL.md describes behavior X, reality is Y
+2. Had to use a workaround instead of the standard path
+3. Need a feature that doesn't exist
+4. Script failed with an unhelpful error message
+5. No existing bulldozer skill covers the use case (use `[feedback/new-skill]` prefix)
+
+**Do NOT create issue when:** own mistake in arguments, external problem (Codex CLI not installed, network down), or behavior documented as a known limitation.
+
+**Command:**
+
+```bash
+gh issue create --repo A3IO/jaine-plugins \
+  --label "feedback,bulldozer,check" \
+  --title "[feedback/check] short description" \
+  --body "$(cat <<ISSUE
+## What I was doing
+{task description}
+
+## What I expected
+{expected behavior}
+
+## What happened
+{actual behavior, errors}
+
+## Workaround used
+{what was done instead, or "none — blocked"}
+
+## Environment
+- Plugin version: $(jq -r .version "$CLAUDE_PLUGIN_ROOT/.claude-plugin/plugin.json")
+- Skill: check
+- Project: $(pwd)
+ISSUE
+)"
+```
+
+**For new-skill requests (trigger #5):** use title prefix `[feedback/new-skill]`, labels `feedback,bulldozer` (omit `check`).
+
+After creating the issue, tell the user:
+> "I created a feedback issue about the check skill: {URL}. Want me to continue with a workaround, or would you like to get this fixed first?"
