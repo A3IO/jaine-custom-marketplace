@@ -95,3 +95,4 @@ View: `column -t -s'|' ~/.claude/hooks/bulldozer.log`
 ## Origin
 
 Developed from a real workflow that found 37 issues in 7 rounds (0 false positives) reviewing a REVERSING audit spec.
+<!-- c9 multi-commit test doc -->
