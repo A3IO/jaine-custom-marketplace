@@ -1,0 +1,17 @@
+# scripts/templates/autobump-stub.yml
+# Canonical stub for plugin orphan branches.
+# Per-plugin instantiation: substitute bulldozer with plugin name (e.g. bulldozer).
+# sha256 of rendered file is the source of truth for drift detection.
+name: Autobump (stub)
+
+on:
+  push:
+    branches:
+      - bulldozer/main
+
+permissions:
+  contents: write
+
+jobs:
+  call:
+    uses: A3IO/jaine-plugins/.github/workflows/_autobump-callable.yml@main
