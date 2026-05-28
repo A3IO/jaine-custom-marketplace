@@ -1,0 +1,10 @@
+{
+  "name": "jaine-matrix",
+  "version": "2026.05.29",
+  "description": "Matrix channel for Claude Code — chat with your session from any Matrix client via a self-hosted homeserver",
+  "author": {
+    "name": "JAINE",
+    "email": "jaine@local"
+  },
+  "keywords": ["matrix", "messaging", "channel", "mcp", "synapse", "remote"]
+}

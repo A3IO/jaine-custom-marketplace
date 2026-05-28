@@ -18,6 +18,7 @@ import { join, extname, basename } from 'path'
 import type { ServerWebSocket } from 'bun'
 
 const PORT = Number(process.env.JAINECHAT_PORT ?? 7777)
+const HOST = process.env.JAINECHAT_HOST ?? '127.0.0.1'
 const STATE_DIR = join(homedir(), '.claude', 'channels', 'jainechat')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const OUTBOX_DIR = join(STATE_DIR, 'outbox')
@@ -146,7 +147,7 @@ function deliver(id: string, text: string, file?: { path: string; name: string }
 
 Bun.serve({
   port: PORT,
-  hostname: '127.0.0.1',
+  hostname: HOST,
   fetch(req, server) {
     const url = new URL(req.url)
 
@@ -204,7 +205,7 @@ Bun.serve({
   },
 })
 
-process.stderr.write(`jainechat: http://localhost:${PORT}\n`)
+process.stderr.write(`jainechat: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}\n`)
 
 const HTML = `<!doctype html>
 <meta charset="utf-8">

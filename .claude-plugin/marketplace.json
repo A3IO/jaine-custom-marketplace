@@ -76,6 +76,16 @@
       },
       "source": "./plugins/jainechat",
       "category": "channels"
+    },
+    {
+      "name": "jaine-matrix",
+      "description": "Matrix channel for Claude Code — chat with your session from any Matrix client via a self-hosted homeserver",
+      "author": {
+        "name": "JAINE",
+        "email": "jaine@local"
+      },
+      "source": "./plugins/jaine-matrix",
+      "category": "channels"
     }
   ]
 }
