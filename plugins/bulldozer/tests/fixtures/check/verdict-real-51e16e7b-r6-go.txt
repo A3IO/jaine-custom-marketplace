@@ -1,0 +1,61 @@
+Findings: none material. GO.
+
+I rechecked the prior chain against current `HEAD=3809f10` on `feat/snap-grid`.
+
+Key checks:
+- R5-F1 is terminal: [show_panel_menu](/0/DEV/JKFDMon/src/fdmon/window.py:416) purges first, guards menu-build `isVisible()`, guards Show All, and guards the chosen-action branch before relayout.
+- I found two `_entries` consumers not in the provided list: [window.py::_is_panel_visible](/0/DEV/JKFDMon/src/fdmon/window.py:406) and [panel_manager.py::has_visible](/0/DEV/JKFDMon/src/fdmon/panel_manager.py:402). `has_visible` is per-entry guarded; `_is_panel_visible` only calls `isVisible()` on the matching panel and catches `RuntimeError`, so I do not see a material dead-entry hole there.
+- The menu still builds correctly: live entries become checkable actions with current visibility; deleted entries are skipped/purged; nested delete during `menu.exec()` is caught and then `reposition_all()` purges.
+- The new source-grep test is only a weak smoke guard. It can catch removal of both purge/RuntimeError patterns, but it does not prove ordering, the first loop guard, Show All guard, or chosen-action guard. Not a blocker for this patch because the implementation itself verifies, but a behavioral FakeMenu/shiboken test would be stronger.
+
+Verification:
+- `git diff --check master...HEAD`: passed.
+- `git status --short --branch`: clean on `feat/snap-grid...origin/feat/snap-grid`.
+- Targeted pytest was blocked before collection by the read-only sandbox: `FileNotFoundError: No usable temporary directory`.
+- Offscreen Qt probes passed for direct `reposition_all` purge, `_on_panel_moved` purge, hide/show relayout, drag-detach default size restore, menu-first-consumer purge, and nested-delete chosen-action handling.
+
+```yaml
+LEDGER_PATCH:
+  review_type: standard_adversarial_round_6
+  branch: feat/snap-grid
+  base: master
+  head: 3809f10
+  diff: .bulldozer/51e16e7b-diff-snap-grid/diff.patch
+  verdict: go
+  findings: []
+  r1_recheck:
+    R1-F1: fixed_terminal
+    R1-F2: fixed_terminal
+    R1-F3: fixed_for_original_scope
+  r2_recheck:
+    R2-F1: fixed_terminal
+    R2-F2: fixed_terminal
+    R2-F3: fixed_for_runtime_scope
+  r3_recheck:
+    R3-F1: fixed_terminal
+  r4_recheck:
+    R4-F1: fixed_terminal
+  r5_recheck:
+    R5-F1: fixed_terminal
+  entries_consumers:
+    missed_non_material:
+      - src/fdmon/window.py:_is_panel_visible
+      - src/fdmon/panel_manager.py:has_visible
+  test_assessment:
+    source_grep_test: weak_smoke_guard_only
+    blocking: false
+  verification:
+    diff_check: passed
+    worktree: clean
+    pytest:
+      status: blocked
+      reason: read-only sandbox has no usable temporary directory
+    probes:
+      direct_reposition_purges_deleted_entry: passed
+      on_panel_moved_purges_deleted_entry: passed
+      menu_first_consumer_purges_deleted_entry: passed
+      chosen_action_after_nested_delete: passed
+      menu_hide_show_relayout: passed
+      drag_detach_default_size: passed
+```
+

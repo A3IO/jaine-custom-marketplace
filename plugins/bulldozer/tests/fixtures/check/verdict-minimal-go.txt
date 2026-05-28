@@ -1,0 +1,7 @@
+No material findings. GO.
+
+```yaml
+LEDGER_PATCH:
+  verdict: go
+  findings: []
+```

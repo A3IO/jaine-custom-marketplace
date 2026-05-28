@@ -1,0 +1,25 @@
+Real-world schema drift: codex emits `summary` instead of `title`, files as
+`"path:line"` strings, severity in nonstandard form, and adds top-level metadata
+fields that are not in the official SKILL.md schema. Parser must accept this
+and emit warnings on stderr.
+
+```yaml
+LEDGER_PATCH:
+  review_type: standard_adversarial
+  branch: feat/example
+  base: master
+  verdict: findings
+  findings:
+    - id: R1-F1
+      severity: critical
+      status: open
+      summary: "drift: summary field instead of title"
+      files:
+        - "src/example.py:42"
+    - id: R1-F2
+      severity: warning
+      status: open
+      summary: "drift: severity alias"
+      files:
+        - "tests/test_example.py:10-20"
+```

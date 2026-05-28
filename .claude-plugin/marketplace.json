@@ -66,6 +66,16 @@
       },
       "source": "./plugins/bulldozer",
       "category": "development"
+    },
+    {
+      "name": "jainechat",
+      "description": "JAINE localhost web chat — channel plugin for Claude Code sessions (port 7777)",
+      "author": {
+        "name": "JAINE",
+        "email": "jaine@local"
+      },
+      "source": "./plugins/jainechat",
+      "category": "channels"
     }
   ]
 }

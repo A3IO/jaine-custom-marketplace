@@ -18,6 +18,15 @@
             "command": "echo \"$(date -Iseconds) | event=look-invoke | url= | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)\" >> ~/.claude/hooks/bulldozer-look.log"
           }
         ]
+      },
+      {
+        "matcher": "^/bulldozer:consult\\b",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"$(date -Iseconds) | event=consult-invoke | round=0 | verdict= | tokens=0 | model= | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)\" >> ~/.claude/hooks/bulldozer-consult.log"
+          }
+        ]
       }
     ]
   }

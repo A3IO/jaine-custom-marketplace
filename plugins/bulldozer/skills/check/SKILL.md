@@ -1,6 +1,6 @@
 ---
 name: check
-description: "Adversarial review of specs, designs, configs, or code via external AI reviewer (Codex CLI). Triggers on \"review this spec\", \"adversarial review\", \"check this design\", \"second opinion\", \"проверь спеку\", \"ревью артефакта\", \"bulldozer check\". Do NOT use for quick questions, trivial edits, or code with existing test coverage."
+description: "Adversarial review of specs, designs, configs, or code via external AI reviewer (Codex CLI) against artifacts on disk. Triggers on \"review this spec\", \"adversarial review\", \"check this design\", \"second opinion on file\", \"проверь спеку\", \"ревью артефакта\", \"bulldozer check\". Do NOT use for inline conversational design questions without an artifact on disk — use bulldozer:consult instead. Do NOT use for quick questions, trivial edits, or code with existing test coverage."
 argument-hint: "[quick|standard|exhaustive] [file|dir|diff]"
 allowed-tools: ["Bash", "Read", "Edit", "Write", "AskUserQuestion"]
 ---
@@ -8,8 +8,6 @@ allowed-tools: ["Bash", "Read", "Edit", "Write", "AskUserQuestion"]
 # Adversarial Review Loop
 
 **Core principle:** Send artifact to an external reviewer, verify each finding empirically, fix confirmed issues, re-send — repeat until GO.
-
-Proven: 37 real issues found in 7 rounds, 0 false positives.
 
 ## When to Use
 
@@ -136,7 +134,12 @@ digraph review_loop {
   "Real or false positive?" -> "Note as false positive" [label="false"];
   "Fix confirmed issues" -> "Commit + log round";
   "Note as false positive" -> "Commit + log round";
-  "Commit + log round" -> "Round < max?" [label=""];
+  "Commit + log round" -> "Show trajectory\n(round >= 2)";
+  "Show trajectory\n(round >= 2)" -> "Pivot prompt?" [label=""];
+  "Pivot prompt?" -> "AskUser:\ncontinue / restructure / accept" [label="round == max\n&& verdict != GO"];
+  "Pivot prompt?" -> "Round < max?" [label="otherwise"];
+  "AskUser:\ncontinue / restructure / accept" -> "Round < max?" [label="continue"];
+  "AskUser:\ncontinue / restructure / accept" -> "Done — user pivoted" [label="restructure\nor accept"];
   "Round < max?" -> "Build RN prompt from ledger" [label="yes"];
   "Build RN prompt from ledger" -> "Send to reviewer (FOREGROUND)";
   "Round < max?" -> "Report: max rounds hit" [label="no"];
@@ -175,41 +178,53 @@ if [[ ! -f .bulldozer/.gitignore ]]; then
 fi
 ```
 
-**2. Send to reviewer** — FOREGROUND, with `-c` reasoning override and `-o`:
+**2. Build the round prompt** — pick the right template from the Reviewer Prompt Templates section below, substitute the artifact-specific placeholders (`<PATH>`, `<TYPE>`, `<PURPOSE>`, `<DEPTH>`, etc.), and write it to a file the wrapper can read:
 
 ```bash
-# quick (medium reasoning, skip skills, ephemeral)
-codex exec -s read-only -c model_reasoning_effort=medium -m "$MODEL" \
-  --ephemeral \
-  -o "${REVIEW_DIR}/verdict-r${ROUND}.txt" \
-  -C "$PROJECT_ROOT" \
-  "SKIP SKILLS. <PROMPT>" \
-  < /dev/null > "${REVIEW_DIR}/full-r${ROUND}.txt" 2>&1
-
-# standard / exhaustive (xhigh reasoning, skills/memories active)
-codex exec -s read-only -c model_reasoning_effort=xhigh -m "$MODEL" \
-  -o "${REVIEW_DIR}/verdict-r${ROUND}.txt" \
-  -C "$PROJECT_ROOT" \
-  "<PROMPT>" \
-  < /dev/null > "${REVIEW_DIR}/full-r${ROUND}.txt" 2>&1
+PROMPT_FILE="${REVIEW_DIR}/prompt-r${ROUND}.txt"
+# Write the round prompt body to $PROMPT_FILE — Round 1 quick/standard or
+# Round N (continuation with ledger). See "Reviewer Prompt Templates" below.
 ```
 
-**CRITICAL RULES:**
-- **FOREGROUND ONLY.** NEVER use `run_in_background`. The `-o` verdict file is written LAST — polling is unreliable.
-- **Check exit code.** If codex exits non-zero, read last 20 lines of `full-r{N}.txt` for diagnostics, mark round as `crash` in ledger, and report the specific error to the user. Do NOT silently retry.
-- **`< /dev/null`** — prevents codex from waiting on stdin. Note: this also blocks codex re-auth prompts. If codex exits with auth error, tell the user to run `codex login` manually.
-- **`2>&1`** — captures stderr into `full-r{N}.txt` for crash diagnostics. Hook noise ends up here too, but verdict is always in `-o` file.
-- **`-m "$MODEL"`** — model chosen by user at launch via AskUserQuestion.
-- **`-C "$PROJECT_ROOT"`** — resolved in Step 1b. Never use `$(git rev-parse ...)` inline — it silently returns empty outside git repos.
+For Round N continuation prompts, embed the current review-ledger.yml as APPENDIX A and the previous verdict-r{N-1}.txt as APPENDIX B (templates already include the headers).
 
-**3. Read verdict** — ONLY the clean file:
+**3. Run the round** — one call composes codex → parser → log-round → trajectory → pivot signal:
+
 ```bash
-Read "${REVIEW_DIR}/verdict-r${ROUND}.txt"
+"${CLAUDE_PLUGIN_ROOT}/skills/check/scripts/bulldozer-round.sh" \
+  --round "$ROUND" \
+  --review-dir "$REVIEW_DIR" \
+  --artifact "$ARTIFACT" \
+  --depth "$DEPTH" \
+  --reviewer "codex/$MODEL" \
+  --prompt-file "$PROMPT_FILE" \
+  --project-root "$PROJECT_ROOT"
+wrapper_exit=$?
 ```
 
-**NEVER parse `full-r{N}.txt` for the verdict.** It contains 1000+ hook lines, file contents, and tool call noise. The `-o` flag gives clean output directly.
+The wrapper runs codex FOREGROUND with the right `-s read-only -m -o -C` flags + depth-specific reasoning effort, invokes `parse-ledger-patch.py` on the resulting `verdict-r${ROUND}.txt`, calls `log-round.sh` (which updates `state.json` and appends to `bulldozer.log`), prints the trajectory to stderr when `ROUND >= 2`, and on `ROUND >= max_rounds && verdict != GO` writes `pivot-r${ROUND}.json` with AskUserQuestion options and exits 10.
 
-**4. Extract LEDGER_PATCH** — the verdict ends with a YAML block:
+stdout carries the final `state.json` contents so you can read trajectory or open findings without re-reading the file.
+
+**Wrapper exit codes — branch explicitly. Do NOT silently retry on non-zero exit.**
+
+Codes are partitioned by origin so the caller can route mechanically without parsing stderr: `1-5` = parser outcomes, `10` = pivot, `64/70/71` = wrapper-side failures (sysexits.h convention). Reserved codes never overlap across origins — if you see `1`, the parser produced it; if `64`, the wrapper rejected the call; if `71`, codex itself crashed.
+
+| Exit | Origin | Meaning | Your action |
+|------|--------|---------|-------------|
+| `0` | wrapper | Round logged successfully | Continue to Step 4 (verify findings) |
+| `1` | parser | No LEDGER_PATCH block in verdict | Manual fallback: `Read "${REVIEW_DIR}/verdict-r${ROUND}.txt"`, extract findings from the prose, append them to the ledger, then continue to Step 4 |
+| `2` | parser | Malformed YAML in LEDGER_PATCH | STOP. Inspect `${REVIEW_DIR}/verdict-r${ROUND}.malformed.yml` (parser saved the raw block); ask user how to proceed (fix template, retry, or pivot) |
+| `3` | parser | Schema violation in LEDGER_PATCH | STOP. Patch is structurally wrong; do NOT apply. Ask user how to proceed |
+| `4` | parser | PyYAML not installed | Tell user the install command (printed by wrapper) and retry |
+| `5` | parser/wrapper | Verdict file empty, missing, or unreadable | Usually transient. Check `${REVIEW_DIR}/full-r${ROUND}.txt` for codex output, then retry the round |
+| `10` | wrapper | Max rounds reached without GO | Read `${REVIEW_DIR}/pivot-r${ROUND}.json` and wrap its `options` array in `AskUserQuestion` (continue / restructure / accept-with-TODO). Act on the user's choice |
+| `64` | wrapper | Preflight / usage error (bad flag, missing flag, bad reviewer format, missing prompt file, invalid depth, non-numeric BULLDOZER_FIXED/FP) | Fix the invocation. Diagnostic on stderr names the offending input. Do NOT retry without correcting the caller — this is a contract violation, not a transient failure |
+| `70` | wrapper | Wrapper-internal failure (parser/log-round script not at expected path, log-round.sh failed during execution) | Check stderr diagnostic — typically a stale `CLAUDE_PLUGIN_ROOT` (run `jaine-sync plugins update bulldozer`) or a corrupted `state.json` in the review dir |
+| `71` | wrapper | codex exec crashed | Diagnostic on wrapper stderr names the original codex exit code (preserved) and the path to `full-r${ROUND}.txt`. Report to user — do not silently retry. Common codex exits: 1 (auth expired → `codex login`), other (network, rate limit) |
+
+Schema example codex emits (Round 1 standard / exhaustive — see "LEDGER_PATCH Protocol" below for the full schema):
+
 ```yaml
 LEDGER_PATCH:
   findings:
@@ -217,34 +232,21 @@ LEDGER_PATCH:
       severity: high
       status: open
       title: "side effect before permission check"
-      files:
-        - path: "src/a.py"
-          lines: "120-148"
+      files: [{path: "src/a.py", lines: "120-148"}]
       original_verdict_excerpt: |
         The ACL check runs after the write...
       required_recheck:
         instructions: "Verify permission check happens before write"
-        commands:
-          - "grep -n 'check_acl' src/a.py"
+        commands: ["grep -n 'check_acl' src/a.py"]
 ```
 
-Claude extracts this block and applies it to `${REVIEW_DIR}/review-ledger.yml`.
+**4. Verify each finding** — use `/receiving-code-review` discipline. Read `${REVIEW_DIR}/parsed-r${ROUND}.json` (the wrapper wrote it; one entry per finding with `id`, `severity`, `files`, `original_verdict_excerpt`, `required_recheck.commands`). For each finding:
 
-**Error handling for LEDGER_PATCH:**
-- **Missing** (reviewer didn't output it): Claude extracts findings from prose and builds the ledger entry manually. Note this in the ledger as `patch_source: manual`.
-- **Malformed YAML** (bad indentation, missing fields): Do NOT apply. Save the raw block to `verdict-r{N}.malformed.yml` alongside the verdict. Ask the user before proceeding.
-- **Schema violation** (e.g., `severity: critical` instead of `blocker|high|medium|low|info`): Normalize to nearest valid value and note in history.
-- **Multiple LEDGER_PATCH blocks**: Use only the LAST one (closest to end of verdict).
-
-**MVP limitation:** Schema validation is informational — Claude applies LEDGER_PATCH manually; no validator script yet.
-
-**5. Verify each finding** — use `/receiving-code-review` discipline:
-- For each finding, run the specific command or grep that would confirm/deny it
+- Run the `required_recheck.commands` (or the closest equivalent) against the current code
 - Classify: REAL or FALSE_POSITIVE
-- Record evidence for each
-- Update finding status in `review-ledger.yml`
+- Record evidence
 
-**CRITICAL: Do not blindly fix reviewer findings. Verify first.**
+**CRITICAL: do not blindly fix reviewer findings. Verify first.**
 
 | Reviewer says | You do |
 |---------------|--------|
@@ -253,49 +255,43 @@ Claude extracts this block and applies it to `${REVIEW_DIR}/review-ledger.yml`.
 | "Pattern matches false positives" | Test the regex on real data |
 | "Contradicts line N" | Read both lines, compare |
 
+**5. Apply findings to the ledger** — append each verified finding from `parsed-r${ROUND}.json` to `${REVIEW_DIR}/review-ledger.yml`, mark status (`verified` / `still_open` / `false_positive` / `wontfix`) based on Step 4's evidence. JSON→YAML transcription is a Claude task (extraction is deterministic via the wrapper; ledger curation is judgment).
+
 **6. Fix confirmed issues** — edit the artifact, commit with finding counts:
+
 ```
 docs: artifact-name vN+1 (Mth review, K findings fixed)
 ```
 
-**7. Log round + update state** — one command does both:
-```bash
-BULLDOZER_REVIEW_DIR="$REVIEW_DIR" \
-BULLDOZER_DEPTH="$DEPTH" \
-"${CLAUDE_PLUGIN_ROOT}/skills/check/scripts/log-round.sh" \
-  "$ROUND" "$ARTIFACT" "$VERDICT" "$FINDINGS" "$FIXED" "$FP" "$REVIEWER"
-```
-- `BULLDOZER_REVIEW_DIR` tells `update-state.py` which per-review dir to write `state.json` into — without it, state goes to `.bulldozer/state.json` (top-level, wrong).
-- `BULLDOZER_DEPTH` records depth level in state — without it, defaults to `standard` regardless of actual depth.
-- You MUST call this AFTER EVERY round (not just the last one).
+If you want the next round's `log-round` line + `state.json` totals to record per-round fixed/false-positive counts (instead of the default 0/0), set the env vars BEFORE the next Step 3 wrapper invocation:
 
-**8. Loop or stop:**
-- Verdict GO → done, write summary
-- Round < max → build Round N prompt from ledger, go to step 2
-- Round = max → report "max rounds reached, N open findings remain"
+```bash
+BULLDOZER_FIXED=K BULLDOZER_FP=M "${CLAUDE_PLUGIN_ROOT}/skills/check/scripts/bulldozer-round.sh" \
+  --round "$((ROUND + 1))" ...
+```
+
+Unset them after the round (`unset BULLDOZER_FIXED BULLDOZER_FP`) so they don't leak into the round-after-next.
+
+**7. Loop or stop:**
+- Verdict GO (wrapper exit 0, parsed-rN.json has `findings: []`) → done, write summary
+- Round < max, verdict NO-GO → build Round N prompt from ledger, go to Step 2
+- Wrapper exited 10 (pivot signal) → act on the user's AskUserQuestion choice from Step 3 (at `ROUND >= max_rounds && verdict != GO` the wrapper always writes the pivot file and exits 10, so a `Round == max + NO-GO` case never reaches this step without a pivot signal — if it does, treat it as a wrapper-state bug and report the pivot file write failure to the operator)
 
 ## Reviewer Prompt Templates
 
 ### Round 1 — quick
 
 ```
-SKIP SKILLS. You are reviewing <PATH>.
+Before reviewing, read CLAUDE.md at the project root (and any sub-CLAUDE.md
+in the artifact's directory). Apply project conventions when classifying
+findings as material vs. defensive.
+
+You are reviewing <PATH>.
 This is a <TYPE> that will be used for <PURPOSE>.
 Find correctness bugs, regressions, security risks, missing tests. Ignore style.
-Keep each finding under 180 words. GO if no material findings.
-End your response with a LEDGER_PATCH YAML block:
+Keep each finding under 180 words.
 
-LEDGER_PATCH:
-  findings:
-    - id: R1-F1
-      severity: blocker|high|medium|low|info
-      status: open
-      title: "short description"
-      files: [{path: "...", lines: "..."}]
-      original_verdict_excerpt: "your finding text"
-      required_recheck:
-        instructions: "what to verify"
-        commands: ["command1", "command2"]
+End with the LEDGER_PATCH block — see LEDGER_PATCH Protocol below.
 ```
 
 ### Round 1 — standard / exhaustive
@@ -303,6 +299,10 @@ LEDGER_PATCH:
 **CRITICAL: Adapt the prompt to the artifact type.** A design spec for a FUTURE feature must NOT be checked for "do these files exist" — they don't exist yet. Check internal consistency, feasibility, and completeness instead.
 
 ```
+Before reviewing, read CLAUDE.md at the project root (and any sub-CLAUDE.md
+in the artifact's directory). Apply project conventions when classifying
+findings as material vs. defensive.
+
 You are performing a <DEPTH> code review of <PATH>.
 This is a <TYPE> that will be used for <PURPOSE>.
 
@@ -324,15 +324,20 @@ For every finding output:
 - Required recheck (exact commands)
 - Evidence
 
-If no material findings, output exactly: GO.
 Do not pad. Do not include style-only comments.
-End your response with a LEDGER_PATCH YAML block listing all findings.
+
+End with the LEDGER_PATCH block — see LEDGER_PATCH Protocol below.
 ```
 
 ### Round N (continuation with ledger)
 
 ```
 This is review round <N> of <PATH>.
+
+Before reviewing, read CLAUDE.md at the project root (and any sub-CLAUDE.md
+in the artifact's directory). Apply project conventions when classifying
+findings as material vs. defensive.
+
 Do BOTH:
 1. Fresh review of current HEAD as if no previous review existed.
 2. Ledger recheck of all non-terminal findings from previous rounds.
@@ -346,9 +351,39 @@ APPENDIX B — previous verdict:
 For each open/fixed finding, decide: verified, still_open, false_positive, or wontfix.
 If a claimed-fixed issue still reproduces, keep the original ID and explain why.
 New findings use IDs R{N}-FN.
-End your response with a LEDGER_PATCH YAML block covering both recheck results and new findings.
+End with the LEDGER_PATCH block covering both recheck results and new findings — see LEDGER_PATCH Protocol below.
 GO only when all material findings are terminal AND fresh review found nothing new.
 ```
+
+### LEDGER_PATCH Protocol
+
+Single source of truth for the LEDGER_PATCH block referenced by all three round templates above. Future changes to the directive go here, not into individual templates (drift between Round-1 standard and Round-N was the regression that #104 caught and PR #106 hot-patched).
+
+Every round MUST end with a LEDGER_PATCH YAML block — REQUIRED for both NO-GO and GO. The wrapper's parser extracts findings deterministically from this block; a reviewer that skips it forces the consumer back to manual prose extraction (the discipline failure PR1a / #101 was meant to eliminate).
+
+**NO-GO shape (one or more findings):**
+```yaml
+LEDGER_PATCH:
+  findings:
+    - id: R{N}-F{M}             # round-prefixed: R1-F1, R1-F2, R2-F1, ...
+      severity: blocker|high|medium|low|info
+      status: open               # status lifecycle managed by consumer
+      title: "short description"
+      files: [{path: "...", lines: "..."}]
+      original_verdict_excerpt: "your finding text verbatim"
+      required_recheck:
+        instructions: "what to verify"
+        commands: ["command1", "command2"]
+```
+
+**GO shape (REQUIRED — do NOT emit a bare "GO" line):**
+```yaml
+LEDGER_PATCH:
+  verdict: go
+  findings: []
+```
+
+A bare `GO` line (without the LEDGER_PATCH block) is auto-synthesized by the parser as `{verdict: go, findings: []}` with `source: synthesized_bare_go` and a warning — it still works, the parser exits 0. The synthesis is suppressed if any `NO-GO` variant also appears in the verdict (exit 1 wins so real findings aren't lost). Still: prefer the explicit structured block above. Synthesis is a graceful fallback, not a green light to skip the protocol — `source: synthesized_bare_go` is a code smell in audit logs, and any time a reviewer needed to write `GO` AND a `NO-GO` example (e.g. inline documentation), synthesis flips off and the consumer ends up in manual extraction anyway.
 
 ## Review Ledger Format
 
@@ -472,7 +507,7 @@ reviewer_model: gpt-5.5
 
 - Reviewer gives GO on round 1 with zero findings (likely didn't read the file — check cwd)
 - Same finding reappears after you "fixed" it (your fix was wrong — re-verify)
-- Round > 5 with new HIGH findings each time (artifact may need redesign, not patching)
+- Round > 5 with new HIGH findings each time — the wrapper prints the trajectory on stderr after every round ≥ 2 (`[bulldozer/check] Round N/M ... Trajectory: A → B → C  (avg last 3: X.X)`). If findings aren't shrinking, the AskUserQuestion pivot dialog will fire automatically at max-round NO-GO. (Note: the legacy calibrated trigger — exhaustive + round ≥ 5 + avg last 3 ≥ 3.0 — was simplified to "max rounds reached" in PR1b; calibration data from 26 historical sessions pending re-analysis as a follow-up.)
 - Reviewer output is empty or errors (check `codex --version`, network, rate limits)
 - `verdict-rN.txt` is empty (codex crashed or `-o` path wrong — check `full-rN.txt` for clues)
 

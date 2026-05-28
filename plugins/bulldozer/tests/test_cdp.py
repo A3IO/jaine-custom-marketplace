@@ -780,7 +780,8 @@ def test_screenshot_supports_full_page():
 
 # --- Documentation content verification (Feedback Protocol) ---
 
-PLUGIN_ROOT = Path(__file__).parent.parent
+from conftest import PLUGIN_ROOT  # noqa: E402
+
 MARKETPLACE_JSON = PLUGIN_ROOT.parent.parent / ".claude-plugin" / "marketplace.json"
 
 
@@ -1305,7 +1306,7 @@ def test_check_skill_step1c_path_is_cwd_relative():
     """
     skill_md = (PLUGIN_ROOT / "skills" / "check" / "SKILL.md").read_text()
     step_1c_start = skill_md.find("Self-ignoring `.bulldozer/`")
-    step_1c_end = skill_md.find("**2. Send to reviewer**", step_1c_start)
+    step_1c_end = skill_md.find("**2. Build the round prompt**", step_1c_start)
     assert step_1c_start > 0 and step_1c_end > step_1c_start, (
         "Could not locate Step 1c block"
     )
@@ -1325,7 +1326,7 @@ def test_check_skill_warning_does_not_suggest_project_gitignore():
     """
     skill_md = (PLUGIN_ROOT / "skills" / "check" / "SKILL.md").read_text()
     step_1c_start = skill_md.find("Self-ignoring `.bulldozer/`")
-    step_1c_end = skill_md.find("**2. Send to reviewer**", step_1c_start)
+    step_1c_end = skill_md.find("**2. Build the round prompt**", step_1c_start)
     step_1c = skill_md[step_1c_start:step_1c_end]
     assert "project's .gitignore" not in step_1c, (
         "WARNING in Step 1c suggests editing the project's .gitignore — that "

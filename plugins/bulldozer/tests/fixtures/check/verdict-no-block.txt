@@ -1,0 +1,5 @@
+**Findings**
+
+Reviewer prose with no LEDGER_PATCH block at end.
+
+Some additional commentary about the artifact but no structured patch.

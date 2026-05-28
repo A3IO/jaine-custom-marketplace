@@ -1,13 +1,14 @@
 # Bulldozer Plugin
 
-Adversarial review (`/bulldozer:check`) + visual browser verification (`/bulldozer:look`).
+Adversarial review (`/bulldozer:check`) + visual browser verification (`/bulldozer:look`) + lightweight design consultation (`/bulldozer:consult`).
 
 ## Skills
 
 | Skill | Command | What it does |
 |-------|---------|-------------|
-| check | `/bulldozer:check` | Adversarial review loop with external AI reviewer (model selection → `-c` reasoning overrides → structured ledger) |
+| check | `/bulldozer:check` | Adversarial review loop with external AI reviewer (model selection → `-c` reasoning overrides → structured ledger). For artifacts on disk. |
 | look | `/bulldozer:look [URL] [task description]` | Browser automation via CDP, AppleScript, macOS native |
+| consult | `/bulldozer:consult [design question]` | Lightweight stateless codex consultation for abstract design Q&A. For inline text without artifacts. Process-isolated via `--skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral -s read-only` from empty tmpdir. |
 
 ## Architecture: /look
 
@@ -100,11 +101,38 @@ When fixing a feedback issue:
 
 Plugin uses `skills/` directory exclusively. No `commands/` directory — per Claude Code docs, commands and skills are the same mechanism, and having both with the same name causes one to be silently dropped. Each `/bulldozer:*` invocation loads `skills/*/SKILL.md` directly.
 
+## Architecture: consult vs check (issue #96)
+
+`consult` and `check` solve overlapping problems with disjoint scopes:
+
+| Aspect | `bulldozer:check` | `bulldozer:consult` |
+|--------|-------------------|---------------------|
+| Input | File/dir/diff on disk | Inline text in conversation |
+| State | `.bulldozer/<session>-<artifact>/` (per-review dir, ledger, state) | None (each invocation independent) |
+| Codex sandbox | Read-only at `-C $PROJECT_ROOT` | Read-only at empty `/tmp/bulldozer-consult-$$/` |
+| Codex isolation flags | `--ephemeral` (quick only) | Always `--skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral` |
+| Verdict format | LEDGER_PATCH YAML in clean `-o` file | Inline prose + GO/NO-GO/MINOR-FIXES + basis sentence, parsed fail-closed |
+| Multi-round | Reviewer sees ledger + previous verdict as appendix | Each round independent; user re-prompts manually |
+| Empirical verification | Required (`/receiving-code-review` discipline) | Not applicable — codex has no file access |
+| Per-round cost | ~30-80s, ~50-100K tokens | ~4-15s, ~5-15K tokens |
+
+**Routing rule (claude-side, enforced by pre-flight in consult Step 2):** if user's prompt mentions any artifact (file path, `.md`/`.py`/etc., "see specs/X", "attached"), redirect to `check`. Otherwise consult.
+
+**Escalation rule** (consult Step 7): if `round_count >= 3` AND last 2 verdicts contain NO-GO, prompt the user to consider `/bulldozer:check`. User decides — we do NOT auto-invoke.
+
+**REMOVED features** (validated against shipping by 3 of 4 independent codex dogfood runs):
+- Persistent mode (`codex exec resume`) — data retention risk, stale context contamination, 2× implementation surface. Users wanting continuity copy prior verdict text into a new prompt.
+- Session log with prompt content — only metadata in `bulldozer-consult.log`. Raw prompts and verdict bodies are not persisted.
+
 ## Known Issues (2026-05-11 review)
 
 ### Open
 
 No known issues.
+
+### In Progress
+
+- **#94** — Trajectory analysis for exhaustive reviews. Step 8 now shows findings-per-round trajectory after every round ≥ 2. Step 8a prompts a pivot dialog when exhaustive + round ≥ 5 + avg last 3 rounds ≥ 3.0 fresh findings. Threshold calibrated against 26 historical sessions (0 FP on converged, 60% TP on non-converging). Addresses slow convergence on stateful concurrent control specs (state×event matrix class).
 
 ### Fixed
 

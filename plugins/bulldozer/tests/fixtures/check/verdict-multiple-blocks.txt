@@ -1,0 +1,21 @@
+First reviewer attempt:
+
+```yaml
+LEDGER_PATCH:
+  verdict: no_go
+  findings:
+    - id: R1-F-OLD
+      severity: low
+      title: "stale block — should be IGNORED by parser"
+```
+
+After reconsidering:
+
+```yaml
+LEDGER_PATCH:
+  verdict: no_go
+  findings:
+    - id: R1-F-NEW
+      severity: high
+      title: "fresh block — parser must use this one (last)"
+```

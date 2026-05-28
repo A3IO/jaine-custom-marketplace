@@ -1,0 +1,9 @@
+{
+  "name": "jainechat",
+  "version": "2026.05.29",
+  "description": "JAINE localhost web chat — channel plugin for Claude Code sessions",
+  "author": {
+    "name": "JAINE",
+    "email": "jaine@local"
+  }
+}

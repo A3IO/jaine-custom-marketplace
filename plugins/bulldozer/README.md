@@ -1,8 +1,23 @@
 # bulldozer
 
-Adversarial review loop with external AI reviewer + visual browser verification via JAINE Browser CDP.
+Adversarial review loop with external AI reviewer + visual browser verification via JAINE Browser CDP + lightweight conversational design consultation.
 
 ## Commands
+
+### /bulldozer:consult — Conversational Design Validation (issue #96)
+
+Lightweight stateless codex consultation for abstract design questions — "should I X or Y?", architectural tradeoffs, sanity-check before any artifact exists.
+
+```
+/bulldozer:consult                                         # ask, then provide design question
+/bulldozer:consult Help me choose between A and B for X    # inline question
+```
+
+Use for: design Q&A, architecture tradeoffs, pre-implementation sanity checks. Stateless by design — each invocation is independent. ~4-15s and ~5K tokens per round (vs ~30-80s and ~50K for check on small artifacts) because codex runs fully isolated (`--skip-git-repo-check --ignore-user-config --ignore-rules --ephemeral -s read-only`) from an empty tmpdir.
+
+**Do NOT use for:** anything referencing files/paths/diffs on disk → use `/bulldozer:check` instead. Pre-flight detection redirects you automatically.
+
+**Log:** `~/.claude/hooks/bulldozer-consult.log` (metadata only — no prompts, no verdict bodies)
 
 ### /bulldozer:check — Adversarial Review
 

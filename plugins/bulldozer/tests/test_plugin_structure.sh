@@ -56,6 +56,7 @@ echo "--- Architecture: skills-only (no commands/) ---"
 check_no_file "commands/ directory removed" "$PLUGIN_ROOT/commands"
 check "skills/check/SKILL.md" "$PLUGIN_ROOT/skills/check/SKILL.md"
 check "skills/look/SKILL.md" "$PLUGIN_ROOT/skills/look/SKILL.md"
+check "skills/consult/SKILL.md" "$PLUGIN_ROOT/skills/consult/SKILL.md"
 
 echo
 echo "--- Check skill: frontmatter ---"
@@ -66,6 +67,64 @@ echo
 echo "--- Look skill: frontmatter ---"
 check_content "look SKILL.md has allowed-tools" "$PLUGIN_ROOT/skills/look/SKILL.md" "allowed-tools"
 check_content "look SKILL.md has argument-hint" "$PLUGIN_ROOT/skills/look/SKILL.md" "argument-hint"
+
+echo
+echo "--- Consult skill: frontmatter (issue #96) ---"
+check_content "consult SKILL.md has allowed-tools" "$PLUGIN_ROOT/skills/consult/SKILL.md" "allowed-tools"
+check_content "consult SKILL.md has argument-hint" "$PLUGIN_ROOT/skills/consult/SKILL.md" "argument-hint"
+check_content "consult description has Triggers" "$PLUGIN_ROOT/skills/consult/SKILL.md" "Triggers on\|triggers on"
+check_content "consult description has anti-trigger for check" "$PLUGIN_ROOT/skills/consult/SKILL.md" "Do NOT use.*file\|Do NOT use.*artifact\|bulldozer:check instead"
+
+echo
+echo "--- Consult skill: v3 isolation flags (locked design) ---"
+check_content "consult uses --skip-git-repo-check" "$PLUGIN_ROOT/skills/consult/SKILL.md" "skip-git-repo-check"
+check_content "consult uses --ignore-user-config" "$PLUGIN_ROOT/skills/consult/SKILL.md" "ignore-user-config"
+check_content "consult uses --ignore-rules" "$PLUGIN_ROOT/skills/consult/SKILL.md" "ignore-rules"
+check_content "consult uses --ephemeral" "$PLUGIN_ROOT/skills/consult/SKILL.md" "ephemeral"
+check_content "consult uses read-only sandbox" "$PLUGIN_ROOT/skills/consult/SKILL.md" "read-only"
+check_content "consult runs from empty tmpdir" "$PLUGIN_ROOT/skills/consult/SKILL.md" "tmpdir\|/tmp/bulldozer-consult"
+check_content "consult uses timeout wrapper" "$PLUGIN_ROOT/skills/consult/SKILL.md" "timeout"
+check_content "consult has pre-flight artifact detection" "$PLUGIN_ROOT/skills/consult/SKILL.md" "pre-flight\|Pre-flight\|artifact reference\|artifact detect"
+check_content "consult has fail-closed verdict parsing" "$PLUGIN_ROOT/skills/consult/SKILL.md" "fail.closed\|fail-closed"
+check_content "consult has escalation rule" "$PLUGIN_ROOT/skills/consult/SKILL.md" "escalat"
+
+echo
+echo "--- Consult: NOT supported (architectural guarantees from issue #96 review) ---"
+# v3 design REMOVED persistent mode — must not creep back in.
+# Detect ACTUAL usage in command lines (not anti-feature documentation in tables/prose).
+# Real usage looks like a shell command line: `codex exec resume "$SESSION"` or `--persistent` as a CLI flag.
+if grep -nE '^\s*(timeout [0-9]+s )?codex exec resume\b' "$PLUGIN_ROOT/skills/consult/SKILL.md" 2>/dev/null; then
+  echo "  FAIL: consult must NOT invoke 'codex exec resume' (REMOVE_PERSISTENT decision, dogfood-2/A2/A3)"
+  FAIL=$((FAIL + 1))
+elif grep -nE '^\s*[^|]*--persistent\b' "$PLUGIN_ROOT/skills/consult/SKILL.md" 2>/dev/null | grep -v '^\s*|' >/dev/null; then
+  echo "  FAIL: consult must NOT accept '--persistent' flag (REMOVE_PERSISTENT decision)"
+  FAIL=$((FAIL + 1))
+else
+  echo "  PASS: consult is stateless-only (no persistent mode usage)"
+  PASS=$((PASS + 1))
+fi
+# Positive evidence: every codex exec invocation in SKILL.md must use --ephemeral
+EPHEMERAL_USES=$(grep -cE '^\s*(timeout [0-9]+s )?codex exec\b.*\\$' "$PLUGIN_ROOT/skills/consult/SKILL.md" 2>/dev/null || echo 0)
+if [[ "$EPHEMERAL_USES" -gt 0 ]]; then
+  # for each multiline codex exec block, ensure --ephemeral is on a continuation line within ~15 lines
+  if grep -A15 -E '^\s*(timeout [0-9]+s )?codex exec\b' "$PLUGIN_ROOT/skills/consult/SKILL.md" | grep -q -- '--ephemeral'; then
+    echo "  PASS: codex exec invocations include --ephemeral"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: codex exec invocation missing --ephemeral flag"
+    FAIL=$((FAIL + 1))
+  fi
+else
+  echo "  FAIL: no codex exec invocation block found in consult SKILL.md (positive evidence missing)"
+  FAIL=$((FAIL + 1))
+fi
+# No session storage with prompt content (dogfood-1 finding #6)
+check_no_file "no session log with raw prompts" "$PLUGIN_ROOT/.bulldozer/consult-sessions.log"
+
+echo
+echo "--- Consult: Feedback section (parity with check/look) ---"
+check_content "consult SKILL.md has Feedback section" "$PLUGIN_ROOT/skills/consult/SKILL.md" "## Feedback"
+check_content "consult SKILL.md has gh issue create" "$PLUGIN_ROOT/skills/consult/SKILL.md" "gh issue create"
 
 echo
 echo "--- Check skill: model selection (merged from command) ---"
@@ -127,6 +186,7 @@ echo
 echo "--- Hooks completeness ---"
 check_content "hooks.json has check matcher" "$PLUGIN_ROOT/hooks/hooks.json" "bulldozer:check"
 check_content "hooks.json has look matcher" "$PLUGIN_ROOT/hooks/hooks.json" "bulldozer:look"
+check_content "hooks.json has consult matcher" "$PLUGIN_ROOT/hooks/hooks.json" "bulldozer:consult"
 
 echo
 echo "--- Plugin description ---"
@@ -142,6 +202,7 @@ check_content "README mentions /bulldozer:look" "$PLUGIN_ROOT/README.md" "bulldo
 check_content "README mentions CDP or browser" "$PLUGIN_ROOT/README.md" "CDP\|browser\|screenshot"
 check_content "README lists status command" "$PLUGIN_ROOT/README.md" "status"
 check_content "README lists tabs command" "$PLUGIN_ROOT/README.md" "tabs"
+check_content "README mentions /bulldozer:consult" "$PLUGIN_ROOT/README.md" "bulldozer:consult"
 
 echo
 echo "--- launch.sh hardening (review findings) ---"

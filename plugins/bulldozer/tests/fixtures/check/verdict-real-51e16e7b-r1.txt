@@ -1,0 +1,120 @@
+**Findings**
+
+R1-F1  
+Severity: high  
+File: [src/fdmon/panel_manager.py](/0/DEV/JKFDMon/src/fdmon/panel_manager.py:248), [src/fdmon/window.py](/0/DEV/JKFDMon/src/fdmon/window.py:445)
+
+Problem:
+```python
+def mouseReleaseEvent(self, event):
+    self._drag_pos = None
+    self._win._dragging = False
+    manager._on_panel_moved()
+```
+Drag release can leave `entry.snap` changed, but never recalculates the grid. The menu hide path also hides without relayout:
+```python
+if entry.window.isVisible():
+    entry.window.hide()
+```
+
+Impact: panels on the same edge keep stale grid sizes/positions. Dragging a new panel onto an occupied edge overlaps it until some later window move/toggle forces `reposition_all()`.
+
+Required fix: after snap/visibility membership changes, relayout from current main geometry. Cover drag release, panel close button, and menu hide. Preserve `_dragging` skip semantics.
+
+Required recheck:
+```bash
+rg -n "mouseReleaseEvent|_hide_panel|entry.window.hide|reposition_all" src/fdmon/panel_manager.py src/fdmon/window.py tests
+QT_QPA_PLATFORM=offscreen uv run pytest tests/test_panel_manager_qt.py tests/test_panel_drag.py tests/test_panel_snap.py tests/test_panel_sticky_snap.py tests/test_panel_close_individual.py tests/test_panel_menu.py
+```
+
+Evidence: offscreen repro showed stale state:
+```text
+after_close False (-120, 310, 220, 210) ['left', 'left']
+after_drag_snap (100, 520, 420, 220) (100, 520, 220, 220) ['bottom', 'bottom']
+after_manual_relayout (100, 520, 210, 220) (310, 520, 210, 220)
+```
+
+R1-F2  
+Severity: medium  
+File: [src/fdmon/panel_manager.py](/0/DEV/JKFDMon/src/fdmon/panel_manager.py:209)
+
+Problem:
+```python
+was_snapped = entry.snap is not None
+self._win._broke_free = not was_snapped
+entry.snap = None
+```
+Dragging a grid-resized snapped panel detaches it, but the window keeps the shared grid size. Detached panels are excluded from later grid layout, so nothing restores `panel.default_size`.
+
+Impact: a detached panel remains compressed/clipped for the rest of the run. It also behaves inconsistently with persistence, since detached size is not saved and will silently return to default after restart.
+
+Required fix: when a panel transitions from snapped to detached, restore `entry.panel.default_size` at a deterministic point, preferably release if `entry.snap is None`, then relayout peers.
+
+Required recheck:
+```bash
+QT_QPA_PLATFORM=offscreen uv run pytest tests/test_panel_drag.py tests/test_panel_manager_qt.py
+```
+
+Evidence:
+```text
+initial (-120, 100, 220, 210) (-120, 310, 220, 210) ['left', 'left']
+after_drag_detach (790, 790, 220, 210) (-120, 310, 220, 210) [None, 'left']
+```
+The detached panel stayed `220x210`; its default was `220x420`.
+
+R1-F3  
+Severity: low  
+File: [tests/test_panel_manager_qt.py](/0/DEV/JKFDMon/tests/test_panel_manager_qt.py:23), [tests/test_panel_grid.py](/0/DEV/JKFDMon/tests/test_panel_grid.py:46)
+
+Problem: coverage is almost entirely pure math. The Qt integration test only asserts one snapped panel’s `x/y`, not `width/height`, not multiple same-edge panels, and not membership changes through drag/close/menu.
+
+Impact: `compute_grid_layout()` can pass while the live `PanelManager` leaves panels stale or overlapping.
+
+Required fix: add integration tests for two same-edge panels, hide/close expansion, drag-detach expansion/restored default size, and drag-snap onto an occupied edge. Add pure tests documenting non-divisible dimensions and `main_w/main_h < count` behavior.
+
+Required recheck:
+```bash
+QT_QPA_PLATFORM=offscreen uv run pytest tests/test_panel_grid.py tests/test_panel_manager_qt.py tests/test_panel_drag.py tests/test_panel_snap.py tests/test_panel_close_individual.py tests/test_panel_menu.py
+```
+
+Evidence: `tests/test_panel_grid.py` covers split math; `tests/test_panel_manager_qt.py::test_position_snapped_panels` only checks `x == 520` and `y == 100`.
+
+Verification note: I could not run pytest in this read-only sandbox. Pytest failed before collection with `FileNotFoundError: No usable temporary directory`. The offscreen Qt repros above did run successfully via `.venv/bin/python -c`.
+
+```yaml
+LEDGER_PATCH:
+  review_type: standard_adversarial
+  branch: feat/snap-grid
+  base: master
+  diff: .bulldozer/51e16e7b-diff-snap-grid/diff.patch
+  verdict: findings
+  findings:
+    - id: R1-F1
+      severity: high
+      status: open
+      summary: Grid is not recalculated after drag snap/detach or hide membership changes.
+      files:
+        - src/fdmon/panel_manager.py:248
+        - src/fdmon/window.py:445
+    - id: R1-F2
+      severity: medium
+      status: open
+      summary: Detached panels keep grid-compressed fixed size instead of default_size.
+      files:
+        - src/fdmon/panel_manager.py:209
+    - id: R1-F3
+      severity: low
+      status: open
+      summary: Snap-grid integration behavior is untested beyond single-panel x/y positioning.
+      files:
+        - tests/test_panel_manager_qt.py:23
+        - tests/test_panel_grid.py:46
+  verification:
+    pytest:
+      status: blocked
+      reason: no writable temporary directory in sandbox
+    repro:
+      status: passed
+      method: offscreen Qt python-c snippets
+```
+
