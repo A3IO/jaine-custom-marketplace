@@ -1,3 +1,9 @@
 __pycache__/
 .pytest_cache/
 .bulldozer/
+
+# Claude Code scheduler lock (runtime artifact, per-session/pid) — ignore the
+# lock only, NOT all of .claude/, so future legitimate .claude/ files (e.g.
+# settings.json, rules/) stay visible to git.
+.claude/*.lock
+.venv-spike/

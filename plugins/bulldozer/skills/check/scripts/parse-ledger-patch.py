@@ -8,6 +8,9 @@ Usage:
 Output (stdout, JSON):
     {
       "findings": [...],
+      "verdict": "go" | "no_go",   # B8 (#110): canonical GO/NO-GO — reviewer
+                                   #   verdict canonicalized, else inferred from
+                                   #   findings. meta keeps the RAW token.
       "meta": {...},               # top-level LEDGER_PATCH fields except 'findings'
       "source": "ledger_patch" | "empty_findings" | "synthesized_bare_go",
       "warnings": ["..."]          # graceful-fallback notes (also on stderr)
@@ -52,7 +55,8 @@ try:
 except ImportError:
     print(
         "ERROR: parse-ledger-patch.py requires PyYAML. "
-        + "Install: pip install pyyaml (or: brew install python-pyyaml / apt install python3-yaml).",
+        + "Install: python3 -m pip install pyyaml "
+        + "(or: uv pip install pyyaml / brew install python-pyyaml / apt install python3-yaml).",
         file=sys.stderr,
     )
     sys.exit(4)
@@ -191,6 +195,43 @@ def extract_ledger_blocks(text: str) -> list[str]:
         # Strip the marker's own indent so PyYAML sees the key at column 0.
         block_lines: list[str] = [stripped]
         i += 1
+        # #127: codex sometimes emits the body inside a ``` markdown fence on
+        # the line right after a BARE `LEDGER_PATCH:` marker, at the marker's
+        # own column. The indent-anchor loop below would treat the fence-opener
+        # (same column as the marker) as outer scope and stop immediately,
+        # capturing only "LEDGER_PATCH:" → yaml.load → {LEDGER_PATCH: None} →
+        # "NoneType, not a mapping" (exit 1, spurious manual fallback). Detect
+        # that exact shape and capture the fence's INNER lines as the block
+        # body; parse()'s `data.get("LEDGER_PATCH", data)` fallback then reads
+        # the bare mapping directly. Guarded to the bare marker so
+        # `LEDGER_PATCH: <inline>` and the indented-body path are untouched, and
+        # a closing fence is required so an unterminated fence degrades to the
+        # indent-anchor path (→ exit 1), never a capture-to-EOF.
+        if stripped == "LEDGER_PATCH:":
+            j = i
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and lines[j].lstrip().startswith("```"):
+                # Close ONLY on a fence at the opener's column. A fence indented
+                # deeper is markdown inside a YAML block scalar (e.g.
+                # `original_verdict_excerpt: |`) quoting an illustrative ``` —
+                # NOT the outer close. Matching any-indent close (R1-F1 dogfood)
+                # truncated the body mid-scalar and let a nested illustrative
+                # LEDGER_PATCH win as a later block, dropping the real finding.
+                fence_indent = len(lines[j]) - len(lines[j].lstrip())
+                fenced: list[str] = []
+                k = j + 1
+                while k < len(lines):
+                    lk = lines[k]
+                    if (lk.lstrip().startswith("```")
+                            and len(lk) - len(lk.lstrip()) == fence_indent):
+                        break
+                    fenced.append(lk)
+                    k += 1
+                if k < len(lines):  # closing fence at opener column found
+                    blocks.append("\n".join(fenced).rstrip())
+                    i = k + 1
+                    continue
         while i < len(lines):
             lookahead = lines[i]
             if not lookahead.strip():
@@ -558,11 +599,30 @@ def parse(raw_yaml: str, malformed_target: Path | None) -> tuple[int, dict[str, 
 
     meta = {k: v for k, v in body.items() if k != "findings"}
 
+    # B8 (#110): emit a canonical top-level `verdict` ("go"/"no_go") on every
+    # exit-0 parse so the wrapper (and Claude reading parsed-rN.json) read the
+    # GO/NO-GO decision directly instead of re-deriving it. The value is
+    # identical to the wrapper's prior computation: a reviewer-supplied verdict
+    # is canonicalized (lower() == "go" -> "go" else "no_go"), otherwise it is
+    # inferred from the findings list. BUG-2 invariant preserved: an explicit
+    # NO-GO with empty findings stays "no_go".
+    #
+    # The canonical value lives at TOP LEVEL, NOT inside meta: meta preserves
+    # the reviewer's RAW verdict token verbatim (Issue #100 case #7 — e.g.
+    # unquoted `verdict: no` must survive as the string "no", not be rewritten
+    # to "no_go"; see TestYamlBoolResolverStripped::test_meta_verdict_no_stays_string).
+    raw_verdict = meta.get("verdict")
+    if raw_verdict is not None:
+        canonical_verdict = "go" if str(raw_verdict).strip().lower() == "go" else "no_go"
+    else:
+        canonical_verdict = "go" if not findings else "no_go"
+
     for w in warnings:
         print(f"WARN: {w}", file=sys.stderr)
 
     return 0, {
         "findings": findings,
+        "verdict": canonical_verdict,
         "meta": meta,
         "source": "empty_findings" if not findings else "ledger_patch",
         "warnings": warnings,
@@ -641,6 +701,14 @@ def main() -> int:
             print(f"WARN: {warning}", file=sys.stderr)
             payload: dict[str, Any] = {
                 "findings": [],
+                # B8 (#110): canonical top-level verdict — the wrapper reads
+                # data.get("verdict") at top level and maps a missing key to
+                # NO-GO (fail-safe). This synthesis path lives in main(), not
+                # parse(), so it must set the canonical field itself (parity
+                # with parse()'s return); otherwise a documented bare-GO reply
+                # is logged as NO-GO (PR-3a dogfood R1-F1→R3-F1). meta keeps the
+                # raw token for symmetry with the structured path.
+                "verdict": "go",
                 "meta": {"verdict": "go", "synthesized": True},
                 "source": "synthesized_bare_go",
                 "warnings": [warning],

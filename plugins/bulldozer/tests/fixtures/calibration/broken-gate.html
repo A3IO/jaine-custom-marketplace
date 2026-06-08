@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>T10b broken gate</title>
+<link rel="icon" href="data:,"></head>
+<body>
+    <h1>T10b: a null-ref throws on load — fix the page until console --gate passes</h1>
+    <div id="status">pending</div>
+    <script>
+    // BUG (intentional): #stats does not exist — .textContent on null throws.
+    document.getElementById('stats').textContent = 'ready';
+    </script>
+</body>
+</html>

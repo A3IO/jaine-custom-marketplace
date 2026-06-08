@@ -42,6 +42,17 @@ check_no_file() {
   fi
 }
 
+check_no_content() {
+  local desc="$1" file="$2" pattern="$3"
+  if [[ -f "$file" ]] && grep -qE "$pattern" "$file"; then
+    echo "  FAIL: $desc — pattern '$pattern' should NOT be in $file"
+    FAIL=$((FAIL + 1))
+  else
+    echo "  PASS: $desc"
+    PASS=$((PASS + 1))
+  fi
+}
+
 echo "=== Bulldozer Plugin Structure Test ==="
 echo "Plugin root: $PLUGIN_ROOT"
 echo
@@ -57,6 +68,14 @@ check_no_file "commands/ directory removed" "$PLUGIN_ROOT/commands"
 check "skills/check/SKILL.md" "$PLUGIN_ROOT/skills/check/SKILL.md"
 check "skills/look/SKILL.md" "$PLUGIN_ROOT/skills/look/SKILL.md"
 check "skills/consult/SKILL.md" "$PLUGIN_ROOT/skills/consult/SKILL.md"
+
+echo
+echo "--- E1 consistency-auditor agent (#94) ---"
+check "consistency-auditor agent exists" "$PLUGIN_ROOT/agents/consistency-auditor.md"
+check_no_content "consistency-auditor tools are read-only (no Bash/Edit/Write)" \
+  "$PLUGIN_ROOT/agents/consistency-auditor.md" "tools:.*(Bash|Edit|Write)"
+check_content "consistency-auditor declares model:" \
+  "$PLUGIN_ROOT/agents/consistency-auditor.md" "^model:"
 
 echo
 echo "--- Check skill: frontmatter ---"

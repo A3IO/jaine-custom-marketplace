@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="icon" href="data:,">
+    <title>JAINE Drive Page</title>
+    <style>
+        body { font-family: system-ui, sans-serif; padding: 2rem; background: #1a1a2e; color: #e0e0e0; }
+        h1 { color: #ffb000; }
+        button { padding: 0.5rem 1rem; margin: 0.5rem; cursor: pointer; }
+        .status { margin: 1rem 0; padding: 0.5rem; background: #0f3460; border-radius: 4px; font-family: monospace; }
+        #async-elem, #flappy { display: none; color: #00ff88; }
+    </style>
+</head>
+<body>
+    <h1>JAINE Drive Page</h1>
+    <p>Deterministic dynamic page for SP2 verify-core e2e.</p>
+
+    <section>
+        <h2>Async element (appears at 800ms)</h2>
+        <div id="async-elem">async content loaded</div>
+    </section>
+
+    <section>
+        <h2>Flapping element (toggles 6x every 200ms, stable-visible from ~1.2s)</h2>
+        <div id="flappy">flappy content</div>
+        <div id="flappy-state" class="status">flapping</div>
+    </section>
+
+    <section>
+        <h2>Delayed-enable button (disabled first 600ms)</h2>
+        <button id="delayed-btn" disabled onclick="window.__delayedClicked=true">Delayed</button>
+    </section>
+
+    <section>
+        <h2>Mid-flow errors</h2>
+        <button id="throw-midflow" onclick="setTimeout(function(){ throw new Error('DRIVE_MIDFLOW_ERR'); }, 100)">Throw soon</button>
+        <button id="cerr-btn" onclick="console.error('DRIVE_CONSOLE_ERR')">console.error</button>
+    </section>
+
+    <section>
+        <h2>Visible/hidden assert targets + trusted click</h2>
+        <div id="always-visible" class="status">always visible</div>
+        <div id="always-hidden" style="display:none">never visible</div>
+        <button id="trusted-target" onclick="window.__driveTrusted = event.isTrusted">Trusted target</button>
+        <button id="hidden-btn" style="display:none" onclick="window.__hiddenClicked=true">Hidden</button>
+    </section>
+
+    <section>
+        <h2>Occluded button (overlay on top — visible but NOT actionable)</h2>
+        <div style="position:relative; width:200px; height:60px">
+            <button id="occluded-btn" style="position:absolute; inset:0"
+                    onclick="window.__occludedClicked=true">Occluded</button>
+            <div id="occluder" style="position:absolute; inset:0; z-index:10; background:rgba(255,0,0,0.05)"></div>
+        </div>
+    </section>
+
+    <section>
+        <h2>Navigation</h2>
+        <a id="nav-link" href="test-page.html">to test-page</a>
+    </section>
+
+    <section>
+        <h2>Shadow DOM (SP4 T7 — dogfood #172)</h2>
+        <div id="shadow-host"></div>
+    </section>
+
+    <section>
+        <h2>Reactive re-insert (SP4 T8 — Alpine x-if imitation)</h2>
+        <div id="reactive-region"><span id="reactive-elem">popup content</span></div>
+    </section>
+
+    <script>
+    // Shadow host: querySelector cannot pierce this — the T7 oracle uses .shadowRoot
+    (function () {
+        var host = document.getElementById('shadow-host');
+        var root = host.attachShadow({mode: 'open'});
+        var canvas = document.createElement('canvas');
+        canvas.width = 80; canvas.height = 20;
+        root.appendChild(canvas);
+    })();
+
+    // Reactive re-insert cycle: every 400ms the element is removed and re-inserted,
+    // imitating Alpine x-if churn — a selector-based assert with a stability window
+    // flaps forever; the reactive STATE below is the stable thing to assert (T8).
+    window.__reactiveState = { showPopup: true };
+    (function () {
+        var region = document.getElementById('reactive-region');
+        setInterval(function () {
+            var el = document.getElementById('reactive-elem');
+            if (el) {
+                el.remove();
+            } else {
+                var span = document.createElement('span');
+                span.id = 'reactive-elem';
+                span.textContent = 'popup content';
+                region.appendChild(span);
+            }
+        }, 400);
+    })();
+    </script>
+
+    <div style="height:1600px"><!-- spacer: pushes the next target below the fold --></div>
+    <section>
+        <h2>Below-fold actionable target</h2>
+        <button id="belowfold-btn" onclick="window.__belowFoldClicked=true">Below fold</button>
+    </section>
+
+    <script>
+        // async element — single appearance at 800ms
+        setTimeout(function () {
+            document.getElementById('async-elem').style.display = 'block';
+        }, 800);
+        // flapping element — visible/hidden toggle 6 times (200ms period),
+        // then permanently visible. Bare presence-polling "sees" it on the first
+        // flash (flaky pass); a stability-window assert must outwait the flapping.
+        (function () {
+            var el = document.getElementById('flappy');
+            var n = 0;
+            var iv = setInterval(function () {
+                el.style.display = (el.style.display === 'none' || !el.style.display) ? 'block' : 'none';
+                n += 1;
+                if (n >= 6) {
+                    clearInterval(iv);
+                    el.style.display = 'block';
+                    document.getElementById('flappy-state').textContent = 'stable';
+                }
+            }, 200);
+        })();
+        // delayed-enable
+        setTimeout(function () {
+            document.getElementById('delayed-btn').disabled = false;
+        }, 600);
+    </script>
+</body>
+</html>

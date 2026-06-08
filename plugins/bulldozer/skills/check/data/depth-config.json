@@ -1,0 +1,5 @@
+{
+  "quick":      {"max_rounds": 1,  "reasoning": "medium", "ephemeral": true,  "prompt_prefix": "SKIP SKILLS. "},
+  "standard":   {"max_rounds": 3,  "reasoning": "xhigh",  "ephemeral": false, "prompt_prefix": ""},
+  "exhaustive": {"max_rounds": 10, "reasoning": "xhigh",  "ephemeral": false, "prompt_prefix": ""}
+}

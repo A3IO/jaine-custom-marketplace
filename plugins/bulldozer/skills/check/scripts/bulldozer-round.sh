@@ -4,16 +4,29 @@
 #
 # Exit code contract (partitioned by origin; see SKILL.md Step 3 table):
 #   0       success (round logged)
-#   1-5     parser outcomes (no LEDGER_PATCH / malformed / schema / PyYAML / IO)
+#   2-5     parser outcomes (malformed / schema / PyYAML / IO)
 #   10      pivot signal (max rounds reached without GO)
+#   11      manual-extraction required (PR-1, issue #110 B5): reviewer
+#           produced prose but no LEDGER_PATCH block. Wrapper has ALREADY
+#           logged the round to state.json with verdict=UNKNOWN +
+#           manual_extraction_pending=true; caller must read verdict file,
+#           extract findings, and call update-state.py with
+#           --mode=replace-extraction to overwrite the placeholder entry.
 #   64      wrapper preflight / usage error (EX_USAGE) — bad CLI args or env
 #   70      wrapper-internal failure (EX_SOFTWARE) — script path missing,
 #           log-round failed, downstream helper crashed
 #   71      codex exec crashed — original code preserved in stderr diagnostic
 #
-# Reserved codes do NOT overlap origins. If you see 1, parser produced it;
-# if 64, wrapper rejected the call; if 71, codex itself crashed.
+# Reserved codes do NOT overlap origins. Parser exit 1 (no LEDGER_PATCH)
+# is mapped to wrapper exit 11 post-state-write, NOT raw 1. If you see
+# 64, wrapper rejected the call; if 71, codex itself crashed.
 set -euo pipefail
+
+# Hoisted to top so the R1-F1 pre-round guard (below) can reference
+# update-state.py in its recovery diagnostic before the parser block
+# resolves PARSER/LOG_ROUND from CLAUDE_PLUGIN_ROOT (with this dir as
+# fallback). Single definition; the parser block reuses this value.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
     cat <<'EOF'
@@ -86,6 +99,83 @@ _emit_stop() {
     exit "$code"
 }
 
+# D1 (#110): pre-write probe helper. Runs the exact
+# open(O_WRONLY|O_CREAT|O_TRUNC) kernel path (`: > PATH`) a later redirect will
+# use; on failure emits STOP 70 with REASON + the path + caller DETAILs and
+# exits. Two file-probe sites share this (FULL_LOG, PARSED_FILE). The mkdir
+# REVIEW_DIR probe is a directory-create (different op) and stays inline.
+_probe_writable() {
+    local path="$1"; shift
+    local reason="$1"; shift
+    if ! : > "$path" 2>/dev/null; then
+        _emit_stop 70 "$reason" "Path: ${path}" "$@"
+    fi
+}
+
+# D2 (#110): single home for the sibling-script path-resolution pattern. NAME is
+# a script under skills/check/scripts/. Prefers CLAUDE_PLUGIN_ROOT (set by
+# Claude Code when invoking the skill); falls back to SCRIPT_DIR (which IS
+# skills/check/scripts/) so direct/test invocation works. Output is byte-for-byte
+# the two-line `X=...; X=${X:-...}` form it replaces at 5 sites (PARSER,
+# LOG_ROUND, RENDER_TRAJECTORY, EMIT_PIVOT, READ_DEPTH_CONFIG). DEPTH_CONFIG
+# resolves a data/ asset (different subdir + `../` fallback) and stays inline.
+_resolve_script() {
+    local name="$1"
+    local p="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/skills/check/scripts/${name}}"
+    printf '%s' "${p:-${SCRIPT_DIR}/${name}}"
+}
+
+# B2 (#110): single home for parser-exit diagnostics. Each documented parser
+# exit code (2-5, plus the catch-all for anything outside 0-5) maps to a wrapper
+# _emit_stop call here, so adding/altering a parser exit code touches ONE place
+# instead of a sprawling case body. exit 0 (success) and exit 1 (manual
+# extraction, PR-1 B5) are NOT handled here — they have control-flow side
+# effects (continue / log-round + exit 11), not just a diagnostic. Reads
+# VERDICT_FILE / FULL_LOG from outer scope (both set before the parser case).
+_emit_parser_exit_diagnostic() {
+    local code="$1"
+    case "$code" in
+        2)
+            # Malformed YAML inside LEDGER_PATCH. Parser saved the raw block as
+            # a .malformed.yml sibling + printed YAML details on its own stderr;
+            # add round/artifact context so the caller can route without
+            # re-parsing parser output.
+            _emit_stop 2 "malformed LEDGER_PATCH YAML." \
+                "Inspect ${VERDICT_FILE%.txt}.malformed.yml, then either fix the reviewer template or re-run the round."
+            ;;
+        3)
+            # Schema violation — YAML parsed fine but structurally wrong (e.g.
+            # missing 'findings', per-finding without 'id'). Patch MUST NOT be
+            # applied to the ledger; the caller must prompt the user.
+            _emit_stop 3 "schema violation in LEDGER_PATCH." \
+                "Do NOT apply this patch. Inspect ${VERDICT_FILE} for the offending block, then re-run after fixing the reviewer template."
+            ;;
+        4)
+            # PyYAML missing — environment problem, not a reviewer problem.
+            # Wrapper packages the remediation prominently so the operator
+            # doesn't have to scan parser stderr.
+            _emit_stop 4 "PyYAML is not installed (parser dependency)." \
+                "Run: python3 -m pip install pyyaml   (or: uv pip install pyyaml; then retry the round)"
+            ;;
+        5)
+            # File / stdin IO failure — verdict missing (codex exited 0 but
+            # didn't write -o; rare bug), pipe truncated, fd exhausted. Distinct
+            # from 2/3 (reviewer-side): almost always transient. Suggest retry.
+            _emit_stop 5 "verdict file missing or unreadable (parser IO failure)." \
+                "Expected ${VERDICT_FILE}. Check codex output in ${FULL_LOG}, then retry the round (often transient)."
+            ;;
+        *)
+            # R2-F2: unexpected parser exit codes (outside 0-5) must NOT pass
+            # through raw — that would leak into wrapper-reserved ranges if the
+            # parser ever returns 64/70/71/10/etc. Map to 70 and preserve the
+            # original code in the diagnostic so the operator can debug.
+            _emit_stop 70 "parse-ledger-patch.py exited ${code} (outside documented 0-5 range)." \
+                "Verdict file: ${VERDICT_FILE}" \
+                "Check parser version / behavior; original exit code preserved above."
+            ;;
+    esac
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --round)        require_value "$1" "$#"; ROUND="$2"; shift 2 ;;
@@ -119,14 +209,31 @@ if (( ${#missing[@]} > 0 )); then
     exit 64
 fi
 
+# A3 (#110): --round must be a positive integer (1-based, per the usage
+# block). Without this, a non-numeric value flowed to update-state.py →
+# ValueError → wrapper exit 70 with a misleading "log-round.sh failed"
+# diagnostic; "0" breaks the verdict-r0 filenames and the
+# (( ROUND >= max_rounds )) pivot guard. Reject at preflight (EX_USAGE).
+if [[ ! "$ROUND" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: --round must be a positive integer (1-based), got: $ROUND" >&2
+    exit 64
+fi
+
 # Reviewer ID format is "provider/model" (e.g. codex/gpt-5.1) so the ledger
 # records a consistent label and the wrapper can extract the model name for
 # codex's -m flag without a separate --model argument.
-MODEL="${REVIEWER#*/}"
-if [[ "$MODEL" == "$REVIEWER" || -z "$MODEL" ]]; then
+# A2 (#110) + R1-F3 dogfood: require a non-empty provider and a non-empty
+# model, allowing the model to contain slashes (routed slugs like
+# codex/openai/gpt-4o → MODEL=openai/gpt-4o). The old `#*/` +
+# (MODEL==REVIEWER || -z MODEL) test admitted leading-slash (/gpt → MODEL=gpt,
+# empty provider). ^[^/]+/.+$ rejects the genuinely-broken shapes — no-slash
+# (codex), leading-slash (/gpt), trailing-slash (codex/, empty model) — while
+# permitting multi-segment models. MODEL = everything after the first slash.
+if [[ ! "$REVIEWER" =~ ^[^/]+/.+$ ]]; then
     echo "error: --reviewer must be in form 'provider/model' (got: $REVIEWER)" >&2
     exit 64
 fi
+MODEL="${REVIEWER#*/}"
 
 # R4-F3 + R5-F1: require BOTH regular file (-f) AND readable (-r).
 # -r alone admits /dev/null and other char/block devices (readable but
@@ -139,17 +246,45 @@ if [[ ! -f "$PROMPT_FILE" || ! -r "$PROMPT_FILE" ]]; then
     exit 64
 fi
 
-# R1-F3a: validate --depth at preflight so codex isn't invoked for a
-# doomed depth. Previously caught only inside the case statement after
-# codex_args was built (line ~91-103); the bad-depth path still ran
-# `mkdir` and burned a stub round.
-case "$DEPTH" in
-    quick|standard|exhaustive) : ;;
-    *)
-        echo "error: --depth must be quick|standard|exhaustive (got: $DEPTH)" >&2
+# B1 (#110): depth parameters (max_rounds, codex reasoning effort, --ephemeral
+# toggle, quick-depth prompt prefix) come from data/depth-config.json — the
+# single source of truth shared with the SKILL.md "Depth Levels" table
+# (TestDepthConfigContract guards drift). Resolve the config + reader script
+# with the same CLAUDE_PLUGIN_ROOT-with-SCRIPT_DIR fallback as PARSER/LOG_ROUND.
+# Reading at preflight keeps the early-rejection property: an unknown depth
+# exits 64 BEFORE codex is invoked, so no doomed round burns a stub.
+DEPTH_CONFIG="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/skills/check/data/depth-config.json}"
+DEPTH_CONFIG="${DEPTH_CONFIG:-${SCRIPT_DIR}/../data/depth-config.json}"
+if [[ ! -f "$DEPTH_CONFIG" ]]; then
+    _emit_stop 70 "depth-config.json not found at expected path." \
+        "Expected at: ${DEPTH_CONFIG}" \
+        "Check CLAUDE_PLUGIN_ROOT (currently: '${CLAUDE_PLUGIN_ROOT:-<unset>}'). Stale cache after plugin update?"
+fi
+READ_DEPTH_CONFIG="$(_resolve_script read-depth-config.py)"
+if [[ ! -f "$READ_DEPTH_CONFIG" ]]; then
+    _emit_stop 70 "read-depth-config.py not found at expected path." \
+        "Expected at: ${READ_DEPTH_CONFIG}" \
+        "Check CLAUDE_PLUGIN_ROOT (currently: '${CLAUDE_PLUGIN_ROOT:-<unset>}'). Stale cache after plugin update?"
+fi
+
+# read-depth-config.py exits 2 for an unknown depth (→ usage error 64) and 3
+# for a missing/corrupt config (→ wrapper-internal 70). Output is TAB-delimited
+# (prompt_prefix LAST so its significant trailing space survives the read —
+# only TAB is an IFS delimiter here, never the embedded space).
+depth_cfg_exit=0
+depth_cfg_out=$(python3 "$READ_DEPTH_CONFIG" "$DEPTH_CONFIG" "$DEPTH") || depth_cfg_exit=$?
+case "$depth_cfg_exit" in
+    0) : ;;
+    2)
+        echo "error: --depth must be one of the keys in depth-config.json (got: $DEPTH)" >&2
         exit 64
         ;;
+    *)
+        _emit_stop 70 "depth-config.json unreadable or corrupt (read-depth-config.py exit ${depth_cfg_exit})." \
+            "Config: ${DEPTH_CONFIG}"
+        ;;
 esac
+IFS=$'\t' read -r max_rounds reasoning ephemeral prompt_prefix <<< "$depth_cfg_out"
 
 # R3-F2: wrap mkdir so failure (parent is a non-dir, EACCES, fs full)
 # maps to wrapper exit 70 instead of leaking raw 1 under set -e.
@@ -158,6 +293,94 @@ if ! mkdir -p "$REVIEW_DIR" 2>/dev/null; then
         "Path: ${REVIEW_DIR}" \
         "Causes: parent is not a directory, EACCES, fs full. Fix --review-dir and retry."
 fi
+
+# Canonicalize REVIEW_DIR to absolute path AFTER mkdir succeeds (R3-F1 dogfood):
+# downstream diagnostics (MANUAL_EXTRACTION_REQUIRED stderr, recovery command
+# Claude copy-pastes for update-state.py --mode=replace-extraction) MUST print
+# an absolute path. Otherwise Claude's later Bash tool invocations may run from
+# a different cwd and the relative path resolves to the wrong .bulldozer/...
+# directory. update-state.py also calls .resolve() defensively, but the
+# user-visible recovery command in stderr is the load-bearing display surface.
+REVIEW_DIR="$(cd "$REVIEW_DIR" && pwd)"
+
+# Shell-escaped form of REVIEW_DIR for the copy-paste recovery commands the
+# wrapper prints on stderr (pre-round guard exit 64, exit-11 manual-extraction).
+# `printf %q` escapes spaces AND metacharacters ($, backticks, quotes) so the
+# operator can paste the recovery command verbatim — bare double-quotes (R5-F1)
+# protected spaces but a path like `.../rev $(cmd) dir` (REVIEW_DIR derives from
+# artifact basenames per SKILL.md Step 1) would still command-substitute. One
+# shared value used at BOTH emit sites so they cannot drift (R6-F2 dogfood; the
+# drift between the two sites is exactly what produced R5-F1/R6-F1).
+REVIEW_DIR_Q="$(printf '%q' "$REVIEW_DIR")"
+
+# Shell-escaped full path to update-state.py for the recovery commands (R8-F1
+# dogfood). SCRIPT_DIR resolves to the plugin's scripts dir, which on macOS can
+# contain spaces (e.g. ~/.claude/plugins/cache/.../bulldozer/...). REVIEW_DIR_Q
+# escaped the --review-dir value but `python3 ${SCRIPT_DIR}/update-state.py` left
+# the script path bare — a spaces/metachar plugin path would still split or
+# command-substitute on copy-paste. Computed once, used at both recovery sites.
+UPDATE_STATE_Q="$(printf '%q' "${SCRIPT_DIR}/update-state.py")"
+
+# PR-1 manual-extraction discipline guard (R1-F1):
+# If a prior round left a manual_extraction_pending=true entry in state.json,
+# the caller (Claude) MUST resolve it via update-state.py --mode=replace-extraction
+# before starting a new round. Otherwise stale UNKNOWN/findings=0 placeholders
+# pollute trajectory/pivot decisions, and the discipline invariant is lost.
+# See SKILL.md Step 7 "Wrapper exited 11" branch for the recovery protocol.
+STATE_FILE="${REVIEW_DIR}/state.json"
+if [[ -f "$STATE_FILE" ]]; then
+    # Bug #1: prior version printed "?" when entry was missing the round
+    # key, then bash `$(( pending_round + 1 ))` syntax-errored INSIDE the
+    # _emit_stop argument list — under set -e this error is silently
+    # swallowed (argument-expansion errors don't trigger ERR), so the
+    # guard never fired and the next round overwrote the corrupt entry.
+    # Fix: print a non-numeric sentinel ("CORRUPT_NO_ROUND_KEY") rather
+    # than "?" so the bash regex check below catches it, AND drop the
+    # `$(( pending_round + 1 ))` arithmetic in the diagnostic so no
+    # arithmetic class exists on this path at all.
+    pending_round=$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as fp:
+        state = json.load(fp)
+except (OSError, json.JSONDecodeError):
+    sys.exit(0)  # let downstream cat/update-state surface the corruption
+for entry in state.get("history", []):
+    pending_value = entry.get("manual_extraction_pending")
+    if pending_value is True:
+        # Canonical pending — emit round number for routing.
+        round_val = entry.get("round")
+        if isinstance(round_val, int) and not isinstance(round_val, bool):
+            print(round_val)
+        else:
+            print("CORRUPT_NO_ROUND_KEY")
+        sys.exit(0)
+    elif pending_value is not False and pending_value is not None:
+        # R1-F3 (R2 dogfood): non-canonical truthy/falsy value present
+        # (e.g. string "true" from hand-edit, int 1, list). Strict `is True`
+        # would skip it → guard never fires → next round overwrites
+        # unresolved corrupt state. Emit non-numeric sentinel to route into
+        # the existing _emit_stop 70 corrupt-pending diagnostic path.
+        print("CORRUPT_NON_BOOL_FLAG")
+        sys.exit(0)
+' "$STATE_FILE" 2>/dev/null) || pending_round=""
+    if [[ -n "$pending_round" ]]; then
+        if [[ ! "$pending_round" =~ ^[0-9]+$ ]]; then
+            _emit_stop 70 "pending entry in ${STATE_FILE} is corrupt (missing or non-integer 'round' key)." \
+                "Cannot determine which round to resolve. Inspect state.json manually:" \
+                "  jq '.history' ${REVIEW_DIR_Q}/state.json" \
+                "Then either fix the entry or delete state.json to start fresh."
+        fi
+        _emit_stop 64 "round ${pending_round} has unresolved manual_extraction_pending=true in ${STATE_FILE}." \
+            "Resolve before starting a new round:" \
+            "  1. Read ${REVIEW_DIR}/verdict-r${pending_round}.txt" \
+            "  2. Extract findings from prose (count K, determine VERDICT)" \
+            "  3. Run: python3 ${UPDATE_STATE_Q} --review-dir ${REVIEW_DIR_Q} \\" \
+            "         --mode=replace-extraction ${pending_round} <K> <GO|NO-GO>" \
+            "Then re-invoke this wrapper for the next round (current pending: ${pending_round})."
+    fi
+fi
+
 VERDICT_FILE="${REVIEW_DIR}/verdict-r${ROUND}.txt"
 FULL_LOG="${REVIEW_DIR}/full-r${ROUND}.txt"
 
@@ -167,35 +390,43 @@ FULL_LOG="${REVIEW_DIR}/full-r${ROUND}.txt"
 # bash redirection fails BEFORE codex runs → codex_exit=1 → diagnostic
 # `tail FULL_LOG` ALSO fails under pipefail → wrapper exits raw 1.
 # Catching the write-failure here exits 70 cleanly with no codex spend.
-if ! : > "$FULL_LOG" 2>/dev/null; then
-    _emit_stop 70 "cannot write full log." \
-        "Path: ${FULL_LOG}" \
-        "Causes: target exists unwritable, parent dir EACCES, fs full."
+_probe_writable "$FULL_LOG" "cannot write full log." \
+    "Causes: target exists unwritable, parent dir EACCES, fs full."
+
+# Depth-specific codex configuration. Reasoning effort + the --ephemeral toggle
+# come from depth-config.json (read at preflight into $reasoning / $ephemeral);
+# $prompt_prefix is likewise already set there (B1, #110).
+codex_args=(exec -s read-only -m "$MODEL" -o "$VERDICT_FILE" -C "$PROJECT_ROOT")
+codex_args+=(-c "model_reasoning_effort=${reasoning}")
+if [[ "$ephemeral" == "true" ]]; then
+    codex_args+=(--ephemeral)
 fi
 
-# Depth-specific codex configuration mirrors SKILL.md Step 2. The
-# unknown-depth branch is unreachable here because preflight already
-# rejected anything outside {quick, standard, exhaustive} with exit 64.
-codex_args=(exec -s read-only -m "$MODEL" -o "$VERDICT_FILE" -C "$PROJECT_ROOT")
-prompt_prefix=""
-case "$DEPTH" in
-    quick)
-        codex_args+=(-c model_reasoning_effort=medium --ephemeral)
-        prompt_prefix="SKIP SKILLS. "
-        ;;
-    standard|exhaustive)
-        codex_args+=(-c model_reasoning_effort=xhigh)
-        ;;
-esac
-
-prompt_body="$(<"$PROMPT_FILE")"
+# A4 (#110): feed the prompt to codex via stdin (codex 0.134.0: "if `-` is
+# used, instructions are read from stdin") instead of a positional arg. A
+# positional risked E2BIG/ARG_MAX (Linux 128KB) on large round-N prompts
+# (ledger + full previous verdict appended), and $(<file) stripped trailing
+# newlines. prompt_prefix (quick-depth "SKIP SKILLS. ") is prepended.
+#
+# R1-F1 (dogfood): assemble prefix + prompt-file into a regular file and feed
+# it via a stdin REDIRECT, NOT a pipe. Under `set -o pipefail` a pipe
+# conflates failures: if codex closes stdin early on a large prompt, `cat`
+# takes SIGPIPE and a successful review is mislabeled exit 71; a `cat` TOCTOU
+# failure is likewise reported as a codex crash. A file redirect removes the
+# pipe (no writer to signal), isolates assembly errors from codex's exit, and
+# leaves the exact bytes sent as a debugging artifact. stdin EOF after the
+# prompt == the old < /dev/null (codex never blocks on an auth prompt).
+codex_stdin="${REVIEW_DIR}/prompt-r${ROUND}.codex-stdin.txt"
+if ! { printf '%s' "$prompt_prefix"; cat "$PROMPT_FILE"; } > "$codex_stdin" 2>/dev/null; then
+    _emit_stop 70 "failed to assemble codex prompt (prefix + --prompt-file)." \
+        "Prompt file: ${PROMPT_FILE}" \
+        "Assembled stdin path: ${codex_stdin}"
+fi
 
 # FOREGROUND ONLY (NEVER run_in_background) — -o is written LAST by codex,
-# polling is unreliable. stdin closed to prevent waiting on auth prompts;
-# stderr merged into FULL_LOG for crash diagnostics.
+# polling is unreliable. stderr merged into FULL_LOG for crash diagnostics.
 codex_exit=0
-codex "${codex_args[@]}" "${prompt_prefix}${prompt_body}" \
-    < /dev/null > "$FULL_LOG" 2>&1 || codex_exit=$?
+codex "${codex_args[@]}" - < "$codex_stdin" > "$FULL_LOG" 2>&1 || codex_exit=$?
 
 if (( codex_exit != 0 )); then
     # Map codex non-zero to wrapper exit 71 (sysexits.h EX_OSERR-style
@@ -237,11 +468,11 @@ fi
 # Step 3-4: extract LEDGER_PATCH via parser, branch on exit code.
 # CLAUDE_PLUGIN_ROOT is set by Claude Code when invoking the skill; fall back
 # to the script's own directory so the wrapper also works when invoked
-# directly (e.g. from tests via PLUGIN_ROOT).
+# directly (e.g. from tests via PLUGIN_ROOT). SCRIPT_DIR was hoisted to the
+# top of the file (after set -euo pipefail) so the R1-F1 pre-round guard
+# could reference update-state.py in its diagnostic — same value here.
 # ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PARSER="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/skills/check/scripts/parse-ledger-patch.py}"
-PARSER="${PARSER:-${SCRIPT_DIR}/parse-ledger-patch.py}"
+PARSER="$(_resolve_script parse-ledger-patch.py)"
 PARSED_FILE="${REVIEW_DIR}/parsed-r${ROUND}.json"
 
 # R1-F3c: validate parser path BEFORE python3 invocation. Stale
@@ -271,111 +502,14 @@ fi
 # subcase; R4-F4 added a regular-unwritable-file test for general
 # coverage). TOCTOU is acceptable here: REVIEW_DIR is wrapper-owned and
 # the round is single-threaded.
-if ! : > "$PARSED_FILE" 2>/dev/null; then
-    _emit_stop 70 "cannot write parsed file." \
-        "Path: ${PARSED_FILE}" \
-        "Causes: target is a directory, target unwritable (chmod), parent dir EACCES, fs full."
-fi
+_probe_writable "$PARSED_FILE" "cannot write parsed file." \
+    "Causes: target is a directory, target unwritable (chmod), parent dir EACCES, fs full."
 
-parser_exit=0
-python3 "$PARSER" --file "$VERDICT_FILE" > "$PARSED_FILE" || parser_exit=$?
-
-case "$parser_exit" in
-    0)
-        : # success path — wrapper continues (log-round composition in next commit)
-        ;;
-    1)
-        # Reviewer narrated the verdict but skipped the LEDGER_PATCH block.
-        # Caller (Claude) falls back to extracting findings from prose by
-        # reading $VERDICT_FILE directly. Same exit code so the SKILL.md
-        # branch can react without parsing our stderr.
-        echo "warning: no LEDGER_PATCH block — caller must extract findings manually from ${VERDICT_FILE}" >&2
-        exit 1
-        ;;
-    2)
-        # Malformed YAML inside LEDGER_PATCH block. Parser already saved
-        # the raw block as a .malformed.yml sibling and printed YAML error
-        # details on its own stderr; the wrapper adds round/artifact context
-        # so the caller can route the failure without re-parsing parser output.
-        malformed_sibling="${VERDICT_FILE%.txt}.malformed.yml"
-        _emit_stop 2 "malformed LEDGER_PATCH YAML." \
-            "Inspect ${malformed_sibling}, then either fix the reviewer template or re-run the round."
-        ;;
-    3)
-        # Schema violation — YAML parsed fine but structurally wrong (e.g.
-        # missing 'findings' field, per-finding without 'id'). Patch MUST
-        # NOT be applied to the ledger; the caller must prompt the user.
-        _emit_stop 3 "schema violation in LEDGER_PATCH." \
-            "Do NOT apply this patch. Inspect ${VERDICT_FILE} for the offending block, then re-run after fixing the reviewer template."
-        ;;
-    4)
-        # PyYAML missing — environment problem, not a reviewer problem.
-        # User-actionable: install pyyaml. Wrapper packages the remediation
-        # prominently so the operator doesn't have to scan parser stderr.
-        _emit_stop 4 "PyYAML is not installed (parser dependency)." \
-            "Run: pip install pyyaml   (then retry the round)"
-        ;;
-    5)
-        # File / stdin IO failure — verdict file missing (codex exited 0 but
-        # didn't write -o; rare bug), pipe truncated, fd exhausted, etc.
-        # Operationally distinct from exit 2/3 (reviewer-side bugs): this is
-        # almost always transient. Suggest retrying before escalating.
-        _emit_stop 5 "verdict file missing or unreadable (parser IO failure)." \
-            "Expected ${VERDICT_FILE}. Check codex output in ${FULL_LOG}, then retry the round (often transient)."
-        ;;
-    *)
-        # R2-F2: unexpected parser exit codes (anything outside 0-5) must
-        # NOT pass through raw — that would leak into wrapper-reserved
-        # ranges if the parser ever returns 64/70/71/10/etc. Map to 70
-        # (wrapper-internal) and preserve the original code in the
-        # diagnostic so the operator can debug the parser.
-        _emit_stop 70 "parse-ledger-patch.py exited ${parser_exit} (outside documented 0-5 range)." \
-            "Verdict file: ${VERDICT_FILE}" \
-            "Check parser version / behavior; original exit code preserved above."
-        ;;
-esac
-
-# ---------------------------------------------------------------------------
-# Step 5-7: derive findings count + verdict, call log-round.sh, emit state.
-# Forgetting any of these is the discipline failure #102 exists to eliminate.
-# ---------------------------------------------------------------------------
-# Read findings count AND verdict in one python3 call. Verdict prefers
-# `meta.verdict` from the parser (preserves explicit `verdict: no_go +
-# findings: []` — the legitimate "reviewer rejects but can't enumerate"
-# signal). Falls back to structural len(findings) check only when meta
-# omits a verdict. BUG-2 fix: pure structural inference was silently
-# flipping explicit NO-GO to GO when findings happened to be empty.
-#
-# R2-F2: capture failure so set -e doesn't bubble python3 exit raw —
-# corrupted parsed-rN.json (parser bug, disk corruption, race with
-# concurrent writer) would otherwise look like parser-no-LEDGER (exit
-# 1) to the caller.
-parser_out_exit=0
-parser_out=$(python3 -c '
-import json, sys
-with open(sys.argv[1]) as fp:
-    data = json.load(fp)
-findings = data.get("findings", [])
-meta_verdict = (data.get("meta") or {}).get("verdict")
-if meta_verdict is not None:
-    verdict = "GO" if str(meta_verdict).strip().lower() == "go" else "NO-GO"
-else:
-    verdict = "GO" if not findings else "NO-GO"
-print(f"{len(findings)}|{verdict}")
-' "$PARSED_FILE") || parser_out_exit=$?
-
-if (( parser_out_exit != 0 )); then
-    _emit_stop 70 "failed to read parsed findings/verdict (python3 exit ${parser_out_exit})." \
-        "Parsed file: ${PARSED_FILE}" \
-        "Likely cause: corrupted JSON output from parser. Inspect the file and the parser stderr."
-fi
-
-findings_count="${parser_out%|*}"
-VERDICT="${parser_out#*|}"
-
-# Caller passes fix/false-positive accounting via env vars so the wrapper
-# CLI stays narrow (no extra flags per round). Defaults to 0/0 for the
-# initial post-review log; the caller can re-invoke or post-update later.
+# Hoisted from post-parser block: parser exit 1 (manual-extraction branch,
+# PR-1 issue #110 B5) calls log-round.sh too, so FIXED/FP/LOG_ROUND must
+# be resolved BEFORE the parser case statement, not after. Definitions
+# unchanged from the post-parser site (now removed below) — same validation,
+# same env-var fallback, same path-existence check.
 #
 # R1-F3b: validate at wrapper boundary so non-numeric input maps to exit
 # 64 (usage error), not exit 1 from update-state.py ValueError under
@@ -391,8 +525,7 @@ if [[ ! "$FP" =~ ^[0-9]+$ ]]; then
     exit 64
 fi
 
-LOG_ROUND="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/skills/check/scripts/log-round.sh}"
-LOG_ROUND="${LOG_ROUND:-${SCRIPT_DIR}/log-round.sh}"
+LOG_ROUND="$(_resolve_script log-round.sh)"
 
 # R1-F3c (companion to parser path check): pre-validate log-round.sh
 # path so missing-script doesn't leak as bash "command not found" (exit
@@ -402,6 +535,125 @@ if [[ ! -f "$LOG_ROUND" ]]; then
         "Expected log-round.sh at: ${LOG_ROUND}" \
         "Check CLAUDE_PLUGIN_ROOT (currently: '${CLAUDE_PLUGIN_ROOT:-<unset>}'). Stale cache after plugin update?"
 fi
+
+# B3 (#110): trajectory render + pivot emit are extracted to standalone
+# scripts (render-trajectory.py, emit-pivot.py) so they are unit-testable.
+# Same CLAUDE_PLUGIN_ROOT-with-SCRIPT_DIR-fallback resolution as PARSER /
+# LOG_ROUND, with the same R1-F3c pre-validation (missing script → 70, not
+# an opaque set -e bail or a "command not found" 127).
+RENDER_TRAJECTORY="$(_resolve_script render-trajectory.py)"
+if [[ ! -f "$RENDER_TRAJECTORY" ]]; then
+    _emit_stop 70 "render-trajectory.py not found at expected path." \
+        "Expected render-trajectory.py at: ${RENDER_TRAJECTORY}" \
+        "Check CLAUDE_PLUGIN_ROOT (currently: '${CLAUDE_PLUGIN_ROOT:-<unset>}'). Stale cache after plugin update?"
+fi
+
+EMIT_PIVOT="$(_resolve_script emit-pivot.py)"
+if [[ ! -f "$EMIT_PIVOT" ]]; then
+    _emit_stop 70 "emit-pivot.py not found at expected path." \
+        "Expected emit-pivot.py at: ${EMIT_PIVOT}" \
+        "Check CLAUDE_PLUGIN_ROOT (currently: '${CLAUDE_PLUGIN_ROOT:-<unset>}'). Stale cache after plugin update?"
+fi
+
+parser_exit=0
+python3 "$PARSER" --file "$VERDICT_FILE" > "$PARSED_FILE" || parser_exit=$?
+
+case "$parser_exit" in
+    0)
+        : # success path — wrapper continues (log-round composition in next commit)
+        ;;
+    1)
+        # PR-1 manual-fallback discipline (issue #110 B5):
+        # Reviewer narrated the verdict but skipped LEDGER_PATCH. Instead of
+        # raw exit 1 (which re-creates #98/#102 discipline gap by handing
+        # control to Claude with no state recorded), log the round to
+        # state.json with verdict=UNKNOWN + manual_extraction_pending=true,
+        # append to bulldozer.log, then exit 11 so caller knows to:
+        #   1. Read $VERDICT_FILE
+        #   2. Extract findings from prose (count K, determine VERDICT)
+        #   3. Call update-state.py --review-dir $REVIEW_DIR \
+        #          --mode=replace-extraction $ROUND $K $VERDICT
+        # See SKILL.md Step 7 "manual-extraction branch" for the protocol.
+        manual_log_exit=0
+        BULLDOZER_REVIEW_DIR="$REVIEW_DIR" BULLDOZER_DEPTH="$DEPTH" \
+            bash "$LOG_ROUND" "$ROUND" "$ARTIFACT" "UNKNOWN" \
+                "0" "$FIXED" "$FP" "$REVIEWER" "$PROJECT_ROOT" "true" \
+                > /dev/null || manual_log_exit=$?
+        if (( manual_log_exit != 0 )); then
+            _emit_stop 70 "log-round.sh failed during manual-extraction logging (exit ${manual_log_exit})." \
+                "Helper script: ${LOG_ROUND}" \
+                "Cannot proceed with exit 11 because state.json was not written."
+        fi
+        {
+            echo "MANUAL_EXTRACTION_REQUIRED: round=${ROUND} artifact=${ARTIFACT}"
+            echo "      Verdict file: ${VERDICT_FILE}"
+            echo "      Extract findings from prose, then call:"
+            echo "      python3 ${UPDATE_STATE_Q} --review-dir ${REVIEW_DIR_Q} \\"
+            echo "          --mode=replace-extraction ${ROUND} <K> <GO|NO-GO>"
+        } >&2
+        exit 11
+        ;;
+    *)
+        # B2 (#110): all diagnostic exit codes (2/3/4/5 + anything unexpected)
+        # route through one helper so the code→message mapping has a single
+        # home. exit 0 (success) and exit 1 (manual extraction) stay above
+        # because they drive control flow, not just a diagnostic.
+        _emit_parser_exit_diagnostic "$parser_exit"
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Step 5-7: derive findings count + verdict, call log-round.sh, emit state.
+# Forgetting any of these is the discipline failure #102 exists to eliminate.
+# ---------------------------------------------------------------------------
+# Read findings count AND verdict in one python3 call. Since B8 (#110) the
+# parser emits a canonical TOP-LEVEL `verdict` ("go"/"no_go") on every exit-0
+# parse, so the wrapper reads it directly — single source of truth (the
+# GO/NO-GO derivation lives in the parser now, not duplicated here). The
+# canonical field is read at top level, NOT from meta: meta preserves the
+# reviewer's raw verdict token (Issue #100 case #7), which may be uppercase
+# or a YAML bool-ish token ("GO", "no") and must not be the decision input.
+# A missing verdict key maps to NO-GO (fail-safe; never a false GO),
+# preserving the BUG-2 invariant that empty findings never flip an
+# explicit NO-GO to GO.
+#
+# R2-F2: capture failure so set -e doesn't bubble python3 exit raw —
+# corrupted parsed-rN.json (parser bug, disk corruption, race with
+# concurrent writer) would otherwise look like parser-no-LEDGER (exit
+# 1) to the caller.
+parser_out_exit=0
+parser_out=$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as fp:
+    data = json.load(fp)
+findings = data.get("findings", [])
+verdict = "GO" if data.get("verdict") == "go" else "NO-GO"
+print(f"{len(findings)}|{verdict}")
+' "$PARSED_FILE") || parser_out_exit=$?
+
+if (( parser_out_exit != 0 )); then
+    _emit_stop 70 "failed to read parsed findings/verdict (python3 exit ${parser_out_exit})." \
+        "Parsed file: ${PARSED_FILE}" \
+        "Likely cause: corrupted JSON output from parser. Inspect the file and the parser stderr."
+fi
+
+# A1 (#110): defensive guard. The inline python above always prints
+# "COUNT|VERDICT" (any read error exits non-zero → the branch above), so
+# this is unreachable via normal PARSED_FILE content. But if a future edit
+# makes that print conditional, an empty parser_out would split into empty
+# findings_count/VERDICT and reach log-round with a misleading
+# "log-round.sh failed". Convert to a clear EX_SOFTWARE failure instead.
+if [[ -z "$parser_out" ]]; then
+    _emit_stop 70 "parser produced empty output (expected 'COUNT|VERDICT')." \
+        "Parsed file: ${PARSED_FILE}"
+fi
+
+findings_count="${parser_out%|*}"
+VERDICT="${parser_out#*|}"
+
+# FIXED, FP, LOG_ROUND already validated/resolved BEFORE parser invocation
+# (hoisted so the parser-exit-1 manual-extraction branch could use them).
+# Do NOT re-define here.
 
 # Pin BULLDOZER_REVIEW_DIR to our --review-dir so log-round/update-state
 # always write state.json into the per-review sandbox the caller asked for,
@@ -423,14 +675,8 @@ if (( log_round_exit != 0 )); then
         "Common causes: corrupted state.json in ${REVIEW_DIR}, EACCES on review dir, update-state.py environment issue."
 fi
 
-# Depth → max_rounds mapping. Computed unconditionally (not gated by trajectory
-# display) so the AskUser-pivot guard below can fire on round 1 quick depth too.
-case "$DEPTH" in
-    quick)      max_rounds=1 ;;
-    standard)   max_rounds=3 ;;
-    exhaustive) max_rounds=10 ;;
-    *)          max_rounds=0 ;;
-esac
+# max_rounds was read from depth-config.json at preflight (B1, #110); the
+# AskUser-pivot guard below uses it (previously a duplicated depth case here).
 
 # Step 8 (U7): trajectory display — only round >= 2, since round 1 has
 # nothing to plot. Goes to stderr (informational) so stdout stays JSON.
@@ -441,34 +687,7 @@ esac
 # (exit 1) to the caller.
 if (( ROUND >= 2 )); then
     trajectory_exit=0
-    python3 - "$ROUND" "$max_rounds" "${REVIEW_DIR}/state.json" <<'PYEOF' >&2 || trajectory_exit=$?
-import json
-import sys
-
-round_num = int(sys.argv[1])
-max_rounds = int(sys.argv[2])
-state_path = sys.argv[3]
-
-with open(state_path) as fp:
-    state = json.load(fp)
-
-history = state.get("history", [])
-trajectory = [h.get("findings", 0) for h in history]
-last = history[-1] if history else {"verdict": "UNKNOWN", "findings": 0}
-last_verdict = last.get("verdict", "UNKNOWN")
-last_findings = last.get("findings", 0)
-
-noun = "finding" if last_findings == 1 else "findings"
-print(
-    f"[bulldozer/check] Round {round_num}/{max_rounds} — "
-    f"verdict: {last_verdict} — {last_findings} {noun} open"
-)
-
-traj_str = " → ".join(str(f) for f in trajectory)
-window = trajectory[-3:]
-avg = sum(window) / len(window) if window else 0
-print(f"Trajectory: {traj_str}  (avg last 3: {avg:.1f})")
-PYEOF
+    python3 "$RENDER_TRAJECTORY" "$ROUND" "$max_rounds" "${REVIEW_DIR}/state.json" >&2 || trajectory_exit=$?
     if (( trajectory_exit != 0 )); then
         _emit_stop 70 "trajectory rendering failed (python3 exit ${trajectory_exit})." \
             "State file: ${REVIEW_DIR}/state.json" \
@@ -497,63 +716,54 @@ if (( cat_exit != 0 )); then
         "Likely cause: permission denied (EACCES). Fix permissions and retry."
 fi
 
-# Step 9 (U5a): AskUser pivot signal — fires when we've hit the depth's
-# max rounds without a GO verdict. Caller (Claude) reads exit 10 + the
-# pivot file and wraps in AskUserQuestion (continue / restructure /
-# accept-with-TODO).
+# Step 9 (U5a): AskUser pivot signal. Two triggers:
+#  - flat: ROUND >= max_rounds without GO (the depth's hard cap).
+#  - calibrated early-pivot (B6, #128): exhaustive only, ROUND >= 5, not GO, and
+#    the mean of the last 3 rounds' findings >= 3.0 (trajectory not converging).
+#    Surfaces the dialog earlier than round 10 to save doomed rounds. Scoped to
+#    exhaustive because widening it false-pivoted converging standard reviews on
+#    the session corpus (docs/superpowers/analysis/2026-06-01-b6-pivot-calibration.md
+#    — 0 FP on exhaustive, FP=4 any-depth). The pivot is an AskUser dialog, not an
+#    abort; the flat trigger stays the round-10 backstop, so this only moves the
+#    dialog earlier on a clearly-doomed exhaustive run.
+# Caller (Claude) reads exit 10 + the pivot file and wraps in AskUserQuestion
+# (continue / restructure / accept-with-TODO).
+CALIBRATED_PIVOT_MIN_ROUND=5
+CALIBRATED_PIVOT_AVG_THRESHOLD=3.0
+pivot_trigger=""
 if [[ -n "${max_rounds:-}" ]] && (( ROUND >= max_rounds )) && [[ "$VERDICT" != "GO" ]]; then
+    pivot_trigger="max_rounds_reached"
+elif [[ "$DEPTH" == "exhaustive" ]] && (( ROUND >= CALIBRATED_PIVOT_MIN_ROUND )) && [[ "$VERDICT" != "GO" ]]; then
+    # Reuse the trajectory metric (mean of last 3 findings) the render step
+    # computes — render-trajectory.py --avg-meets is now the single source
+    # (#133 F1), so the displayed avg and this gate can never diverge. It
+    # decides in python (bash never float-compares) and prints "0" on an
+    # unreadable state.json (exit 0); 2>/dev/null + || avg_meets=0 keep any
+    # unexpected failure non-fatal (no early pivot, flat round-10 backstop stays).
+    avg_meets=$(python3 "$RENDER_TRAJECTORY" --avg-meets \
+        "${REVIEW_DIR}/state.json" "$CALIBRATED_PIVOT_AVG_THRESHOLD" 2>/dev/null) || avg_meets=0
+    if (( avg_meets == 1 )); then
+        pivot_trigger="calibrated_nonconvergence"
+    fi
+fi
+
+if [[ -n "$pivot_trigger" ]]; then
     PIVOT_FILE="${REVIEW_DIR}/pivot-r${ROUND}.json"
     # R2-F3: pivot write may fail (EACCES on review dir, fs full, python3
     # crash). Capture so set -e doesn't bubble python3 exit raw — exit 10
     # is meaningful ONLY when the pivot file actually exists for the
     # caller to read.
     pivot_exit=0
-    python3 - "$ROUND" "$max_rounds" "$findings_count" "$DEPTH" "$ARTIFACT" "$PIVOT_FILE" <<'PYEOF' || pivot_exit=$?
-import json
-import sys
-
-round_num, max_rounds, open_findings, depth, artifact, pivot_path = (
-    int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]),
-    sys.argv[4], sys.argv[5], sys.argv[6],
-)
-pivot = {
-    "trigger": "max_rounds_reached",
-    "round": round_num,
-    "max_rounds": max_rounds,
-    "depth": depth,
-    "artifact": artifact,
-    "open_findings": open_findings,
-    # AskUserQuestion-compatible fields below: caller can pass these
-    # directly to the tool without renaming or synthesizing missing keys.
-    "question": (
-        f"Reached max rounds ({max_rounds}) without GO — "
-        f"{open_findings} finding(s) open. How to proceed?"
-    ),
-    "header": "Pivot",  # chip label, ≤12 chars per AskUserQuestion schema
-    "multiSelect": False,
-    "options": [
-        {
-            "label": "continue",
-            "description": "Run another round (exceeds max for this depth)",
-        },
-        {
-            "label": "restructure",
-            "description": "Pause review, restructure the artifact, re-launch /bulldozer:check",
-        },
-        {
-            "label": "accept-with-TODO",
-            "description": "Accept current state, log open findings as project TODOs",
-        },
-    ],
-}
-with open(pivot_path, "w") as fp:
-    json.dump(pivot, fp, indent=2)
-PYEOF
+    python3 "$EMIT_PIVOT" "$ROUND" "$max_rounds" "$findings_count" "$DEPTH" "$ARTIFACT" "$PIVOT_FILE" "$pivot_trigger" || pivot_exit=$?
     if (( pivot_exit != 0 )) || [[ ! -f "$PIVOT_FILE" ]]; then
         _emit_stop 70 "pivot file write failed (python3 exit ${pivot_exit})." \
             "Expected pivot file: ${PIVOT_FILE}" \
             "Exit 10 suppressed because caller cannot read a missing pivot file."
     fi
-    echo "PIVOT: max rounds reached without GO. See ${PIVOT_FILE} for AskUserQuestion options." >&2
+    if [[ "$pivot_trigger" == "calibrated_nonconvergence" ]]; then
+        echo "PIVOT: exhaustive review not converging by round ${ROUND} (avg last 3 findings >= ${CALIBRATED_PIVOT_AVG_THRESHOLD}). See ${PIVOT_FILE} for AskUserQuestion options." >&2
+    else
+        echo "PIVOT: max rounds reached without GO. See ${PIVOT_FILE} for AskUserQuestion options." >&2
+    fi
     exit 10
 fi

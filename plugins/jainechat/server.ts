@@ -11,17 +11,30 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  EmptyResultSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { readFileSync, writeFileSync, mkdirSync, statSync, copyFileSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, basename } from 'path'
 import type { ServerWebSocket } from 'bun'
+import { tts, stt } from './xai'
 
 const PORT = Number(process.env.JAINECHAT_PORT ?? 7777)
 const HOST = process.env.JAINECHAT_HOST ?? '127.0.0.1'
 const STATE_DIR = join(homedir(), '.claude', 'channels', 'jainechat')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const OUTBOX_DIR = join(STATE_DIR, 'outbox')
+
+// Optional local-LLM mode: set JAINECHAT_LLM to an ollama model (e.g. "granite4.1:3b")
+// to answer instantly from a local model instead of routing to the Claude session.
+const OLLAMA = process.env.JAINECHAT_OLLAMA ?? 'http://localhost:11434'
+const LLM = process.env.JAINECHAT_LLM
+const SYSTEM_PROMPT_PATH = process.env.JAINECHAT_SYSTEM_PROMPT
+let SYSTEM_PROMPT = ''
+if (LLM && SYSTEM_PROMPT_PATH) {
+  try { SYSTEM_PROMPT = readFileSync(SYSTEM_PROMPT_PATH, 'utf8') }
+  catch { process.stderr.write(`jainechat: WARNING — JAINECHAT_SYSTEM_PROMPT not readable (${SYSTEM_PROMPT_PATH})\n`) }
+}
 
 type Msg = {
   id: string
@@ -130,9 +143,116 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
+// Die with the session. MCP spec: the client closes our stdin on shutdown and the server
+// must exit — but the SDK transport never watches stdin EOF (typescript-sdk#202), so
+// nothing here ever noticed and zombies piled up holding ports for days. The 'close'
+// handler is the primary fix (verified delivered in CC's spawn-pipe topology; with
+// fifo-style stdin Bun.serve suppresses it — bun#3255 — hence not trusted alone). The
+// watchdog is the backstop for a hung-but-alive client and any undelivered EOF. It arms
+// only once a real MCP client initializes (manual local-LLM runs never arm it): exit
+// when re-parented to launchd (ppid BECAME 1 — supervisors that ARE pid 1 stay safe) or
+// after 2 consecutive failed pings, which the client's protocol layer auto-pongs — only
+// a dead/hung peer fails them. Ping failure = timeout only on EVERY Bun: ≤1.2.x reported
+// dead-pipe writes as success (fixed in 1.3.x; 'error' event still missing, bun#7251),
+// and the SDK's send() ignores write errors regardless — so the short per-request
+// timeout is what keeps detection ≈ 40s worst-case.
+// NB: deprecated `Server` (not McpServer) is intentional: oninitialized + request().
+process.stdin.on('close', () => process.exit(0))
+const PING_MS = 15_000
+let armed = false
+mcp.oninitialized = () => {
+  if (armed) return // spec-violating double-initialized must not arm a second loop
+  armed = true
+  const ppidAtArm = process.ppid
+  let pingFails = 0
+  let inFlight = false
+  setInterval(() => {
+    if (process.ppid === 1 && ppidAtArm !== 1) process.exit(0)
+    if (inFlight) return // ≤1 ping in flight: a slow tick must not stack timeouts
+    inFlight = true
+    // ping() takes no options → request() directly for a timeout shorter than the tick
+    mcp.request({ method: 'ping' }, EmptyResultSchema, { timeout: PING_MS - 5_000 }).then(
+      () => { inFlight = false; pingFails = 0 },
+      () => { inFlight = false; if (++pingFails >= 2) process.exit(0) },
+    )
+  }, PING_MS)
+}
+
 await mcp.connect(new StdioServerTransport())
 
+// Local-LLM conversation history (in-memory, capped) — only used when LLM is set.
+const history: { role: 'user' | 'assistant'; content: string }[] = []
+
+async function localReply(userText: string): Promise<void> {
+  history.push({ role: 'user', content: userText })
+  if (history.length > 20) history.splice(0, history.length - 20)
+  try {
+    const res = await fetch(`${OLLAMA}/api/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: LLM,
+        messages: [
+          { role: 'system', content: (SYSTEM_PROMPT ? SYSTEM_PROMPT + '\n\n---\n' : '') + 'Это голосовой чат. Отвечай коротко и разговорно, без списков, markdown и эмодзи.' },
+          ...history,
+        ],
+        stream: true,
+        options: { num_predict: 400 },
+      }),
+    })
+    if (!res.ok || !res.body) throw new Error(`ollama ${res.status}`)
+    // Stream tokens; broadcast each complete phrase as its own message so the
+    // client's TTS pipeline starts speaking the first phrase while the rest generates.
+    const reader = res.body.getReader()
+    const dec = new TextDecoder()
+    let buf = '', phrase = '', full = ''
+    const clean = (s: string) =>
+      s.replace(/[*_`#>]+/g, '').replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '').replace(/\s+/g, ' ').trim()
+    const emitPhrases = (force = false) => {
+      for (;;) {
+        // cut at a terminator followed by space/end, but only once the phrase is
+        // long enough — skips initials (J.A.I.N.E.), decimals (4.6), list markers (1.).
+        let cut = -1, mm: RegExpExecArray | null
+        const re = /[.!?…\n]+(?=\s|$)/g
+        while ((mm = re.exec(phrase))) {
+          const end = mm.index + mm[0].length
+          if (end >= 12) { cut = end; break }
+        }
+        if (cut < 0) break
+        const p = clean(phrase.slice(0, cut))
+        phrase = phrase.slice(cut)
+        if (p) broadcast({ type: 'msg', id: nextId(), from: 'assistant', text: p, ts: Date.now() })
+      }
+      if (force && phrase.trim()) {
+        const p = clean(phrase); phrase = ''
+        if (p) broadcast({ type: 'msg', id: nextId(), from: 'assistant', text: p, ts: Date.now() })
+      }
+    }
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += dec.decode(value, { stream: true })
+      let nl: number
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1)
+        if (!line) continue
+        try {
+          const c = (JSON.parse(line) as { message?: { content?: string } }).message?.content ?? ''
+          if (c) { phrase += c; full += c; emitPhrases() }
+        } catch {}
+      }
+    }
+    // flush any final non-newline-terminated NDJSON chunk before the last emit
+    if (buf.trim()) { try { const c = (JSON.parse(buf.trim()) as { message?: { content?: string } }).message?.content ?? ''; if (c) { phrase += c; full += c } } catch {} }
+    emitPhrases(true)
+    if (full.trim()) history.push({ role: 'assistant', content: full.trim() })
+  } catch (err) {
+    broadcast({ type: 'msg', id: nextId(), from: 'assistant', text: `(local LLM error: ${err instanceof Error ? err.message : err})`, ts: Date.now() })
+  }
+}
+
 function deliver(id: string, text: string, file?: { path: string; name: string }): void {
+  if (LLM) { void localReply(text); return }
   void mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -145,8 +265,9 @@ function deliver(id: string, text: string, file?: { path: string; name: string }
   })
 }
 
-Bun.serve({
-  port: PORT,
+function serve(port: number) {
+  return Bun.serve({
+  port,
   hostname: HOST,
   fetch(req, server) {
     const url = new URL(req.url)
@@ -166,6 +287,43 @@ Bun.serve({
       } catch {
         return new Response('404', { status: 404 })
       }
+    }
+
+    if (url.pathname === '/tts' && req.method === 'POST') {
+      return (async () => {
+        try {
+          const { text, voice, language } = (await req.json()) as {
+            text?: string; voice?: string; language?: string
+          }
+          if (!text?.trim()) return new Response('empty text', { status: 400 })
+          const mp3 = await tts(text, { voice, language })
+          return new Response(mp3, { headers: { 'content-type': 'audio/mpeg' } })
+        } catch (err) {
+          return new Response(`tts: ${err instanceof Error ? err.message : err}`, { status: 502 })
+        }
+      })()
+    }
+
+    if (url.pathname === '/stt' && req.method === 'POST') {
+      return (async () => {
+        try {
+          const form = await req.formData()
+          const id = String(form.get('id') ?? '') || nextId()
+          const language = (form.get('language') as string) || undefined
+          const f = form.get('file')
+          if (!(f instanceof File) || f.size === 0) return new Response('no audio', { status: 400 })
+          const text = await stt(await f.arrayBuffer(), f.name || 'audio.webm', { language })
+          if (text) {
+            broadcast({ type: 'msg', id, from: 'user', text, ts: Date.now() })
+            deliver(id, text)
+          }
+          return new Response(JSON.stringify({ text }), {
+            headers: { 'content-type': 'application/json' },
+          })
+        } catch (err) {
+          return new Response(`stt: ${err instanceof Error ? err.message : err}`, { status: 502 })
+        }
+      })()
     }
 
     if (url.pathname === '/upload' && req.method === 'POST') {
@@ -203,9 +361,25 @@ Bun.serve({
       } catch {}
     },
   },
-})
+  })
+}
 
-process.stderr.write(`jainechat: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}\n`)
+// Each session runs its own jainechat process; bind the first free port from
+// PORT upward so a 2nd session doesn't crash on EADDRINUSE. The chosen URL is
+// printed to stderr (visible in the Claude Code MCP log).
+let boundPort = PORT
+for (let p = PORT; p < PORT + 20; p++) {
+  try {
+    serve(p)
+    boundPort = p
+    break
+  } catch (err) {
+    const inUse = (err as { code?: string })?.code === 'EADDRINUSE' || String((err as Error)?.message ?? '').toLowerCase().includes('in use')
+    if (!inUse || p === PORT + 19) throw err
+  }
+}
+
+process.stderr.write(`jainechat: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${boundPort}${LLM ? ` (local LLM: ${LLM})` : ''}\n`)
 
 const HTML = `<!doctype html>
 <meta charset="utf-8">
@@ -223,14 +397,18 @@ form { position: fixed; bottom: 0; left: 0; right: 0; padding: 1em; background: 
 #row button[type=submit]:hover { background: #2a4a2a; }
 h3 { color: #7a7; }
 b { color: #7a7; }
+#mic.rec { background: #5a1a1a; border-color: #a33; color: #fbb; }
+#spk { display: flex; align-items: center; gap: 0.3ch; cursor: pointer; user-select: none; color: #999; }
 </style>
 <h3>jainechat</h3>
 <pre id=log></pre>
 <form id=form>
   <textarea id=text rows=2 autocomplete=off autofocus></textarea>
   <div id=row>
+    <button type=button id=mic title="hold to talk — click to start/stop">🎤 talk</button>
     <button type=button onclick="file.click()">attach</button><input type=file id=file>
     <span id=chip></span>
+    <label id=spk title="speak jaine's replies"><input type=checkbox id=spkbox checked> 🔊</label>
     <button type=submit>send</button>
   </div>
 </form>
@@ -247,7 +425,7 @@ const msgs = {}
 const ws = new WebSocket('ws://' + location.host + '/ws')
 ws.onmessage = e => {
   const m = JSON.parse(e.data)
-  if (m.type === 'msg') add(m)
+  if (m.type === 'msg') { add(m); if (m.from === 'assistant') playTTS(m.text) }
   if (m.type === 'edit') { const x = msgs[m.id]; if (x) { x.body.textContent = m.text + ' (edited)' } }
 }
 
@@ -294,5 +472,94 @@ function line(who, text, replyTo, file) {
 
 function scroll() { window.scrollTo(0, document.body.scrollHeight) }
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit() } })
+
+// --- voice out: stream jaine's replies via /tts, sentence by sentence ---
+// Split into sentence-sized chunks and pipeline: synth the next chunk while the
+// current one plays, so audio starts after the FIRST sentence, not the whole text.
+const spkbox = document.getElementById('spkbox')
+let ttsQueue = [], ttsDraining = false, curAudio = null
+
+function ttsChunks(text) {
+  const parts = text.replace(/\\s+/g, ' ').trim().match(/[^.!?…\\n]+[.!?…]*/g) || [text]
+  const out = []
+  for (let p of parts) {
+    p = p.trim(); if (!p) continue
+    while (p.length > 220) {
+      let cut = p.lastIndexOf(' ', 220); if (cut < 80) cut = 220
+      out.push(p.slice(0, cut).trim()); p = p.slice(cut).trim()
+    }
+    if (p) out.push(p)
+  }
+  return out
+}
+
+function fetchTTS(text) {
+  return fetch('/tts', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }) })
+    .then(r => r.ok ? r.blob() : null).catch(() => null)
+}
+
+function playBlob(b) {
+  return new Promise(res => {
+    const url = URL.createObjectURL(b)
+    curAudio = new Audio(url)
+    const done = () => { URL.revokeObjectURL(url); res() }
+    curAudio.onended = done; curAudio.onerror = done
+    curAudio.play().catch(done)
+  })
+}
+
+async function drainTTS() {
+  ttsDraining = true
+  try {
+    let pending = ttsQueue.length ? fetchTTS(ttsQueue.shift()) : null
+    while (pending) {
+      const blob = await pending
+      pending = ttsQueue.length ? fetchTTS(ttsQueue.shift()) : null // prefetch next while this plays
+      if (blob) await playBlob(blob)
+    }
+  } finally {
+    ttsDraining = false
+  }
+}
+
+function playTTS(text) {
+  if (!spkbox.checked || !text || !text.trim()) return
+  for (const c of ttsChunks(text)) ttsQueue.push(c)
+  if (!ttsDraining) drainTTS()
+}
+
+// turning the toggle off stops playback and clears the queue
+spkbox.addEventListener('change', () => {
+  if (!spkbox.checked) { ttsQueue = []; if (curAudio) curAudio.pause() }
+})
+
+// --- voice in: mic capture -> /stt (recognized text returns over WS) ---
+const mic = document.getElementById('mic')
+let rec = null, chunks = []
+mic.onclick = async () => {
+  if (rec && rec.state === 'recording') { rec.stop(); return }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    rec = new MediaRecorder(stream)
+    chunks = []
+    rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data) }
+    rec.onstop = () => {
+      stream.getTracks().forEach(t => t.stop())
+      mic.classList.remove('rec'); mic.textContent = '🎤 talk'
+      const mt = rec.mimeType || 'audio/webm'
+      const blob = new Blob(chunks, { type: mt })
+      if (!blob.size) return
+      const ext = mt.includes('mp4') || mt.includes('m4a') ? 'm4a' : mt.includes('ogg') ? 'ogg' : 'webm'
+      const fd = new FormData()
+      fd.set('id', 'u' + Date.now() + '-' + (++uid))
+      fd.set('file', blob, 'rec.' + ext)
+      fetch('/stt', { method: 'POST', body: fd }).catch(() => {})
+    }
+    rec.start()
+    mic.classList.add('rec'); mic.textContent = '⏹ stop'
+  } catch (err) {
+    alert('mic error: ' + err)
+  }
+}
 </script>
 `

@@ -1,0 +1,25 @@
+{
+  "trigger": "max_rounds_reached",
+  "round": 3,
+  "max_rounds": 3,
+  "depth": "standard",
+  "artifact": "src/x.py",
+  "open_findings": 5,
+  "question": "Reached max rounds (3) without GO \u2014 5 finding(s) open. How to proceed?",
+  "header": "Pivot",
+  "multiSelect": false,
+  "options": [
+    {
+      "label": "continue",
+      "description": "Run another round (exceeds max for this depth)"
+    },
+    {
+      "label": "restructure",
+      "description": "Pause review, restructure the artifact, re-launch /bulldozer:check"
+    },
+    {
+      "label": "accept-with-TODO",
+      "description": "Accept current state, log open findings as project TODOs"
+    }
+  ]
+}

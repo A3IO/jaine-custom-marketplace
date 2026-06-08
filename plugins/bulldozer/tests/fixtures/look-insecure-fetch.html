@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>look-insecure-fetch</title>
+<!-- #93 reproduction: a file:// page fetching an http:// origin. The fetch target is
+     passed in the URL hash so a test can point it at the random test_server port
+     (normalize_url passes a file:// URL — hash included — through verbatim). With web
+     security ON the fetch is cross-origin → FAIL; an --insecure lane
+     (--disable-web-security) → OK. -->
+<div id="r">PENDING</div>
+<script>
+  var target = location.hash.slice(1);
+  fetch(target)
+    .then(function (resp) { return resp.text(); })
+    .then(function (body) { document.getElementById("r").textContent = "OK:" + body.trim(); })
+    .catch(function (err) {
+      document.getElementById("r").textContent =
+        "FAIL:" + ((err && err.message) ? err.message : String(err));
+    });
+</script>

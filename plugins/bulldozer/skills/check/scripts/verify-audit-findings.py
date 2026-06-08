@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""E1 consistency-audit verifier (#94). Quote-presence only — anti-hallucination.
+
+Reads a findings JSON (the consistency-auditor agent's output, written by Claude),
+keeps only findings whose cited quote(s) are verbatim-present where claimed, and
+writes the survivors. The ONE deterministic guarantee: a fabricated / absent quote
+is dropped. It does NOT judge whether the cited text is a real defect of its class
+— that is Claude's semantic call on the survivors.
+
+Usage:
+  verify-audit-findings.py --findings <in.json> --out <out.json> --project-root <dir>
+
+Robust fail-open: the agent is an LLM, so its output can be valid JSON with wrong
+shapes (top-level array, non-string quote/file, non-dict anchor, out-of-contract
+class). Any such malformed input DROPS the offending finding (or the whole batch)
+and exits 0 — a misbehaving auditor degrades to "no pre-clean this round", never
+crashes the round.
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+# The four-class contract — mirror of skills/check/data/e1-evidence-schema.json
+# (anchor_by_class keys). Drift-guarded by
+# tests/test_verify_audit_findings.py::test_known_classes_survive_drift_guard.
+VALID_CLASSES = frozenset({
+    "dead_ref", "internal_contradiction", "cross_spec_drift", "stale_term",
+})
+
+
+def _present(text, quote):
+    """quote is a non-empty (after strip) string verbatim-present (fixed-string) in text."""
+    return isinstance(quote, str) and quote.strip() != "" and quote in text
+
+
+def _read(root, rel):
+    """Read rel under root, or None.
+
+    Drops non-string / empty rel, and any path that resolves OUTSIDE project-root
+    (absolute path or ../ traversal) — the verifier only ever reads the reviewed
+    project. Both sides are resolved so symlinks and macOS /var↔/private don't leak.
+    """
+    if not isinstance(rel, str) or not rel:
+        return None
+    root_p = Path(root).resolve()
+    try:
+        target = (root_p / rel).resolve()
+        target.relative_to(root_p)  # ValueError if outside root (abs path or ../)
+    except (ValueError, OSError):
+        return None
+    try:
+        return target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def survives(finding, root):
+    """True iff the finding's class is in-contract AND every cited quote is
+    verbatim-present where claimed. Never raises on malformed field types."""
+    cls = finding.get("class")
+    # isinstance guard first: a non-string (e.g. list/dict) class is unhashable and
+    # would raise TypeError in the `in VALID_CLASSES` membership test.
+    if not isinstance(cls, str) or cls not in VALID_CLASSES:
+        return False
+    text = _read(root, finding.get("file", ""))
+    quote = finding.get("quote", "")
+    anchor = finding.get("anchor")
+    if not isinstance(anchor, dict):
+        anchor = {}
+    if text is None or not _present(text, quote):
+        return False
+    if cls == "internal_contradiction":
+        quote_b = anchor.get("quote_b", "")
+        return quote_b != quote and _present(text, quote_b)
+    if cls == "cross_spec_drift":
+        other_text = _read(root, anchor.get("other_file", ""))
+        return other_text is not None and _present(other_text, anchor.get("other_quote", ""))
+    # dead_ref + stale_term: quote-presence (GATE-A) is the whole deterministic check;
+    # whether `ref` resolves / the term is stale-vs-intentional is Claude's judgment.
+    return True
+
+
+def main(argv):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--findings", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--project-root", required=True)
+    args = ap.parse_args(argv)
+
+    try:
+        data = json.loads(Path(args.findings).read_text(encoding="utf-8"))
+        findings = data.get("findings", []) if isinstance(data, dict) else []
+        if not isinstance(findings, list):
+            findings = []
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        findings = []  # fail-open (UnicodeDecodeError = non-UTF-8 findings file)
+
+    survivors = [f for f in findings if isinstance(f, dict) and survives(f, args.project_root)]
+    Path(args.out).write_text(json.dumps({"findings": survivors}, indent=2), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>SP0 Async Spike</title></head>
+<body>
+  <button id="load">Load</button>
+  <div id="result"></div>
+  <button id="delayed" disabled>Delayed</button>
+  <div id="delayed-result"></div>
+  <button id="break">Break</button>
+  <script>
+    // #result appears 800ms after click — tests wait-for-element.
+    document.getElementById('load').addEventListener('click', function () {
+      setTimeout(function () {
+        document.getElementById('result').textContent = 'loaded';
+        console.log('SPIKE_RESULT_READY');
+      }, 800);
+      // #delayed enables 1500ms AFTER this click (not page load) — exercises the actionability
+      // race (R2-F1): naive (blind 1s sleep, immediate click) hits it while still disabled →
+      // no-op → fails; best (explicit wait !disabled) and Playwright (auto-wait) handle it.
+      setTimeout(function () {
+        document.getElementById('delayed').disabled = false;
+      }, 1500);
+    });
+    document.getElementById('delayed').addEventListener('click', function () {
+      document.getElementById('delayed-result').textContent = 'clicked';
+    });
+    // #break throws — tests console-error gate.
+    document.getElementById('break').addEventListener('click', function () {
+      undefined_function_xyz();  // ReferenceError → console
+    });
+  </script>
+</body></html>

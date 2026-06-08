@@ -2,8 +2,10 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <link rel="icon" href="data:,">
     <title>JAINE Test Page</title>
     <style>
+        html { scroll-behavior: smooth; }
         body { font-family: system-ui, sans-serif; padding: 2rem; background: #1a1a2e; color: #e0e0e0; }
         h1 { color: #00d4ff; }
         button { padding: 0.5rem 1rem; margin: 0.5rem; cursor: pointer; background: #16213e; color: #e0e0e0; border: 1px solid #0f3460; border-radius: 4px; }
@@ -23,6 +25,31 @@
             Click Me
         </button>
         <div id="click-status" class="status">not clicked</div>
+    </section>
+
+    <section>
+        <h2>Trusted Click Test</h2>
+        <button id="trusted-probe" onclick="
+            window.__clickTrusted = event.isTrusted;
+            window.__userActivation = (navigator.userActivation && 'isActive' in navigator.userActivation) ? navigator.userActivation.isActive : null;
+            document.getElementById('trusted-status').textContent = 'isTrusted=' + window.__clickTrusted;
+        ">Trusted Probe</button>
+        <div id="trusted-status" class="status">no click</div>
+    </section>
+
+    <section>
+        <h2>Hidden (display:none) Click Test</h2>
+        <button id="hidden-btn" style="display:none" onclick="window.__hiddenClicked = true">Hidden</button>
+        <div id="hidden-status" class="status">hidden, expect el.click fallback</div>
+    </section>
+
+    <section>
+        <h2>Occluded Click Test</h2>
+        <div style="position:relative; width:200px; height:60px">
+            <button id="occluded-btn" style="position:absolute; inset:0"
+                    onclick="window.__occludedClicked = true">Occluded</button>
+            <div id="occluder" style="position:absolute; inset:0; z-index:10; background:rgba(255,0,0,0.05)"></div>
+        </div>
     </section>
 
     <section>
@@ -49,6 +76,14 @@
     <section>
         <h2>Network Test</h2>
         <div id="network-status" class="status">fetching...</div>
+    </section>
+
+    <section style="margin-top: 2200px">
+        <h2>Below-Fold Smooth-Scroll Test</h2>
+        <button id="belowfold-btn" onclick="
+            window.__belowfoldTrusted = event.isTrusted;
+            window.__belowfoldClicked = true;
+        ">Below Fold</button>
     </section>
 
     <script>

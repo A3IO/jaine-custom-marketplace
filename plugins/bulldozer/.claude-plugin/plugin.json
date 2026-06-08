@@ -1,9 +1,11 @@
 {
   "name": "bulldozer",
-  "version": "2026.05.27.4",
+  "version": "2026.06.05.6",
   "description": "Adversarial review loop with external AI reviewer (Codex CLI) + visual browser verification via JAINE Browser CDP",
   "author": {
     "name": "JAINE",
     "email": "jaine@local"
-  }
+  },
+  "repository": "https://github.com/A3IO/jaine-plugins",
+  "homepage": "https://github.com/A3IO/jaine-plugins/tree/bulldozer/main/plugins/bulldozer"
 }

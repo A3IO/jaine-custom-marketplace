@@ -2,7 +2,7 @@
 name: check
 description: "Adversarial review of specs, designs, configs, or code via external AI reviewer (Codex CLI) against artifacts on disk. Triggers on \"review this spec\", \"adversarial review\", \"check this design\", \"second opinion on file\", \"проверь спеку\", \"ревью артефакта\", \"bulldozer check\". Do NOT use for inline conversational design questions without an artifact on disk — use bulldozer:consult instead. Do NOT use for quick questions, trivial edits, or code with existing test coverage."
 argument-hint: "[quick|standard|exhaustive] [file|dir|diff]"
-allowed-tools: ["Bash", "Read", "Edit", "Write", "AskUserQuestion"]
+allowed-tools: ["Bash", "Read", "Edit", "Write", "AskUserQuestion", "Task"]
 ---
 
 # Adversarial Review Loop
@@ -112,37 +112,31 @@ Free-form prompts without a file/dir/diff are NOT supported — the iterative fi
 | `standard` | 3 | `-c model_reasoning_effort=xhigh` | (none) | Normal work, moderate stakes |
 | `exhaustive` | until GO (cap 10) | `-c model_reasoning_effort=xhigh` | (none) | High stakes, spec drives automation |
 
+> **Canonical source:** the wrapper reads these depth parameters from `skills/check/data/depth-config.json` (single source of truth, B1 / #110). This table mirrors that file — `TestDepthConfigContract` fails if they drift.
+
 Default: `standard`. Override via argument: `/bulldozer:check exhaustive`
 
 ```dot
 digraph review_loop {
   rankdir=TB;
-  "Resolve project root" -> "Self-ignore .bulldozer";
-  "Self-ignore .bulldozer" -> "Setup review dir";
-  "Setup review dir" -> "Send to reviewer (FOREGROUND)";
-  "Send to reviewer (FOREGROUND)" -> "Read verdict file";
-  "Read verdict file" -> "Empty?" [label=""];
-  "Empty?" -> "Rerun same round" [label="yes (crash)"];
-  "Rerun same round" -> "Send to reviewer (FOREGROUND)";
-  "Empty?" -> "Extract LEDGER_PATCH" [label="no"];
-  "Extract LEDGER_PATCH" -> "Apply to review-ledger.yml";
-  "Apply to review-ledger.yml" -> "GO verdict?";
-  "GO verdict?" -> "Done — log summary" [label="yes"];
-  "GO verdict?" -> "Verify each finding\nempirically in code" [label="no"];
-  "Verify each finding\nempirically in code" -> "Real or false positive?";
+  "Setup review dir + build prompt" -> "bulldozer-round.sh (codex, parse, log-round, trajectory, pivot)";
+  "bulldozer-round.sh (codex, parse, log-round, trajectory, pivot)" -> "Branch on wrapper exit code";
+  "Branch on wrapper exit code" -> "Verify findings empirically" [label="0"];
+  "Branch on wrapper exit code" -> "Manual extraction (read verdict, replace-extraction)" [label="11"];
+  "Branch on wrapper exit code" -> "STOP — inspect and fix invocation" [label="2/3/4/5/64/70/71"];
+  "Branch on wrapper exit code" -> "AskUser pivot (continue / restructure / accept-with-TODO)" [label="10"];
+  "Manual extraction (read verdict, replace-extraction)" -> "Verify findings empirically";
+  "Verify findings empirically" -> "Real or false positive?";
   "Real or false positive?" -> "Fix confirmed issues" [label="real"];
-  "Real or false positive?" -> "Note as false positive" [label="false"];
-  "Fix confirmed issues" -> "Commit + log round";
-  "Note as false positive" -> "Commit + log round";
-  "Commit + log round" -> "Show trajectory\n(round >= 2)";
-  "Show trajectory\n(round >= 2)" -> "Pivot prompt?" [label=""];
-  "Pivot prompt?" -> "AskUser:\ncontinue / restructure / accept" [label="round == max\n&& verdict != GO"];
-  "Pivot prompt?" -> "Round < max?" [label="otherwise"];
-  "AskUser:\ncontinue / restructure / accept" -> "Round < max?" [label="continue"];
-  "AskUser:\ncontinue / restructure / accept" -> "Done — user pivoted" [label="restructure\nor accept"];
-  "Round < max?" -> "Build RN prompt from ledger" [label="yes"];
-  "Build RN prompt from ledger" -> "Send to reviewer (FOREGROUND)";
-  "Round < max?" -> "Report: max rounds hit" [label="no"];
+  "Real or false positive?" -> "Note false positive" [label="false"];
+  "Fix confirmed issues" -> "Apply findings to ledger";
+  "Note false positive" -> "Apply findings to ledger";
+  "Apply findings to ledger" -> "GO verdict?";
+  "GO verdict?" -> "Done — write summary" [label="yes"];
+  "GO verdict?" -> "Build Round N prompt" [label="no, round < max"];
+  "Build Round N prompt" -> "bulldozer-round.sh (codex, parse, log-round, trajectory, pivot)";
+  "AskUser pivot (continue / restructure / accept-with-TODO)" -> "Build Round N prompt" [label="continue"];
+  "AskUser pivot (continue / restructure / accept-with-TODO)" -> "Done — user pivoted" [label="restructure / accept"];
 }
 ```
 
@@ -178,6 +172,43 @@ if [[ ! -f .bulldozer/.gitignore ]]; then
 fi
 ```
 
+**1.7. Pre-review consistency audit (E1, doc rounds only)** — for a
+**doc/spec artifact** (a `.md`/`.mdx`/`.rst` file, a `docs`/`specs` directory,
+or a diff touching doc files — skip for pure code), run this BEFORE building the
+round prompt, every round:
+
+1. **Locate.** Read `audit_model` from `.bulldozer/config.md` frontmatter (default
+   `sonnet`). Preferred: dispatch the read-only auditor
+   `Task(subagent_type: "bulldozer:consistency-auditor", model: <audit_model>)`.
+   **If that Task errors `agent type ... not found`** — plugin agents register only at
+   session-start / `/reload-plugins`, NOT from source the way skills do, so a
+   just-shipped auditor stays unregistered until the consumer reloads — do the
+   four-class locate **inline yourself** instead: read the artifact (and its sibling
+   specs) and produce the SAME `{id, class, file, quote, anchor}` envelope, copying
+   every quote verbatim. (Inline is equivalent for correctness — the verifier below
+   drops hallucinated quotes regardless of who located them; the subagent is only a
+   cost-isolation optimization.) Either way, YOU write the envelope to
+   `${REVIEW_DIR}/e1-findings-r${ROUND}.json` (the agent is read-only — it cannot write
+   the file).
+2. **Verify (anti-hallucination).** Run:
+   `python3 <plugin>/skills/check/scripts/verify-audit-findings.py --findings ${REVIEW_DIR}/e1-findings-r${ROUND}.json --out ${REVIEW_DIR}/e1-verified-r${ROUND}.json --project-root ${PROJECT_ROOT}`.
+   It keeps only findings whose quotes are verbatim-present and writes
+   `e1-verified-r${ROUND}.json`. (Fail-open: on any error it writes an empty set and
+   exits 0 — skip the pre-clean and proceed.)
+3. **Judge + fix.** You may edit the artifact for a consistency finding ONLY if it
+   appears in `e1-verified-r${ROUND}.json` (the sole licensed fix input — NEVER fix
+   from the raw `e1-findings` file). For each survivor, apply judgment: is the cited
+   text a real defect of its class (the dead_ref genuinely unresolved? the two present
+   quotes genuinely conflicting? the drift real? the term stale-not-intentional)? Fix
+   the real ones; DECLINE the intentional ones (declining is fine — nothing blocks).
+4. **Commit separately** as `docs: pre-review consistency fixes (N)`. These are E1
+   fixes, NOT codex-round fixes: never set `BULLDOZER_FIXED`/`BULLDOZER_FP` for them;
+   if noted in `review-ledger.yml`, use a distinct `e1_audit:` note, never `R{round}-F{n}`.
+
+Then proceed to the codex round normally. (Enforcement is soft: the verifier is
+cheap, this step is pinned by a structural test, and `e1-verified-r${ROUND}.json`'s
+presence in `${REVIEW_DIR}` makes a skip detectable in-session.)
+
 **2. Build the round prompt** — pick the right template from the Reviewer Prompt Templates section below, substitute the artifact-specific placeholders (`<PATH>`, `<TYPE>`, `<PURPOSE>`, `<DEPTH>`, etc.), and write it to a file the wrapper can read:
 
 ```bash
@@ -202,26 +233,48 @@ For Round N continuation prompts, embed the current review-ledger.yml as APPENDI
 wrapper_exit=$?
 ```
 
-The wrapper runs codex FOREGROUND with the right `-s read-only -m -o -C` flags + depth-specific reasoning effort, invokes `parse-ledger-patch.py` on the resulting `verdict-r${ROUND}.txt`, calls `log-round.sh` (which updates `state.json` and appends to `bulldozer.log`), prints the trajectory to stderr when `ROUND >= 2`, and on `ROUND >= max_rounds && verdict != GO` writes `pivot-r${ROUND}.json` with AskUserQuestion options and exits 10.
+The wrapper runs codex FOREGROUND with the right `-s read-only -m -o -C` flags + depth-specific reasoning effort, invokes `parse-ledger-patch.py` on the resulting `verdict-r${ROUND}.txt`, calls `log-round.sh` (which updates `state.json` and appends to `bulldozer.log`), prints the trajectory to stderr when `ROUND >= 2`, and on a pivot trigger — the flat `ROUND >= max_rounds && verdict != GO`, or the B6 calibrated exhaustive early-pivot (#128: `depth == exhaustive && ROUND >= 5 && verdict != GO && mean-last-3 findings >= 3.0`) — writes `pivot-r${ROUND}.json` with AskUserQuestion options and exits 10.
 
 stdout carries the final `state.json` contents so you can read trajectory or open findings without re-reading the file.
 
+**Wrapper environment variables (E1, #110).** The wrapper sets two vars in the `log-round.sh` child-process scope ONLY — they do not leak back to the caller's environment:
+- `BULLDOZER_REVIEW_DIR="$REVIEW_DIR"` — pins where `log-round.sh` / `update-state.py` write `state.json` (the per-review sandbox), overriding their cwd-relative `.bulldozer/` default. Set fresh per round.
+- `BULLDOZER_DEPTH="$DEPTH"` — records the depth in the round's `state.json` / `bulldozer.log` line.
+
+The inverse pair `BULLDOZER_FIXED` / `BULLDOZER_FP` (Step 6) is set by YOU in the wrapper's env to record per-round fixed / false-positive counts; unset them after the round so they don't leak into the next.
+
 **Wrapper exit codes — branch explicitly. Do NOT silently retry on non-zero exit.**
 
-Codes are partitioned by origin so the caller can route mechanically without parsing stderr: `1-5` = parser outcomes, `10` = pivot, `64/70/71` = wrapper-side failures (sysexits.h convention). Reserved codes never overlap across origins — if you see `1`, the parser produced it; if `64`, the wrapper rejected the call; if `71`, codex itself crashed.
+Codes are partitioned by origin so the caller can route mechanically without parsing stderr: `2-5` = parser outcomes, `10` = pivot, `11` = manual-extraction (wrapper-converted from internal parser exit 1), `64/70/71` = wrapper-side failures (sysexits.h convention). Reserved codes never overlap across origins — if you see `11`, the wrapper converted parser's internal "no LEDGER_PATCH" signal; if you see `64`, the wrapper rejected the call; if `71`, codex itself crashed. Raw wrapper exit 1 should never surface post-PR-1 — if it does, report as plugin bug.
 
 | Exit | Origin | Meaning | Your action |
 |------|--------|---------|-------------|
 | `0` | wrapper | Round logged successfully | Continue to Step 4 (verify findings) |
-| `1` | parser | No LEDGER_PATCH block in verdict | Manual fallback: `Read "${REVIEW_DIR}/verdict-r${ROUND}.txt"`, extract findings from the prose, append them to the ledger, then continue to Step 4 |
+| `1` | parser | (internal) No LEDGER_PATCH block — wrapper intercepts and converts to exit 11. Callers should never observe this exit directly. | If somehow surfaced (wrapper bug?), report to plugin maintainer. |
 | `2` | parser | Malformed YAML in LEDGER_PATCH | STOP. Inspect `${REVIEW_DIR}/verdict-r${ROUND}.malformed.yml` (parser saved the raw block); ask user how to proceed (fix template, retry, or pivot) |
 | `3` | parser | Schema violation in LEDGER_PATCH | STOP. Patch is structurally wrong; do NOT apply. Ask user how to proceed |
 | `4` | parser | PyYAML not installed | Tell user the install command (printed by wrapper) and retry |
 | `5` | parser/wrapper | Verdict file empty, missing, or unreadable | Usually transient. Check `${REVIEW_DIR}/full-r${ROUND}.txt` for codex output, then retry the round |
 | `10` | wrapper | Max rounds reached without GO | Read `${REVIEW_DIR}/pivot-r${ROUND}.json` and wrap its `options` array in `AskUserQuestion` (continue / restructure / accept-with-TODO). Act on the user's choice |
+| `11` | wrapper | No LEDGER_PATCH block in verdict — round logged with `verdict="UNKNOWN"` + `manual_extraction_pending=true`; caller must extract findings from prose and reconcile | Read `${REVIEW_DIR}/verdict-r${ROUND}.txt`, count findings (K) and determine VERDICT (GO/NO-GO) from the prose. Then call: `python3 <plugin>/skills/check/scripts/update-state.py --review-dir "${REVIEW_DIR}" --mode=replace-extraction ${ROUND} ${K} ${VERDICT}` (`update-state.py` is NOT on PATH — invoke via `python3` + full script path; the wrapper's exit-11 stderr prints the exact command with both the script path and `--review-dir` already shell-escaped — copy it verbatim). See Step 7 "manual-extraction branch" for the full flow including terminal-round pivot dispatch. |
 | `64` | wrapper | Preflight / usage error (bad flag, missing flag, bad reviewer format, missing prompt file, invalid depth, non-numeric BULLDOZER_FIXED/FP) | Fix the invocation. Diagnostic on stderr names the offending input. Do NOT retry without correcting the caller — this is a contract violation, not a transient failure |
 | `70` | wrapper | Wrapper-internal failure (parser/log-round script not at expected path, log-round.sh failed during execution) | Check stderr diagnostic — typically a stale `CLAUDE_PLUGIN_ROOT` (run `jaine-sync plugins update bulldozer`) or a corrupted `state.json` in the review dir |
 | `71` | wrapper | codex exec crashed | Diagnostic on wrapper stderr names the original codex exit code (preserved) and the path to `full-r${ROUND}.txt`. Report to user — do not silently retry. Common codex exits: 1 (auth expired → `codex login`), other (network, rate limit) |
+
+**Pivot signal channels (E2, #110).** At `ROUND >= max_rounds && verdict != GO` the wrapper signals a pivot on FOUR channels — the exit code alone is necessary but not sufficient:
+1. **exit 10** — the routing signal (branch on it).
+2. **stderr** — a human-readable `PIVOT: ...` marker line.
+3. **`${REVIEW_DIR}/pivot-r${ROUND}.json`** — the load-bearing payload: the `options` array you MUST read and wrap in `AskUserQuestion`.
+4. **stdout** — the final `state.json` (trajectory context).
+
+The exit-10 row tells you to act; channel 3 carries the actual options. (The exit-11 manual-extraction path has NO auto-written pivot file at a terminal OR calibrated pivot — Step 7 step 5 builds the `AskUserQuestion` payload inline instead.)
+
+**Extending parser exit codes (E3, #110).** The parser exit-code contract has a single source of truth: the `Exit codes:` docstring in `parse-ledger-patch.py`. Adding a code (6+) requires THREE synced edits:
+1. **Parser docstring** (SSOT) — define the code and its meaning.
+2. **Wrapper** `_emit_parser_exit_diagnostic` case branch (`bulldozer-round.sh`) — map it to an `_emit_stop` diagnostic (control-flow codes 0/1 stay in the main parser `case`).
+3. **The exit-code table above** — document the caller's action.
+
+`TestParserExitContract` (`tests/test_check_round_wrapper.py`) is the drift guard: `test_every_diagnostic_code_has_wrapper_emit_stop` fails if a docstring-listed code (other than 0/1) has no `_emit_stop N` in the wrapper, and `test_documented_codes_are_expected_set` pins the current set `{0,1,2,3,4,5}`.
 
 Schema example codex emits (Round 1 standard / exhaustive — see "LEDGER_PATCH Protocol" below for the full schema):
 
@@ -272,10 +325,38 @@ BULLDOZER_FIXED=K BULLDOZER_FP=M "${CLAUDE_PLUGIN_ROOT}/skills/check/scripts/bul
 
 Unset them after the round (`unset BULLDOZER_FIXED BULLDOZER_FP`) so they don't leak into the round-after-next.
 
-**7. Loop or stop:**
+**7. Loop or stop — branch on the EXIT CODE first, not the round number** (B6, #128: a calibrated pivot can exit 10 at exhaustive round 5-9 even though `round < max_rounds`, so "round < max" no longer implies "keep going"):
 - Verdict GO (wrapper exit 0, parsed-rN.json has `findings: []`) → done, write summary
-- Round < max, verdict NO-GO → build Round N prompt from ledger, go to Step 2
-- Wrapper exited 10 (pivot signal) → act on the user's AskUserQuestion choice from Step 3 (at `ROUND >= max_rounds && verdict != GO` the wrapper always writes the pivot file and exits 10, so a `Round == max + NO-GO` case never reaches this step without a pivot signal — if it does, treat it as a wrapper-state bug and report the pivot file write failure to the operator)
+- Wrapper exit 0 (round logged, NO pivot) AND verdict NO-GO AND `round < max_rounds` → build Round N+1 prompt from ledger, go to Step 2. This continuation applies ONLY on exit 0 — a pivot (exit 10) takes precedence.
+- Wrapper exited 10 (pivot signal) → act on the user's AskUserQuestion choice from Step 3. Fires on EITHER the flat `ROUND >= max_rounds && verdict != GO` trigger OR the B6 calibrated trigger (`depth == exhaustive` AND `ROUND >= 5` AND NO-GO AND avg-last-3 findings `>= 3.0`), so exit 10 can occur at `round < max_rounds` on exhaustive runs. The wrapper always writes `pivot-rN.json` before exiting 10; if exit 10 ever arrives without a readable pivot file, treat it as a wrapper-state bug and report it.
+- **Wrapper exited 11 (manual-extraction branch) — REQUIRED PROTOCOL:**
+  1. Read `${REVIEW_DIR}/verdict-r${ROUND}.txt` — reviewer wrote prose but skipped the structured LEDGER_PATCH block
+  2. Extract findings from prose: count `K` (number of real findings) and determine `VERDICT` (GO if no real findings; NO-GO if K > 0 OR reviewer narrated problems without enumerating cleanly)
+  3. Append the extracted findings to `${REVIEW_DIR}/review-ledger.yml` with status `open` (use IDs `R${ROUND}-F${M}` matching wrapper convention)
+  4. Reconcile state: `python3 <plugin>/skills/check/scripts/update-state.py --review-dir "${REVIEW_DIR}" --mode=replace-extraction ${ROUND} ${K} ${VERDICT}` — this updates `history[round=${ROUND}].findings`, `verdict`, and clears `manual_extraction_pending`; deltas `findings_total` correctly (`update-state.py` is NOT on PATH — invoke via `python3` + full script path). **IMPORTANT:** use the ABSOLUTE path the wrapper prints in the exit-11 stderr recovery command — it appears as the `--review-dir <path>` argument, with `REVIEW_DIR` already canonicalized to absolute (the wrapper runs `REVIEW_DIR="$(cd "$REVIEW_DIR" && pwd)"` before any diagnostic is emitted), NOT a relative path inferred from your Bash tool's current cwd. Claude's Bash tool invocations may run with different cwd across messages; the absolute path from stderr survives. `update-state.py` canonicalizes via `.resolve()` defensively, but the safest contract is to copy the absolute `--review-dir` value the wrapper printed.
+  5. **Pivot check (REQUIRED):** the manual-extraction path exits 11 BEFORE the wrapper's Step 9, so the wrapper's pivot triggers never run — the caller MUST replicate BOTH here. Fire the AskUserQuestion pivot dialog if EITHER trigger holds:
+      - **Terminal:** `ROUND >= max_rounds` AND `VERDICT == NO-GO` (use `>=`, not `==`, to mirror the wrapper's flat pivot — a user-continued over-max manual round, e.g. standard round 4, must still pivot); or
+      - **Calibrated (B6, #128):** `depth == exhaustive` AND `ROUND >= 5` AND `VERDICT == NO-GO` AND the mean of the last 3 `history[].findings` (read from `state.json` after step 4's reconcile) `>= 3.0`. This is the manual-path mirror of the wrapper's calibrated early-pivot — without it, an exhaustive round 5-9 manually reconciled to NO-GO would silently continue, bypassing B6.
+
+      The manual-extraction path does NOT have the wrapper write `pivot-rN.json` automatically — Claude constructs the payload inline using this template (matches the wrapper exit-10 sidecar shape). When the **calibrated** trigger is the one that fired, swap the question for the "not converging by round N" wording (mirroring emit-pivot.py's `calibrated_nonconvergence` text) instead of the "reached max rounds" wording below:
+
+      ```python
+      AskUserQuestion(questions=[{
+          "question": f"Reached max rounds ({max_rounds}) without GO — {K} finding(s) open. How to proceed?",
+          "header": "Pivot",  # ≤12 chars per AskUserQuestion schema
+          "multiSelect": False,
+          "options": [
+              {"label": "continue",         "description": "Run another round (exceeds max for this depth)"},
+              {"label": "restructure",      "description": "Pause review, restructure the artifact, re-launch /bulldozer:check"},
+              {"label": "accept-with-TODO", "description": "Accept current state, log open findings as project TODOs"},
+          ],
+      }])
+      ```
+
+      Manual-extraction MUST NOT silently exit without this pivot dialog when EITHER trigger holds (parity with the non-manual exit-10 + calibrated early-pivot flows).
+  6. Continue — **pivot precedence first** (mirrors Step 7's exit-code rule): if a pivot dialog fired in step 5 → act on the user's choice; else if `VERDICT == GO` → done; else if `ROUND < max_rounds` → build Round N+1 prompt and go to Step 2.
+
+  > **Why this protocol exists:** Issue #110 (B5) — pre-PR-1, wrapper exit 1 silently lost the round (no state.json, no bulldozer.log) and handed control to Claude with zero discipline. The exit 11 + replace-extraction pair restores the discipline invariant (every round writes state.json + bulldozer.log) while preserving the human-readable prose-extraction path for reviewers that skip LEDGER_PATCH.
 
 ## Reviewer Prompt Templates
 
@@ -480,16 +561,20 @@ Optional `.bulldozer/config.md` in project root:
 ```yaml
 ---
 reviewer_model: gpt-5.5
+audit_model: sonnet
 ---
 ```
 
 `reviewer_model` is updated by the model selection prompt on each launch. Save updates ONLY `reviewer_model`, preserving all other keys if present.
 
+`audit_model` (optional, default `sonnet`) — the model for the E1 consistency-auditor
+subagent (Step 1.7). Flip to `haiku` for lower cost (lower contradiction-catch rate —
+see the design spec §2 split test).
+
 ## Common Mistakes
 
 | Mistake | Fix |
 |---------|-----|
-| Running codex in background | **FOREGROUND ONLY.** `-o` file is written LAST — polling is unreliable |
 | Parsing `full-r{N}.txt` for verdict | Use `-o verdict-rN.txt` — clean answer, zero parsing |
 | Trusting reviewer blindly | Verify EVERY finding with grep/read/run before fixing |
 | Not using `-C` flag | Codex may run from wrong directory → false NO-GO |
@@ -507,7 +592,7 @@ reviewer_model: gpt-5.5
 
 - Reviewer gives GO on round 1 with zero findings (likely didn't read the file — check cwd)
 - Same finding reappears after you "fixed" it (your fix was wrong — re-verify)
-- Round > 5 with new HIGH findings each time — the wrapper prints the trajectory on stderr after every round ≥ 2 (`[bulldozer/check] Round N/M ... Trajectory: A → B → C  (avg last 3: X.X)`). If findings aren't shrinking, the AskUserQuestion pivot dialog will fire automatically at max-round NO-GO. (Note: the legacy calibrated trigger — exhaustive + round ≥ 5 + avg last 3 ≥ 3.0 — was simplified to "max rounds reached" in PR1b; calibration data from 26 historical sessions pending re-analysis as a follow-up.)
+- Round > 5 with new HIGH findings each time — the wrapper prints the trajectory on stderr after every round ≥ 2 (`[bulldozer/check] Round N/M ... Trajectory: A → B → C  (avg last 3: X.X)`). If findings aren't shrinking, the AskUserQuestion pivot dialog fires automatically — at max-round NO-GO for any depth, OR (B6, #128) early at **exhaustive round ≥ 5** when the mean of the last 3 rounds' findings ≥ 3.0. (The calibrated exhaustive trigger was removed in PR1b, then re-derived from a 65-session corpus and re-added in #128 — see `docs/superpowers/analysis/2026-06-01-b6-pivot-calibration.md`.)
 - Reviewer output is empty or errors (check `codex --version`, network, rate limits)
 - `verdict-rN.txt` is empty (codex crashed or `-o` path wrong — check `full-rN.txt` for clues)
 

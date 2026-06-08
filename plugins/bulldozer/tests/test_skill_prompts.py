@@ -7,11 +7,17 @@ back to bare "GO" → parser exits 1 → manual prose extraction kicks in,
 defeating PR1a (#98/#101) at the most common terminal state in
 exhaustive depth.
 """
+import json
 import re
+import shutil
+import subprocess
+
+import pytest
 
 from conftest import PLUGIN_ROOT
 
 SKILL_MD = PLUGIN_ROOT / "skills" / "check" / "SKILL.md"
+E1_SCHEMA = PLUGIN_ROOT / "skills" / "check" / "data" / "e1-evidence-schema.json"
 
 GO_DIRECTIVE_MARKER = "GO MUST be expressed"
 
@@ -377,3 +383,95 @@ class TestSkillUsesWrapperComposer:
                 f"Step-by-step should document wrapper exit code {code} "
                 f"(at least one of: 'exit {code}', 'exit code {code}', or `{code}`)."
             )
+
+
+class TestDigraphRefresh:
+    """B7 (#110): the review_loop digraph must reflect the wrapper-driven flow
+    (one bulldozer-round.sh node + exit-code branches incl. exit-11 manual
+    extraction and exit-10 pivot), not the pre-wrapper
+    Send->Read->Empty?->Extract architecture.
+    """
+
+    def _digraph(self) -> str:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        m = re.search(r"```dot\n(digraph review_loop \{.*?\n\})\n```", text, re.DOTALL)
+        assert m, "digraph review_loop block not found in SKILL.md"
+        return m.group(1)
+
+    def test_reflects_wrapper_driven_flow(self):
+        g = self._digraph()
+        assert "bulldozer-round.sh" in g
+        assert "11" in g and "manual extraction" in g.lower()
+        assert "10" in g
+        assert "pivot" in g.lower()
+
+    def test_drops_stale_pre_wrapper_nodes(self):
+        g = self._digraph()
+        for stale in ('"Empty?"', '"Rerun same round"',
+                      '"Send to reviewer (FOREGROUND)"',
+                      '"Extract LEDGER_PATCH"', '"Commit + log round"'):
+            assert stale not in g, f"stale node {stale} still in digraph"
+
+    @pytest.mark.skipif(shutil.which("dot") is None, reason="graphviz not installed")
+    def test_digraph_parses_with_graphviz(self):
+        g = self._digraph()
+        r = subprocess.run(["dot", "-Tsvg"], input=g,
+                           capture_output=True, text=True, timeout=10)
+        assert r.returncode == 0, r.stderr
+
+
+class TestE1SchemaContract:
+    """Drift guard for the E1 finding envelope (mirrors TestDepthConfigContract).
+
+    Single source of truth for the consistency-auditor agent body and the
+    verifier — if the envelope/anchor shapes drift from this file, the agent
+    and verifier silently disagree. (#94)
+    """
+
+    def test_schema_exists_and_parses(self):
+        data = json.loads(E1_SCHEMA.read_text())
+        assert data["envelope"] == ["id", "class", "file", "quote", "anchor"]
+
+    def test_four_classes_with_anchor_shapes(self):
+        data = json.loads(E1_SCHEMA.read_text())
+        anchors = data["anchor_by_class"]
+        assert set(anchors) == {
+            "dead_ref", "internal_contradiction", "cross_spec_drift", "stale_term"
+        }
+        assert anchors["internal_contradiction"] == ["quote_b"]
+        assert anchors["cross_spec_drift"] == ["other_file", "other_quote"]
+        assert anchors["dead_ref"] == ["ref"]
+        assert anchors["stale_term"] == ["exclude_section"]
+
+
+class TestE1Step:
+    """Pins the E1 pre-review consistency-audit step in SKILL.md (drift guard, #94)."""
+
+    def test_task_in_allowed_tools(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        # frontmatter allowed-tools must include Task (auditor dispatch)
+        assert '"Task"' in text or "Task," in text or "Task]" in text
+
+    def test_step_names_the_pieces(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        assert "consistency-auditor" in text          # agent dispatch
+        assert "verify-audit-findings.py" in text     # verifier invocation
+        assert "e1-verified-r" in text                # sole-licensed-fix input
+        assert "audit_model" in text                  # config knob (default sonnet)
+
+    def test_sole_licensed_fix_input_clause(self):
+        text = SKILL_MD.read_text(encoding="utf-8").lower()
+        # fix ONLY from e1-verified; raw e1-findings is forbidden as a fix source
+        assert "e1-verified" in text and "e1-findings" in text
+        assert "only" in text  # "fix only ... e1-verified"
+
+    def test_agent_dispatch_has_inline_fallback(self):
+        """Agents register at session-start / /reload-plugins, NOT from source like
+        skills — so a just-shipped consistency-auditor is 'not found' until reload.
+        Step 1.7 MUST document the inline fallback (observed in consumer session
+        8eb7be75: Task -> 'agent type not found' -> consumer improvised inline)."""
+        text = SKILL_MD.read_text(encoding="utf-8")
+        low = text.lower()
+        assert "not found" in low or "not registered" in low  # the failure signal
+        assert "inline" in low                                 # the fallback action
+        assert "reload-plugins" in low                         # the documented remedy

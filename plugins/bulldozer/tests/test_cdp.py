@@ -485,10 +485,10 @@ def test_status_shows_channel():
 
 
 def test_all_commands_registered():
-    """All 17 commands must be in COMMANDS dict."""
+    """All 18 agent-facing commands must be in COMMANDS dict (17 look + assert)."""
     expected = {
         "status", "tabs", "screenshot", "js", "navigate", "open",
-        "title", "html", "reload", "wait", "click", "fill",
+        "title", "html", "reload", "wait", "assert", "click", "fill",
         "console", "network", "pdf", "viewport", "window",
     }
     source = Path(CDP_SCRIPT).read_text()
@@ -536,10 +536,10 @@ def test_navigate_fallback_to_applescript():
 
 
 def test_help_shows_all_commands():
-    """--help must list all 17 commands."""
+    """--help must list all 18 agent-facing commands (17 look + assert)."""
     r = run_cdp(["--help"])
     for cmd in ["status", "tabs", "screenshot", "js", "navigate", "open",
-                 "title", "html", "reload", "wait", "click", "fill",
+                 "title", "html", "reload", "wait", "assert", "click", "fill",
                  "console", "network", "pdf", "viewport", "window"]:
         assert cmd in r.stdout, f"--help missing '{cmd}' command"
 
@@ -906,6 +906,55 @@ def test_issue_56_skill_md_instructs_url_parsing():
     )
 
 
+def test_issue_60_quick_invoke_normalizes_bare_absolute_path():
+    """Issue #60 §1: Quick Invoke must teach the agent that a bare absolute path
+    that exists on disk is URL-shaped → normalize to file:// (else → about:blank)."""
+    import re
+    skill_md = (PLUGIN_ROOT / "skills" / "look" / "SKILL.md").read_text()
+    m = re.search(r"## Quick Invoke.*?(?=^## )", skill_md, re.DOTALL | re.MULTILINE)
+    assert m, "SKILL.md is missing the 'Quick Invoke' section"
+    quick_invoke = m.group(0)
+    assert "absolute" in quick_invoke and "path" in quick_invoke, (
+        "Quick Invoke must describe how to handle a bare absolute filesystem path (#60)"
+    )
+    assert "file://" in quick_invoke, (
+        "Quick Invoke must instruct normalizing a bare absolute path to file:// (#60)"
+    )
+    assert "exist" in quick_invoke, (
+        "Quick Invoke must condition normalization on the path existing on disk (#60)"
+    )
+    # R1-F1: must NOT teach the agent to hand-prefix file:// (that bypasses the
+    # scripts' pathlib.as_uri percent-encoding and breaks paths with spaces/#/?).
+    assert "as-is" in quick_invoke or "as is" in quick_invoke, (
+        "Quick Invoke must tell the agent to pass a bare path through as-is "
+        "(scripts normalize with proper encoding), not hand-prefix file:// (#60 R1-F1)"
+    )
+    assert re.search(r"percent[- ]?encod|as_uri", quick_invoke), (
+        "Quick Invoke must note the scripts percent-encode the file:// URI (#60 R1-F1)"
+    )
+
+
+def test_issue_60_clip_origin_documented():
+    """Issue #60 §1-minor: SKILL.md must document --clip coordinate origin.
+
+    Empirically (this PR): clip X Y are document/page coordinates, but without
+    captureBeyondViewport only the part within the current viewport renders —
+    a below-fold region must be scrolled into view before clipping.
+    """
+    skill_md = (PLUGIN_ROOT / "skills" / "look" / "SKILL.md").read_text()
+    import re as _re
+    assert _re.search(r"document.{0,30}coordinate|document/page coordinate", skill_md), (
+        "SKILL.md --clip docs must state X Y are document/page coordinates (#60)"
+    )
+    assert "captureBeyondViewport" in skill_md, (
+        "SKILL.md --clip docs must name captureBeyondViewport as the viewport-limit reason (#60)"
+    )
+    assert _re.search(r"scroll.{0,40}(into view|viewport)", skill_md), (
+        "SKILL.md --clip docs must tell the agent to scroll a below-fold region "
+        "into view before clipping (#60)"
+    )
+
+
 def test_issue_55_screenshot_supports_clip_flag():
     """cmd_screenshot must parse --clip X Y W H for region capture (issue #55).
 
@@ -1126,6 +1175,7 @@ def test_screenshot_log_includes_clip_and_scale():
             line = cdp_log_lines[0]
             assert "clip=" in line, "CDP log must include clip= field for observability"
             assert "scale=" in line, "CDP log must include scale= field for observability"
+            assert "bind=" in line, "CDP log must include bind= field for observability (SP2)"
             return
     raise AssertionError("cmd_screenshot function not found")
 
@@ -1209,8 +1259,8 @@ def test_scale_reads_devicepixelratio_via_same_ws_connection():
                 "window.devicePixelRatio — multi-tab consistency with capture ws_url."
             )
             assert "cdp_js" not in scale_section or scale_section.count("cdp_js") == 0, (
-                "--scale branch should not call cdp_js (which opens a separate WS via get_tab()); "
-                "use ws_send(ws_url, 'Runtime.evaluate', …) instead."
+                "--scale branch should not call cdp_js; read DPR via ws_send(ws_url, "
+                "'Runtime.evaluate', …) on the captured ws_url so it targets the capture's tab."
             )
             return
     raise AssertionError("cmd_screenshot function not found")
@@ -1354,6 +1404,673 @@ def test_check_skill_does_not_modify_project_gitignore():
         )
 
 
+# --- Unit tests for normalize_url helper (issue #60 §1) ---
+
+
+def _import_normalize_url():
+    """Helper: import normalize_url from the production cdp.py."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_cdp_under_test", CDP_SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.normalize_url
+
+
+def test_normalize_url_bare_existing_path_to_file_uri(tmp_path):
+    """A bare absolute path that exists on disk becomes a file:// URI."""
+    fn = _import_normalize_url()
+    p = tmp_path / "page.html"
+    p.write_text("<html></html>")
+    result = fn(str(p))
+    assert result == p.as_uri(), (
+        "bare existing absolute path must normalize to its file:// URI "
+        "(got {!r})".format(result)
+    )
+    assert result.startswith("file://")
+
+
+def test_normalize_url_nonexistent_bare_path_verbatim(tmp_path):
+    """A bare absolute path that does NOT exist is left verbatim (CDP will reject it)."""
+    fn = _import_normalize_url()
+    missing = str(tmp_path / "nope.html")
+    assert fn(missing) == missing
+
+
+def test_normalize_url_http_verbatim():
+    """http:// URLs pass through unchanged."""
+    fn = _import_normalize_url()
+    assert fn("http://localhost:9401/x") == "http://localhost:9401/x"
+
+
+def test_normalize_url_https_verbatim():
+    """https:// URLs pass through unchanged."""
+    fn = _import_normalize_url()
+    assert fn("https://example.com/a") == "https://example.com/a"
+
+
+def test_normalize_url_file_uri_idempotent():
+    """An already-file:// URL is not double-normalized (does not start with '/')."""
+    fn = _import_normalize_url()
+    assert fn("file:///tmp/x.html") == "file:///tmp/x.html"
+
+
+def test_normalize_url_host_port_verbatim():
+    """A host:port/... token is left verbatim (does not start with '/')."""
+    fn = _import_normalize_url()
+    assert fn("localhost:9401/dashboard.html") == "localhost:9401/dashboard.html"
+
+
+def test_normalize_url_relative_path_verbatim():
+    """A relative path (no leading slash) is left verbatim — scope is absolute paths only."""
+    fn = _import_normalize_url()
+    assert fn("some/rel/path.html") == "some/rel/path.html"
+
+
+def test_normalize_url_encodes_spaces(tmp_path):
+    """A bare path with spaces is percent-encoded by as_uri() (naive concat would be invalid)."""
+    fn = _import_normalize_url()
+    p = tmp_path / "my page.html"
+    p.write_text("x")
+    result = fn(str(p))
+    assert "%20" in result, "space must be percent-encoded, got {!r}".format(result)
+    assert " " not in result
+
+
+def test_normalize_url_directory_passes_through_verbatim(tmp_path):
+    """A directory is NOT a viewable file — only regular files normalize (os.path.isfile).
+    A bare dir passes through verbatim (CDP will reject it; we don't open dir listings)."""
+    fn = _import_normalize_url()
+    assert fn(str(tmp_path)) == str(tmp_path)
+
+
+def test_normalize_url_special_file_passes_through_verbatim():
+    """Device/FIFO/socket nodes exist but are not regular files — must NOT be normalized
+    (a FIFO would hang Chrome, /dev/null renders blank). Guard on os.path.isfile, not exists."""
+    fn = _import_normalize_url()
+    import os
+    if not os.path.exists("/dev/null"):
+        import pytest
+        pytest.skip("/dev/null not present")
+    assert os.path.exists("/dev/null") and not os.path.isfile("/dev/null")
+    assert fn("/dev/null") == "/dev/null", "special files must pass through verbatim, not become file://"
+
+
+def _func_source(func_name):
+    """Return the source text of a top-level function in cdp.py."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            return "\n".join(source.splitlines()[node.lineno - 1 : node.end_lineno])
+    raise AssertionError("{} function not found in cdp.py".format(func_name))
+
+
+def test_cmd_navigate_calls_normalize_url():
+    """cmd_navigate must route its URL arg through normalize_url (defense-in-depth, #60)."""
+    src = _func_source("cmd_navigate")
+    assert "normalize_url(" in src, (
+        "cmd_navigate must normalize the bare-path URL via normalize_url(args[0]) "
+        "so a raw /tmp/x.html doesn't reach Page.navigate as an invalid URL.\nFound:\n" + src
+    )
+
+
+def test_cmd_open_calls_normalize_url():
+    """cmd_open must route its URL arg through normalize_url (#60)."""
+    src = _func_source("cmd_open")
+    assert "normalize_url(" in src, (
+        "cmd_open must normalize the bare-path URL via normalize_url(args[0]).\nFound:\n" + src
+    )
+
+
+def test_normalize_url_registered_as_command():
+    """#60 R1-F1/altitude: normalize_url is exposed as a CLI subcommand so launch.sh can
+    call it (single source of truth) instead of re-implementing the rule in bash."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def cmd_normalize_url" in source, "cdp.py must define cmd_normalize_url"
+    assert '"normalize-url"' in source or "'normalize-url'" in source, (
+        "cdp.py COMMANDS must register the 'normalize-url' subcommand"
+    )
+
+
+def test_cmd_normalize_url_behavioral(tmp_path):
+    """`cdp.py normalize-url PATH` prints the normalized URL (the exact value launch.sh uses)."""
+    p = tmp_path / "a b#c.html"
+    p.write_text("x")
+    r = run_cdp(["normalize-url", str(p)])
+    assert r.returncode == 0, "normalize-url failed: {}".format(r.stderr)
+    assert r.stdout.strip() == p.as_uri(), (
+        "normalize-url must print the percent-encoded file:// URI, got {!r}".format(r.stdout)
+    )
+    # non-file passes through verbatim
+    r2 = run_cdp(["normalize-url", "http://localhost:9401/x"])
+    assert r2.stdout.strip() == "http://localhost:9401/x"
+
+
+def test_plugin_json_has_repository_and_homepage():
+    """Issue #60 §2: plugin.json exposes repository + homepage so the feedback
+    target (A3IO/jaine-plugins) is machine-discoverable, not buried in SKILL.md prose."""
+    pj_path = PLUGIN_ROOT / ".claude-plugin" / "plugin.json"
+    pj = json.loads(pj_path.read_text())  # also asserts valid JSON
+    assert "repository" in pj, "plugin.json must declare a repository URL (#60 §2)"
+    assert "A3IO/jaine-plugins" in pj["repository"], (
+        "repository must point to the feedback/source repo A3IO/jaine-plugins, "
+        "got {!r}".format(pj.get("repository"))
+    )
+    assert pj.get("homepage"), "plugin.json must declare a non-empty homepage URL (#60 §2)"
+    # no regression on the pre-existing required fields
+    for field in ("name", "version", "description", "author"):
+        assert field in pj, "plugin.json lost pre-existing field {!r}".format(field)
+
+
+def test_launch_sh_delegates_to_cdp_normalize_url():
+    """#60 R1-F1/altitude: launch.sh must call `cdp.py normalize-url` (single source of
+    truth) rather than re-implementing the as_uri rule inline. Guards on a leading slash
+    (cheap skip for http URLs) and keeps the original URL if the call yields nothing."""
+    launch = (PLUGIN_ROOT / "skills" / "look" / "scripts" / "launch.sh").read_text()
+    assert "normalize-url" in launch, (
+        "launch.sh must delegate to `cdp.py normalize-url` (single source of truth)"
+    )
+    assert '"$URL" == /*' in launch, "launch.sh should cheap-skip non-slash URLs"
+    assert "as_uri()" not in launch, (
+        "as_uri() now lives only in cdp.py normalize_url — launch.sh must not duplicate it"
+    )
+    # R1-F1 (#1): empty result from the python3 call must NOT blank the URL
+    assert '-n "$normalized"' in launch or "-n \"${normalized}\"" in launch, (
+        "launch.sh must keep the original URL if normalize-url returns empty "
+        "(python3 missing/failed) instead of launching Chrome with a blank URL"
+    )
+
+
+def test_launch_sh_normalization_matches_cdp_subcommand(tmp_path):
+    """R1-F1 behavioral (non-tautological): the REAL `cdp.py normalize-url` subcommand
+    that launch.sh invokes must produce the same percent-encoded URI as normalize_url."""
+    p = tmp_path / "a b#c.html"
+    p.write_text("x")
+    cdp_uri = _import_normalize_url()(str(p))
+    subcommand_out = run_cdp(["normalize-url", str(p)]).stdout.strip()
+    assert subcommand_out == cdp_uri == p.as_uri(), (
+        "cdp.py normalize-url (what launch.sh calls) must equal normalize_url "
+        "(got subcommand={!r} fn={!r})".format(subcommand_out, cdp_uri)
+    )
+    assert "%23" in cdp_uri and "%20" in cdp_uri, "reserved chars must be percent-encoded"
+
+
+def test_ws_send_seq_single_connection():
+    """ws_send_seq must exist and open exactly ONE websocket connection
+    (press+release share it) while iterating the call sequence."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def ws_send_seq" in source, "Missing ws_send_seq helper"
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "ws_send_seq":
+            body = ast.get_source_segment(source, node)
+            assert body.count("create_connection") == 1, \
+                "ws_send_seq must open exactly one connection for the whole sequence"
+            assert "for " in body, "ws_send_seq must iterate over the call sequence"
+            return
+    raise AssertionError("ws_send_seq not found in cdp.py")
+
+
+def test_cmd_click_uses_trusted_input():
+    """cmd_click must dispatch a trusted CDP Input event, force instant scroll,
+    hit-test, and retain an el.click() fallback."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_click":
+            body = ast.get_source_segment(source, node)
+            assert "Input.dispatchMouseEvent" in body, "cmd_click must use CDP Input.dispatchMouseEvent"
+            assert "ws_send_seq" in body, "cmd_click must use ws_send_seq for press+release"
+            assert "behavior:'instant'" in body, "cmd_click must force instant scroll before measuring"
+            assert "elementFromPoint" in body, "cmd_click must hit-test via elementFromPoint"
+            assert "el.click()" in body, "cmd_click must retain the el.click() fallback"
+            return
+    raise AssertionError("cmd_click not found in cdp.py")
+
+
+def test_cmd_click_uses_same_ws_url_for_measure_and_dispatch():
+    """cmd_click's websocket path must capture ONE ws_url and use direct
+    Runtime.evaluate (NOT cdp_js, which issues a single evaluate and can't express
+    the press+release sequence) for measure + fallback. Mirrors the screenshot
+    same-target guard test_scale_reads_devicepixelratio_via_same_ws_connection."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_click":
+            # inspect CALLS (not raw source) so a comment mentioning cdp_js does
+            # not self-defeat the assertion (R2-F1).
+            called = {n.func.id for n in ast.walk(node)
+                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            assert "cdp_js" not in called, (
+                "cmd_click must NOT call cdp_js (a single Runtime.evaluate can't express "
+                "the press+release); use ws_send_seq on the captured ws_url instead."
+            )
+            assert "ws_send_seq" in called, "cmd_click must dispatch via ws_send_seq"
+            body = ast.get_source_segment(source, node)
+            assert "ws_send_seq(ws_url" in body, \
+                "cmd_click must pass the captured ws_url to ws_send_seq"
+            assert "Runtime.evaluate" in body, \
+                "cmd_click must use direct Runtime.evaluate for measure/fallback"
+            return
+    raise AssertionError("cmd_click not found in cdp.py")
+
+
+def _load_cdp_module():
+    """Load cdp.py as a throwaway module (mirrors test_e2e.py's _load_image_dimensions
+    — keeps unit tests in sync with the source of truth, and lets tests monkeypatch
+    module globals like has_websocket/osascript/ws_send to drive cmd_* offline)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_cdp_under_test", CDP_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_applescript_bounds_normalizes_to_contract():
+    """AppleScript `x1, y1, x2, y2` → CDP contract `left,top,width,height`."""
+    fn = _load_cdp_module()._applescript_bounds
+    assert fn("100, 100, 1540, 1000") == "100,100,1440,900"
+
+
+def test_applescript_bounds_rejects_malformed():
+    """Malformed AppleScript output fails loud (ValueError), no silent fallback."""
+    fn = _load_cdp_module()._applescript_bounds
+    raised = False
+    try:
+        fn("not bounds at all")
+    except ValueError:
+        raised = True
+    assert raised, "_applescript_bounds must raise ValueError on malformed input"
+
+
+def test_cmd_window_bounds_uses_cdp():
+    """window bounds must use CDP Browser.getWindowForTarget (headless-capable),
+    with the AppleScript fallback normalized via _applescript_bounds (sub-project B)."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "Browser.getWindowForTarget" in source, (
+        "cmd_window bounds must call CDP Browser.getWindowForTarget"
+    )
+    assert "_applescript_bounds" in source, (
+        "cmd_window AppleScript fallback must normalize bounds via _applescript_bounds"
+    )
+
+
+def test_cmd_window_applescript_fallback_normalizes():
+    """cmd_window's AppleScript fallback (websocket absent) must ITSELF print the
+    normalized left,top,width,height contract — not raw AppleScript output (B.2:
+    both channels share one contract). The structural test above only proves the
+    symbols exist; this drives cmd_window end-to-end with a stubbed osascript."""
+    import io, contextlib
+    mod = _load_cdp_module()
+    mod.has_websocket = lambda: False
+    mod.osascript = lambda script: "100, 100, 1540, 1000"
+    mod.log = lambda *a, **k: None
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mod.cmd_window(["bounds"])
+    assert rc == 0, "fallback should succeed, got rc={}".format(rc)
+    assert buf.getvalue().strip() == "100,100,1440,900", (
+        "AppleScript fallback must print normalized contract, got: {!r}".format(buf.getvalue())
+    )
+
+
+def test_cmd_window_bounds_rejects_unexpected_cdp_response_shape():
+    """A malformed CDP response (e.g. {"result": None}) must fail loud (rc 1), not
+    raise an AttributeError traceback — the shape guard must be isinstance-safe."""
+    import io, contextlib
+    mod = _load_cdp_module()
+    mod.has_websocket = lambda: True
+    mod.get_tab = lambda url_filter=None: {"webSocketDebuggerUrl": "ws://x", "id": "T"}
+    mod.ws_send = lambda ws, method, params=None: {"result": None}
+    mod.osascript = lambda script: "0, 0, 1, 1"  # pre-fix code falls here → rc 0 → RED
+    mod.log = lambda *a, **k: None
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mod.cmd_window(["bounds"])
+    assert rc == 1, "malformed CDP response must fail loud (rc 1), got rc={}".format(rc)
+
+
+def test_cmd_window_bounds_cdp_happy_path():
+    """The CDP success path prints exactly `left,top,width,height` from
+    result.bounds — an offline lock on the format string (the structural test
+    only greps symbols; the malformed test stubs an error shape; only the e2e,
+    excluded from the default run, otherwise exercises the CDP happy path, so a
+    field transposition like left<->top would ship undetected offline)."""
+    import io, contextlib
+    mod = _load_cdp_module()
+    mod.has_websocket = lambda: True
+    mod.get_tab = lambda url_filter=None: {"webSocketDebuggerUrl": "ws://x", "id": "T"}
+    mod.ws_send = lambda ws, method, params=None: {
+        "result": {"windowId": 1,
+                   "bounds": {"left": 10, "top": 20, "width": 1440, "height": 900,
+                              "windowState": "normal"}}
+    }
+    mod.log = lambda *a, **k: None
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mod.cmd_window(["bounds"])
+    assert rc == 0, "CDP happy path should succeed, got rc={}".format(rc)
+    assert buf.getvalue().strip() == "10,20,1440,900", (
+        "CDP path must print left,top,width,height, got: {!r}".format(buf.getvalue())
+    )
+
+
+def test_applescript_bounds_rejects_wrong_count():
+    """A wrong NUMBER of values (vs a non-integer value) hits the len guard with
+    the 'expected 4' message — the count check runs before int conversion."""
+    fn = _load_cdp_module()._applescript_bounds
+    raised = False
+    try:
+        fn("1, 2, 3")
+    except ValueError as e:
+        raised = True
+        assert "expected 4" in str(e), "wrong-count error should say 'expected 4', got: {}".format(e)
+    assert raised, "_applescript_bounds must raise ValueError on wrong value count"
+
+
+# ── sub-C: --target tab pinning ──
+
+TWO_TABS = [
+    {"id": "AAAaaa111222333", "type": "page", "url": "http://localhost/a?look=tgtA",
+     "webSocketDebuggerUrl": "ws://x/A"},
+    {"id": "BBBbbb444555666", "type": "page", "url": "http://localhost/b?look=tgtB",
+     "webSocketDebuggerUrl": "ws://x/B"},
+]
+
+
+def _stub_tabs(mod, tabs):
+    """Point a loaded cdp.py module's cdp_get at a fixed /json/list (no browser)."""
+    mod.cdp_get = lambda path: tabs
+
+
+def _expect_systemexit(fn):
+    """Run fn(); return True iff it raised SystemExit with a non-zero code."""
+    try:
+        fn()
+    except SystemExit as e:
+        return e.code not in (0, None)
+    return False
+
+
+def test_get_tab_none_returns_first_page():
+    """No selector → first page (backward-compat lock; passes pre-impl too)."""
+    mod = _load_cdp_module(); _stub_tabs(mod, TWO_TABS)
+    assert mod.get_tab()["id"] == "AAAaaa111222333"
+
+
+def test_get_tab_exact_id():
+    mod = _load_cdp_module(); _stub_tabs(mod, TWO_TABS)
+    assert mod.get_tab("BBBbbb444555666")["id"] == "BBBbbb444555666"
+
+
+def test_get_tab_unique_id_prefix():
+    """A 12-char prefix (what tabs/status/open display) resolves to that tab."""
+    mod = _load_cdp_module(); _stub_tabs(mod, TWO_TABS)
+    assert mod.get_tab("BBBbbb444555")["id"] == "BBBbbb444555666"  # 12-char prefix
+
+
+def test_get_tab_url_substring():
+    """Backward-compat lock: a url substring resolves (subsumes old url_filter)."""
+    mod = _load_cdp_module(); _stub_tabs(mod, TWO_TABS)
+    assert mod.get_tab("look=tgtB")["id"] == "BBBbbb444555666"
+
+
+def test_get_tab_ambiguous_prefix_fails_loud():
+    """A ≥12-char prefix matching ≥2 tabs exits non-zero (never silently picks one)."""
+    mod = _load_cdp_module()
+    _stub_tabs(mod, [
+        {"id": "SHAREDPREFIX01aaaa", "type": "page", "url": "http://x/1", "webSocketDebuggerUrl": "ws://1"},
+        {"id": "SHAREDPREFIX01bbbb", "type": "page", "url": "http://x/2", "webSocketDebuggerUrl": "ws://2"},
+    ])
+    assert _expect_systemexit(lambda: mod.get_tab("SHAREDPREFIX01")), \
+        "ambiguous id-prefix must fail loud (SystemExit non-zero)"
+
+
+def test_get_tab_short_prefix_not_an_id_match():
+    """A <12-char selector is NOT treated as an id prefix (the displayed id is 12 chars)
+    — it falls through to url-substring, so a 1-3 char string can't silently pin a tab
+    by a too-short unique id prefix (R1-F4). "BBB" uniquely prefixes BBBbbb444555666's
+    id but is <12 chars and not a url substring → fail loud (no match)."""
+    mod = _load_cdp_module(); _stub_tabs(mod, TWO_TABS)
+    assert _expect_systemexit(lambda: mod.get_tab("BBB")), \
+        "a <12-char id-prefix must NOT resolve as an id — fall through to url, then fail loud"
+
+
+def test_get_tab_ambiguous_url_fails_loud():
+    """A url substring matching ≥2 tabs is ambiguous → fail loud (never pick first)."""
+    mod = _load_cdp_module()
+    _stub_tabs(mod, [
+        {"id": "id000000000001", "type": "page", "url": "http://x/p?dup=Z", "webSocketDebuggerUrl": "ws://1"},
+        {"id": "id000000000002", "type": "page", "url": "http://x/q?dup=Z", "webSocketDebuggerUrl": "ws://2"},
+    ])
+    assert _expect_systemexit(lambda: mod.get_tab("dup=Z")), \
+        "ambiguous url substring must fail loud"
+
+
+def test_get_tab_no_match_fails_loud():
+    mod = _load_cdp_module(); _stub_tabs(mod, TWO_TABS)
+    assert _expect_systemexit(lambda: mod.get_tab("zzz-no-such")), \
+        "unknown selector must fail loud (SystemExit non-zero)"
+
+
+def test_main_target_requires_websocket():
+    """--target on the AppleScript fallback (no websocket) fails loud BEFORE dispatch."""
+    import io, contextlib
+    mod = _load_cdp_module()
+    mod.has_websocket = lambda: False
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = mod.main(["--target", "abc", "title"])
+    assert rc == 1, "expected rc 1, got {}".format(rc)
+    assert "--target requires" in err.getvalue(), \
+        "must explain --target needs websocket, got: {!r}".format(err.getvalue())
+
+
+def test_main_target_missing_selector():
+    """`--target` with no following value fails loud (not an IndexError)."""
+    import io, contextlib
+    mod = _load_cdp_module()
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = mod.main(["--target"])
+    assert rc == 1
+    assert "requires a selector" in err.getvalue()
+
+
+def test_main_target_strips_to_help():
+    """--target is global: `--target X --help` consumes the flag and still prints help
+    (the flag is NOT mistaken for the command). Named with the `main_target` prefix so
+    `-k "main_target or main_tab"` selects it WITHOUT also matching the existing
+    `test_*_as_js_main_world_*` tests (a bare `-k main_` would — R1-F3)."""
+    import io, contextlib
+    mod = _load_cdp_module()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = mod.main(["--target", "X", "--help"])
+    assert rc == 0
+    assert "cdp.py" in out.getvalue(), "help text should print"
+
+
+def test_main_tab_is_alias_for_target():
+    """--tab is an accepted alias (the websocket gate proves it was parsed)."""
+    import io, contextlib
+    mod = _load_cdp_module()
+    mod.has_websocket = lambda: False
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = mod.main(["--tab", "abc", "title"])
+    assert rc == 1 and "--target requires" in err.getvalue(), \
+        "--tab must be parsed like --target"
+
+
+def _capture_ws_url(mod):
+    """Stub ws_send to record the ws_url it was called with; return a benign OK result."""
+    seen = {}
+    def fake_ws_send(ws_url, method, params=None):
+        seen["ws_url"] = ws_url
+        return {"result": {"result": {"value": "ok"}}}
+    mod.ws_send = fake_ws_send
+    return seen
+
+
+def test_cdp_js_requires_ws_url():
+    """cdp_js no longer self-resolves get_tab(); ws_url is a REQUIRED param (C.2 pin).
+    Signature-based so the RED is offline-deterministic — a call-based check
+    (`mod.cdp_js("1+1")`) would execute the OLD 1-arg body's `get_tab()`→`cdp_get()`,
+    which hits the live CDP port and may `sys.exit(1)`, making the RED env-dependent
+    (R1-F2). Inspecting the signature touches no network."""
+    import inspect
+    mod = _load_cdp_module()
+    params = inspect.signature(mod.cdp_js).parameters
+    assert "ws_url" in params, "cdp_js must take an explicit ws_url param"
+    assert params["ws_url"].default is inspect.Parameter.empty, \
+        "ws_url must be a REQUIRED arg (no default) so a caller can't forget to thread it"
+
+
+def test_cmd_title_pins_target_tab():
+    """cmd_title (an indirect cdp_js caller) must drive the PINNED tab, not the first."""
+    import io, contextlib
+    mod = _load_cdp_module()
+    _stub_tabs(mod, TWO_TABS)
+    mod.has_websocket = lambda: True
+    mod.TARGET = "BBBbbb444555666"
+    mod.log = lambda *a, **k: None
+    seen = _capture_ws_url(mod)
+    with contextlib.redirect_stdout(io.StringIO()):
+        mod.cmd_title([])
+    assert seen.get("ws_url") == "ws://x/B", \
+        "cmd_title must use the pinned tab's ws_url, got {!r}".format(seen.get("ws_url"))
+
+
+def test_no_unpinned_tab_resolution():
+    """C-acceptance: every get_tab( CALL passes the global TARGET selector, and every
+    cdp_js( CALL threads an explicit ws_url — no cmd_* resolves a tab without the pin.
+    Arity alone is too weak: get_tab(None) or get_tab(<literal>) would satisfy a count
+    check yet still drift to the wrong tab (R1-F1), so get_tab must be called with the
+    Name `TARGET`. AST-based (not text) so a comment can't self-defeat it."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == "get_tab":
+                pinned = (len(node.args) >= 1
+                          and isinstance(node.args[0], ast.Name)
+                          and node.args[0].id == "TARGET")
+                if not pinned:
+                    offenders.append("get_tab() not threaded with TARGET @L{}".format(node.lineno))
+            if node.func.id == "cdp_js" and (len(node.args) + len(node.keywords)) < 2:
+                offenders.append("cdp_js(...) missing explicit ws_url @L{}".format(node.lineno))
+    assert not offenders, "un-pinned tab resolution (selector not threaded): {}".format(offenders)
+
+
+def test_cmd_navigate_pins_target_tab():
+    """cmd_navigate (a direct get_tab caller) must drive the PINNED tab."""
+    import io, contextlib
+    mod = _load_cdp_module()
+    _stub_tabs(mod, TWO_TABS)
+    mod.has_websocket = lambda: True
+    mod.TARGET = "BBBbbb444555666"
+    mod.log = lambda *a, **k: None
+    seen = _capture_ws_url(mod)
+    with contextlib.redirect_stdout(io.StringIO()):
+        mod.cmd_navigate(["http://localhost/x"])
+    assert seen.get("ws_url") == "ws://x/B", \
+        "cmd_navigate must use the pinned tab's ws_url, got {!r}".format(seen.get("ws_url"))
+
+
+# ── SP1: CHROME_APP_NAME parameterization (spec §4.2) ──
+
+def _import_cdp(env_override=None):
+    """Import cdp.py as a fresh module in a child interpreter and print CHROME_APP.
+
+    Constants like CHROME_APP are bound at import; mutating os.environ around an
+    in-process exec_module would leak across tests — so run the import in a child
+    interpreter (keeps the file's subprocess-CLI convention)."""
+    code = (
+        "import importlib.util; "
+        "spec = importlib.util.spec_from_file_location('cdp_mod', {!r}); "
+        "m = importlib.util.module_from_spec(spec); "
+        "spec.loader.exec_module(m); "
+        "print(m.CHROME_APP)"
+    ).format(CDP_SCRIPT)
+    env = os.environ.copy()
+    env.pop("CHROME_APP_NAME", None)
+    if env_override:
+        env.update(env_override)
+    return subprocess.run([sys.executable, "-c", code],
+                          capture_output=True, text=True, timeout=10, env=env)
+
+
+def test_chrome_app_name_env_overrides():
+    r = _import_cdp({"CHROME_APP_NAME": "Google Chrome for Testing"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "Google Chrome for Testing"
+
+
+def test_chrome_app_default_is_stock():
+    r = _import_cdp()
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "Google Chrome"
+
+
+def test_chrome_app_name_with_quote_fails_loud():
+    """cdp.py applies the same CHROME_APP_NAME guard launch.sh has — the value is
+    spliced into AppleScript string literals (injection surface)."""
+    r = _import_cdp({"CHROME_APP_NAME": 'Evil " App'})
+    assert r.returncode != 0
+    assert "CHROME_APP_NAME" in r.stderr
+
+
+# ── SP1: hole B — native_screenshot owner match ──
+
+class _FakePgrep:
+    def __init__(self, returncode=0, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def test_chrome_pid_for_port_returns_first_pid():
+    m = _load_cdp_module()
+    calls = {}
+
+    def fake_runner(cmd, **kw):
+        calls["cmd"] = cmd
+        return _FakePgrep(returncode=0, stdout="4242\n4300\n")
+
+    assert m._chrome_pid_for_port(9355, _runner=fake_runner) == 4242
+    # Anchored ERE: port 9355 must not match 93550 (mirrors launch.sh KILL_MATCH).
+    # The "--" separator is REQUIRED: the pattern starts with "--" and BSD pgrep
+    # without it errors rc=2 (usage) → the helper would silently name-fallback.
+    assert calls["cmd"][0] == "pgrep"
+    assert calls["cmd"][1] == "-f"
+    assert calls["cmd"][2] == "--"
+    assert calls["cmd"][3] == r"--remote-debugging-port=9355($|[[:space:]])"
+
+
+def test_chrome_pid_for_port_none_when_no_match():
+    m = _load_cdp_module()
+    assert m._chrome_pid_for_port(
+        9355, _runner=lambda *a, **k: _FakePgrep(returncode=1)) is None
+
+
+def test_chrome_pid_for_port_none_on_oserror():
+    m = _load_cdp_module()
+
+    def boom(*a, **k):
+        raise OSError("pgrep missing")
+
+    assert m._chrome_pid_for_port(9355, _runner=boom) is None
+
+
+def test_native_screenshot_owner_match_is_not_prefix_substring():
+    """Structural: the 'Google' substring collision (hole B) is gone."""
+    text = Path(CDP_SCRIPT).read_text()
+    assert "split()[0]" not in text
+    assert "kCGWindowOwnerPID" in text
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = failed = 0
@@ -1368,3 +2085,19 @@ if __name__ == "__main__":
             failed += 1
     print(f"\n=== {passed} passed, {failed} failed ===")
     sys.exit(0 if failed == 0 else 1)
+
+
+class TestAssertStructural:
+    def test_assert_registered_in_commands(self):
+        cdp = _load_cdp_module()
+        assert "assert" in cdp.COMMANDS
+        assert callable(cdp.COMMANDS["assert"])
+
+    def test_docstring_documents_verify_core_surface(self):
+        """Drift-guard: the module docstring (the agent-facing usage text) names
+        every SP2 verify-core surface (full set since Task 6 — R1-F1/E1-r2-A1)."""
+        cdp = _load_cdp_module()
+        doc = cdp.__doc__
+        for token in ("assert", "--actionable", "--gate", "--wait",
+                      "--require-trusted", "--bind"):
+            assert token in doc, "verify-core surface {!r} missing from cdp.py docstring".format(token)

@@ -1,0 +1,10 @@
+{
+  "envelope": ["id", "class", "file", "quote", "anchor"],
+  "anchor_by_class": {
+    "dead_ref": ["ref"],
+    "internal_contradiction": ["quote_b"],
+    "cross_spec_drift": ["other_file", "other_quote"],
+    "stale_term": ["exclude_section"]
+  },
+  "notes": "quote is the literal citing text (verbatim from file). The verifier confirms quote-presence ONLY (anti-hallucination); Claude judges whether the cited text is a real defect of its class. See docs/superpowers/specs/2026-06-01-e1-pre-review-consistency-audit-design.md."
+}

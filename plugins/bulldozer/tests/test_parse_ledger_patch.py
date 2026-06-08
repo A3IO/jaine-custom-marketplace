@@ -190,6 +190,98 @@ class TestLedgerPatchNonMappingValue:
         assert result.returncode == 3, result.stderr
 
 
+class TestFencedLedgerPatchBlock:
+    """#127: codex sometimes emits the LEDGER_PATCH body inside a ``` markdown
+    fence on the line right after a bare `LEDGER_PATCH:` marker, at the marker's
+    own column. extract_ledger_blocks' indent-anchor treated the fence-opener as
+    outer scope and captured only the bare marker → yaml.load → {LEDGER_PATCH:
+    None} → "NoneType, not a mapping" → exit 1 (spurious manual fallback). The
+    fence's inner content is the real mapping and must be parsed.
+    """
+
+    def test_fenced_go_after_marker_exits_zero(self):
+        text = "No material findings.\n\nLEDGER_PATCH:\n```yaml\nverdict: go\nfindings: []\n```\n"
+        result = run_parser(stdin_text=text)
+        assert result.returncode == 0, (
+            f"fenced GO LEDGER_PATCH must parse (exit 0), not fall back to "
+            f"manual extraction (exit 1). stderr:\n{result.stderr}"
+        )
+        payload = load_payload(result)
+        assert payload["verdict"] == "go"
+        assert payload["findings"] == []
+
+    def test_fenced_without_language_tag_exits_zero(self):
+        text = "LEDGER_PATCH:\n```\nverdict: go\nfindings: []\n```\n"
+        result = run_parser(stdin_text=text)
+        assert result.returncode == 0, result.stderr
+        assert load_payload(result)["verdict"] == "go"
+
+    def test_fenced_nogo_with_findings_parses(self):
+        text = (
+            "LEDGER_PATCH:\n```yaml\n"
+            "findings:\n"
+            "  - id: R1-F1\n"
+            "    severity: high\n"
+            "    status: open\n"
+            "    title: bug\n"
+            "```\n"
+        )
+        result = run_parser(stdin_text=text)
+        assert result.returncode == 0, result.stderr
+        payload = load_payload(result)
+        assert payload["verdict"] == "no_go"
+        assert len(payload["findings"]) == 1
+        assert payload["findings"][0]["id"] == "R1-F1"
+
+    def test_bare_marker_no_fence_still_exits_one(self):
+        # Regression: truly empty `LEDGER_PATCH:` (no fenced body following) must
+        # STILL exit 1 — fenced-mode capture must not fire without a fence opener.
+        text = "LEDGER_PATCH:\n\njust prose after.\n"
+        result = run_parser(stdin_text=text)
+        assert result.returncode == 1, result.stderr
+
+    def test_fence_without_close_falls_back(self):
+        # Defensive: an unterminated fence after the marker must not capture to
+        # EOF blindly; falls through to the indent-anchor path → exit 1 (no
+        # usable mapping), not a crash or a half-block.
+        text = "LEDGER_PATCH:\n```yaml\nverdict: go\n"  # no closing ```
+        result = run_parser(stdin_text=text)
+        assert result.returncode == 1, result.stderr
+
+    def test_fenced_body_with_nested_fence_in_block_scalar(self):
+        # R1-F1 (#127 dogfood): a fenced LEDGER_PATCH whose body contains a block
+        # scalar (original_verdict_excerpt: |) with an embedded ``` fence must NOT
+        # close early on that nested (deeper-indented) fence. A naive any-indent
+        # close truncated the body mid-scalar and let the nested illustrative
+        # LEDGER_PATCH win as a later block → real outer finding dropped. The
+        # close must match the opener's column.
+        text = (
+            "LEDGER_PATCH:\n"
+            "```yaml\n"
+            "findings:\n"
+            "  - id: R1-F1\n"
+            "    severity: high\n"
+            "    status: open\n"
+            "    title: real outer finding\n"
+            "    original_verdict_excerpt: |\n"
+            "      The directive looks like:\n"
+            "      ```\n"
+            "      LEDGER_PATCH:\n"
+            "        findings: []\n"
+            "      ```\n"
+            "```\n"
+        )
+        result = run_parser(stdin_text=text)
+        assert result.returncode == 0, result.stderr
+        payload = load_payload(result)
+        assert payload["verdict"] == "no_go"
+        assert len(payload["findings"]) == 1, (
+            f"nested illustrative LEDGER_PATCH must NOT win — the real outer "
+            f"finding must survive. Got: {payload['findings']}"
+        )
+        assert payload["findings"][0]["id"] == "R1-F1"
+
+
 class TestMultiBlockMalformedFallback:
     """Issue #100 case #11: if a verdict has multiple LEDGER_PATCH blocks and
     only the LAST one has a YAML syntax error, prior valid blocks were silently
@@ -418,6 +510,22 @@ class TestBareGoSynthesis:
         assert "synthes" in result.stderr.lower()
         assert payload.get("source") == "synthesized_bare_go", (
             f"source must signal synthesis, got {payload.get('source')!r}"
+        )
+
+    def test_bare_go_emits_top_level_canonical_verdict(self):
+        # B8 regression (#110 PR-3a dogfood, R1-F1→R3-F1): the synthesized
+        # bare-GO payload is built in main() (NOT parse()), so B8's top-level
+        # canonical `verdict` — added only to parse()'s return — was missing
+        # here. The wrapper reads data.get("verdict") at top level and maps a
+        # missing key to NO-GO (fail-safe), so a documented bare-GO reply was
+        # logged as NO-GO. The synthesized payload MUST set top-level verdict.
+        text = "Verdict body prose here.\n\nGO\n"
+        result = run_parser(stdin_text=text)
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        assert payload.get("verdict") == "go", (
+            f"bare-GO synthesis must emit top-level verdict='go' (wrapper reads "
+            f"top level, not meta); got {payload.get('verdict')!r}"
         )
 
     def test_bare_go_with_surrounding_whitespace_synthesizes(self):
@@ -1983,3 +2091,52 @@ class TestIdStrictValidation:
             f"whitespace-only variant of an id must trip duplicate detection; "
             f"got {result.returncode}"
         )
+
+
+class TestCanonicalVerdict:
+    """B8 (#110): parser emits a canonical meta.verdict on every exit-0 parse.
+
+    Output is identical to the wrapper's prior GO/NO-GO computation: a
+    reviewer-supplied verdict is canonicalized (lower() == "go" -> "go" else
+    "no_go"), otherwise it is inferred from the findings list. BUG-2 invariant
+    preserved: an explicit NO-GO with empty findings stays "no_go".
+    """
+
+    _NOGO_FINDING = (
+        "LEDGER_PATCH:\n"
+        "  findings:\n"
+        "    - id: R1-F1\n"
+        "      severity: high\n"
+        "      status: open\n"
+        '      title: "test finding"\n'
+        '      files: [{path: "a.py", lines: "1-5"}]\n'
+        '      original_verdict_excerpt: "snippet"\n'
+        "      required_recheck:\n"
+        '        instructions: "verify"\n'
+        '        commands: ["grep foo a.py"]\n'
+    )
+
+    def test_findings_no_explicit_verdict_infers_no_go(self):
+        result = run_parser(stdin_text=self._NOGO_FINDING)
+        assert result.returncode == 0, result.stderr
+        payload = load_payload(result)
+        assert payload["verdict"] == "no_go"
+
+    def test_empty_findings_no_explicit_verdict_infers_go(self):
+        result = run_parser(stdin_text="LEDGER_PATCH:\n  findings: []\n")
+        assert result.returncode == 0, result.stderr
+        payload = load_payload(result)
+        assert payload["verdict"] == "go"
+
+    def test_explicit_no_go_with_empty_findings_stays_no_go(self):
+        # BUG-2 regression: explicit NO-GO must NOT flip to go on empty findings.
+        result = run_parser(stdin_text="LEDGER_PATCH:\n  verdict: no-go\n  findings: []\n")
+        assert result.returncode == 0, result.stderr
+        payload = load_payload(result)
+        assert payload["verdict"] == "no_go"
+
+    def test_explicit_go_canonicalized_lowercase(self):
+        result = run_parser(stdin_text="LEDGER_PATCH:\n  verdict: GO\n  findings: []\n")
+        assert result.returncode == 0, result.stderr
+        payload = load_payload(result)
+        assert payload["verdict"] == "go"

@@ -5,10 +5,18 @@ Requires JAINE Browser (auto-launched by jaine_browser fixture).
 Run: pytest tests/test_e2e.py -v
 """
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 
 sys.path.insert(0, os.path.dirname(__file__))
-from conftest import run_cdp  # noqa: E402
+import pytest  # noqa: E402
+from conftest import run_cdp, CDP_PORT, FIXTURES_DIR, LAUNCH_SCRIPT, LANE_ENV_VARS, _kill_pattern, _wait_port_release  # noqa: E402
 
 
 # ── Status & Tabs ──
@@ -54,6 +62,48 @@ def test_reload_succeeds(test_page_url):
     r = run_cdp(["reload"])
     assert r.returncode == 0, "reload failed: {}".format(r.stderr)
     assert "Reloaded" in r.stdout
+
+
+def test_navigate_bare_path_normalizes_to_file_uri(jaine_browser, tmp_path):
+    """Issue #60 §1: a bare absolute path navigates correctly (normalized to file://).
+
+    Without normalize_url, CDP rejects the bare path with
+    'Cannot navigate to invalid URL' and the page stays where it was.
+    """
+    page = tmp_path / "bd60.html"
+    page.write_text("<!DOCTYPE html><html><head><title>BD60 BARE PATH</title></head><body>ok</body></html>")
+    bare = str(page)  # no file:// scheme
+    assert bare.startswith("/")
+
+    r = run_cdp(["navigate", bare])
+    assert r.returncode == 0, "navigate to bare path failed: {}".format(r.stderr)
+
+    # Wait for THIS page's title specifically — a generic `title.length > 0` would
+    # fire on the previous page's title (CDP navigate returns before load completes).
+    w = run_cdp(["wait", "--js", "document.title === 'BD60 BARE PATH'", "5"])
+    assert w.returncode == 0, "page did not finish loading bd60.html in time: {}".format(w.stderr)
+    href = run_cdp(["js", "location.href"]).stdout
+    title = run_cdp(["js", "document.title"]).stdout
+    assert "file://" in href, "bare path should have been normalized to file://, got href={!r}".format(href)
+    assert "BD60 BARE PATH" in title, "page did not load (title={!r})".format(title)
+
+
+def test_navigate_bare_path_with_spaces_and_reserved_chars(jaine_browser, tmp_path):
+    """Issue #60 R1-F1 (e2e): a bare path with a space + '#' navigates correctly —
+    the percent-encoded file:// URI must round-trip through CDP to the real file."""
+    page = tmp_path / "bd60 spaced#page.html"
+    page.write_text("<!DOCTYPE html><html><head><title>BD60 SPACED</title></head><body>ok</body></html>")
+    bare = str(page)
+    assert " " in bare and "#" in bare
+
+    r = run_cdp(["navigate", bare])
+    assert r.returncode == 0, "navigate to spaced/# path failed: {}".format(r.stderr)
+    w = run_cdp(["wait", "--js", "document.title === 'BD60 SPACED'", "5"])
+    assert w.returncode == 0, "spaced/# page did not load: {}".format(w.stderr)
+    href = run_cdp(["js", "location.href"]).stdout
+    title = run_cdp(["js", "document.title"]).stdout
+    assert "%20" in href and "%23" in href, "space + '#' must be percent-encoded in href, got {!r}".format(href)
+    assert "BD60 SPACED" in title, "spaced/# page did not load (title={!r})".format(title)
 
 
 # ── See ──
@@ -187,7 +237,13 @@ def test_viewport_changes_size(test_page_url):
 def test_window_bounds_returns_coords(jaine_browser):
     r = run_cdp(["window", "bounds"])
     assert r.returncode == 0, "window bounds failed: {}".format(r.stderr)
-    assert "," in r.stdout, "Expected comma-separated bounds, got: {}".format(r.stdout)
+    out = r.stdout.strip()
+    # B.2 contract: exactly `left,top,width,height` — comma-separated, no spaces.
+    assert " " not in out, "contract is left,top,width,height (no spaces), got: {!r}".format(out)
+    parts = out.split(",")
+    assert len(parts) == 4, "expected 4 fields left,top,width,height, got: {!r}".format(out)
+    left, top, width, height = (int(p) for p in parts)
+    assert width > 0 and height > 0, "width/height must be positive, got {}x{}".format(width, height)
 
 
 # ── Issue #55: --clip, --scale, dimensions in stdout ──
@@ -286,3 +342,257 @@ def test_screenshot_clip_and_scale_combined(test_page_url, tmp_path):
     assert dims == (200, 150), (
         "Combined --clip + --scale 1 must produce CSS-pixel output (200×150), got {}".format(dims)
     )
+
+
+def test_click_trusted_grants_user_activation(test_page_url):
+    """Visible button → trusted Input.dispatchMouseEvent → isTrusted + user activation."""
+    r = run_cdp(["click", "#trusted-probe"])
+    assert r.returncode == 0, "click failed: {}".format(r.stderr)
+    assert "trusted" in r.stdout.lower(), "expected trusted marker, got: {}".format(r.stdout)
+    assert "fallback" not in r.stdout.lower(), "visible button must not fall back: {}".format(r.stdout)
+    t = run_cdp(["js", "String(window.__clickTrusted)"])
+    assert "true" in t.stdout, "event.isTrusted should be true, got: {}".format(t.stdout)
+    a = run_cdp(["js", "String(window.__userActivation)"])
+    assert "true" in a.stdout, "userActivation.isActive should be true, got: {}".format(a.stdout)
+
+
+def test_click_hidden_falls_back_untrusted(test_page_url):
+    """display:none element → not hittable → untrusted el.click() fallback + stderr WARN."""
+    r = run_cdp(["click", "#hidden-btn"])
+    assert r.returncode == 0, "fallback click must still return 0: {}".format(r.stderr)
+    assert "fallback" in r.stdout.lower(), "expected fallback marker, got: {}".format(r.stdout)
+    assert "activation" in r.stderr.lower(), "expected user-activation WARN on stderr, got: {}".format(r.stderr)
+    h = run_cdp(["js", "String(window.__hiddenClicked)"])
+    assert "true" in h.stdout, "hidden handler should fire via el.click fallback: {}".format(h.stdout)
+
+
+def test_click_occluded_falls_back(test_page_url):
+    """Element under a higher-z-index overlay → elementFromPoint miss → fallback."""
+    r = run_cdp(["click", "#occluded-btn"])
+    assert r.returncode == 0, "occluded click must still return 0: {}".format(r.stderr)
+    assert "fallback" in r.stdout.lower(), "occluded element must fall back, got: {}".format(r.stdout)
+    o = run_cdp(["js", "String(window.__occludedClicked)"])
+    assert "true" in o.stdout, "occluded handler should fire via el.click fallback: {}".format(o.stdout)
+
+
+def test_click_belowfold_smooth_scroll_stays_trusted(test_page_url):
+    """Below-fold button on a scroll-behavior:smooth page must STILL be trusted —
+    regression guard that scrollIntoView uses behavior:'instant' (R1-F1)."""
+    r = run_cdp(["click", "#belowfold-btn"])
+    assert r.returncode == 0, "click failed: {}".format(r.stderr)
+    assert "trusted" in r.stdout.lower() and "fallback" not in r.stdout.lower(), \
+        "below-fold smooth-scroll button must be trusted (instant scroll), got: {}".format(r.stdout)
+    t = run_cdp(["js", "String(window.__belowfoldTrusted)"])
+    assert "true" in t.stdout, "below-fold isTrusted should be true, got: {}".format(t.stdout)
+
+
+# ── sub-C: --target tab pinning ──
+
+
+def _open_lane(token, test_server):
+    """Open test-page.html?<token> in a new tab; return its 12-char id from `tabs`."""
+    url = "http://localhost:{}/test-page.html?{}".format(test_server, token)
+    r = run_cdp(["open", url])
+    assert r.returncode == 0, "open failed: {}".format(r.stderr)
+    t = run_cdp(["tabs"])
+    for line in t.stdout.splitlines():
+        if token in line:
+            return line.split()[0]  # id[:12] is the first column
+    raise AssertionError("opened tab not in `tabs` for {}: {}".format(token, t.stdout))
+
+
+def test_target_pins_cdp_js_family(jaine_browser, test_server, tmp_path):
+    """--target drives ONLY the selected tab for the cdp_js family, value-distinguished:
+    js (location.search), fill (input value), wait (--js predicate), title (per-tab
+    document.title), html (per-tab marker), screenshot --full-page (per-tab height).
+    Per-tab markers are injected with the js command (proven-pinned first)."""
+    base = "http://localhost:{}/test-page.html".format(test_server)
+    id_a = _open_lane("look=cjA", test_server)
+    id_b = _open_lane("look=cjB", test_server)
+
+    # js (cdp_js) honors the id pin
+    assert run_cdp(["--target", id_a, "js", "location.search"]).stdout.strip() == "?look=cjA"
+    assert run_cdp(["--target", id_b, "js", "location.search"]).stdout.strip() == "?look=cjB"
+    # url-substring selector resolves the same tab (end-to-end)
+    assert run_cdp(["--target", "look=cjB", "js", "location.search"]).stdout.strip() == "?look=cjB"
+
+    # fill (cdp_js) drives only the pinned tab
+    run_cdp(["--target", id_b, "fill", "#test-input", "valB"])
+    assert run_cdp(["--target", id_b, "js",
+                    "document.getElementById('test-input').value"]).stdout.strip() == "valB"
+    assert run_cdp(["--target", id_a, "js",
+                    "document.getElementById('test-input').value"]).stdout.strip() == ""
+
+    # wait (cdp_js) polls the pinned tab
+    assert run_cdp(["--target", id_b, "wait", "--js",
+                    "location.search === '?look=cjB'", "5"]).returncode == 0
+
+    # Inject per-tab markers via the proven-pinned js (A also gets a 4000px pad).
+    run_cdp(["--target", id_a, "js",
+             "document.title='TTL_A'; document.body.setAttribute('data-lane','LANE_A');"
+             " var d=document.createElement('div'); d.style.height='4000px';"
+             " document.body.appendChild(d); 'ok'"])
+    run_cdp(["--target", id_b, "js",
+             "document.title='TTL_B'; document.body.setAttribute('data-lane','LANE_B'); 'ok'"])
+
+    # title (cdp_js) pins
+    assert run_cdp(["--target", id_a, "title"]).stdout.strip() == "TTL_A"
+    assert run_cdp(["--target", id_b, "title"]).stdout.strip() == "TTL_B"
+
+    # html (cdp_js) pins — each tab's marker present only in its own DOM
+    html_a = run_cdp(["--target", id_a, "html"]).stdout
+    html_b = run_cdp(["--target", id_b, "html"]).stdout
+    assert "LANE_A" in html_a and "LANE_B" not in html_a
+    assert "LANE_B" in html_b and "LANE_A" not in html_b
+
+    # screenshot --full-page (cdp_js metrics) pins — A's 4000px pad ⇒ taller capture
+    pa, pb = str(tmp_path / "fpA.jpg"), str(tmp_path / "fpB.jpg")
+    run_cdp(["--target", id_a, "screenshot", "--full-page", pa])
+    run_cdp(["--target", id_b, "screenshot", "--full-page", pb])
+    dim_a, dim_b = _read_jpeg_dimensions(pa), _read_jpeg_dimensions(pb)
+    assert dim_a and dim_b, "could not read screenshot dims: {} {}".format(dim_a, dim_b)
+    assert dim_a[1] > dim_b[1] + 1000, (
+        "A's full-page capture (4000px pad) must be much taller than B's — proves "
+        "--full-page metrics read the PINNED tab; got A={} B={}".format(dim_a, dim_b))
+
+
+def test_target_pins_direct_commands(jaine_browser, test_server):
+    """--target drives ONLY the selected tab for representative DIRECT get_tab
+    side-effect commands (navigate, click, network); the sibling tab is untouched and
+    a bare call (no --target) is unchanged. The remaining direct callers
+    (reload/console/pdf/viewport/window) share the identical get_tab(TARGET) pattern,
+    guaranteed by test_no_unpinned_tab_resolution. (cdp_js-family + selector-form
+    coverage lives in test_target_pins_cdp_js_family.)"""
+    base = "http://localhost:{}/test-page.html".format(test_server)
+    id_a = _open_lane("look=dirA", test_server)
+    id_b = _open_lane("look=dirB", test_server)
+
+    # direct (navigate) drives only the pinned tab; id is stable across navigation
+    run_cdp(["--target", id_a, "navigate", base + "?look=dirA2"])
+    run_cdp(["--target", id_a, "wait", "--js", "location.search === '?look=dirA2'", "5"])
+    assert run_cdp(["--target", id_a, "js", "location.search"]).stdout.strip() == "?look=dirA2"
+    assert run_cdp(["--target", id_b, "js", "location.search"]).stdout.strip() == "?look=dirB"
+
+    # direct (click) drives only the pinned tab
+    run_cdp(["--target", id_b, "click", "#test-btn"])
+    assert "true" in run_cdp(["--target", id_b, "js",
+                              "document.getElementById('test-btn').dataset.clicked"]).stdout
+    a_clicked = run_cdp(["--target", id_a, "js",
+                         "String(document.getElementById('test-btn').dataset.clicked)"]).stdout.strip()
+    assert a_clicked in ("undefined", "null", ""), \
+        "tab A's button must NOT be clicked, got {!r}".format(a_clicked)
+
+    # direct (network) reloads + captures the PINNED tab → its own URL is in the log
+    net_b = run_cdp(["--target", id_b, "network"])
+    assert net_b.returncode == 0 and "look=dirB" in net_b.stdout, (
+        "network must reload+capture the pinned tab B (its ?look=dirB request), "
+        "got rc={} out={!r}".format(net_b.returncode, net_b.stdout))
+
+    # no --target is unchanged (drives some tab, rc 0)
+    assert run_cdp(["js", "location.search"]).returncode == 0
+
+
+def test_target_ambiguous_and_miss_fail_loud(jaine_browser, test_server):
+    """An ambiguous url selector and an unknown selector both fail loud (non-zero)."""
+    base = "http://localhost:{}/test-page.html".format(test_server)
+    run_cdp(["open", base + "?dup=AMB"])
+    run_cdp(["open", base + "?dup=AMB"])  # two tabs share the token → ambiguous
+
+    amb = run_cdp(["--target", "dup=AMB", "js", "1"])
+    assert amb.returncode != 0, "ambiguous url selector must fail loud, got rc=0"
+    assert "ambiguous" in amb.stderr.lower() or "match" in amb.stderr.lower()
+
+    miss = run_cdp(["--target", "zzz-no-such-tab", "js", "1"])
+    assert miss.returncode != 0, "unknown selector must fail loud"
+    assert "no tab" in miss.stderr.lower() or "matched no" in miss.stderr.lower()
+
+
+# ── sub-D: --insecure web-security lane (#93) ──
+
+# A dedicated insecure e2e port: fixed + in-range + never 9333, and always distinct from the
+# secure lane's CDP_PORT (R1-F4). `CDP_PORT + 2` could land on 9333 (CDP_PORT=9331) or out of
+# range (CDP_PORT=65534) (R2-F1) — so use a fixed in-range port and only step away if CDP_PORT
+# happens to equal it. Both 9356 and 9358 are in 1..65535 and != 9333.
+INSECURE_TEST_PORT = 9356 if CDP_PORT != 9356 else 9358
+
+
+def _cdp_online(port):
+    try:
+        return urlopen("http://localhost:{}/json/version".format(port), timeout=3).status == 200
+    except (URLError, OSError):
+        return False
+
+
+@pytest.fixture(scope="module")
+def insecure_lane():
+    """An isolated HEADLESS lane launched via launch.sh with LOOK_INSECURE=1
+    (--disable-web-security). Dedicated non-9333 port + temp profile; torn down with
+    pkill + rmtree. Fails loud on an unexpected pre-existing listener (isolation)."""
+    if _cdp_online(INSECURE_TEST_PORT):
+        pytest.fail("Unexpected CDP listener on insecure test port {0} — kill it "
+                    "(pkill -f remote-debugging-port={0}) and re-run.".format(INSECURE_TEST_PORT))
+    profile = tempfile.mkdtemp(prefix="jaine-insecure-{}-".format(INSECURE_TEST_PORT))
+    env = os.environ.copy()
+    for _v in LANE_ENV_VARS:
+        env.pop(_v, None)
+    env.update({
+        "CDP_PORT": str(INSECURE_TEST_PORT),
+        "LOOK_PROFILE_DIR": profile,
+        "LOOK_HEADLESS": "1",
+        "LOOK_INSECURE": "1",
+    })
+    kill_match = _kill_pattern(profile)
+    # DEVNULL, not PIPE: launch.sh redirects Chrome into the lane's chrome.log;
+    # an unread PIPE could fill and block the child (SP1 review).
+    subprocess.Popen(["bash", LAUNCH_SCRIPT, "about:blank"], env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if _cdp_online(INSECURE_TEST_PORT):
+            break
+        time.sleep(0.5)
+    else:
+        subprocess.run(["pkill", "-f", "--", kill_match], capture_output=True)
+        _wait_port_release(INSECURE_TEST_PORT)
+        shutil.rmtree(profile, ignore_errors=True)
+        pytest.fail("insecure lane did not start on {} within 20s".format(INSECURE_TEST_PORT))
+    yield INSECURE_TEST_PORT
+    subprocess.run(["pkill", "-f", "--", kill_match], capture_output=True)
+    # headless=new Chrome serves CDP for seconds after SIGTERM — wait for actual
+    # port release so a back-to-back run doesn't trip the fail-loud guard above.
+    _wait_port_release(INSECURE_TEST_PORT)
+    shutil.rmtree(profile, ignore_errors=True)
+
+
+def _fetch_result(cdp_port, target_url, poll=5.0):
+    """Navigate the lane at cdp_port to the file:// repro (target in #hash); poll #r."""
+    repro = (Path(FIXTURES_DIR) / "look-insecure-fetch.html").as_uri()  # percent-encoded (space-safe)
+    nav = run_cdp(["navigate", repro + "#" + target_url], env_override={"CDP_PORT": str(cdp_port)})
+    assert nav.returncode == 0, "navigate failed: {}".format(nav.stderr)
+    deadline = time.time() + poll
+    last = ""
+    while time.time() < deadline:
+        r = run_cdp(["js", "document.getElementById('r').textContent"],
+                    env_override={"CDP_PORT": str(cdp_port)})
+        last = r.stdout.strip()
+        if last and last != "PENDING":
+            return last
+        time.sleep(0.25)
+    return last
+
+
+def test_insecure_lane_unblocks_file_fetch(insecure_lane, test_server):
+    """D acceptance (flag-shipped): an --insecure lane lets a file:// page fetch an
+    http:// origin (the #93 case) — fetch SUCCEEDS."""
+    target = "http://127.0.0.1:{}/lan-probe.txt".format(test_server)
+    result = _fetch_result(insecure_lane, target)
+    assert result.startswith("OK:"), "insecure lane must unblock the fetch, got {!r}".format(result)
+    assert "PONG-LOOK-93" in result
+
+
+def test_secure_lane_blocks_file_fetch(jaine_browser, test_server):
+    """Causation control: the DEFAULT (secure) lane CANNOT fetch http:// from file://
+    — proves --disable-web-security, not something else, is what unblocks it."""
+    target = "http://127.0.0.1:{}/lan-probe.txt".format(test_server)
+    result = _fetch_result(CDP_PORT, target)  # CDP_PORT = the secure jaine_browser lane
+    assert result.startswith("FAIL:"), "secure lane must block the cross-origin fetch, got {!r}".format(result)

@@ -1,0 +1,12 @@
+# Pivot options offered when /bulldozer:check hits max rounds without GO.
+# emit-pivot.py renders these into pivot-rN.json (AskUserQuestion-compatible).
+# Add a 4th option here — no code change. Each option needs string `label` +
+# `description`. If this file is missing or malformed, emit-pivot.py falls back
+# to its built-in copy of this set (kept identical), so the dialog still renders.
+options:
+  - label: continue
+    description: "Run another round (exceeds max for this depth)"
+  - label: restructure
+    description: "Pause review, restructure the artifact, re-launch /bulldozer:check"
+  - label: accept-with-TODO
+    description: "Accept current state, log open findings as project TODOs"
