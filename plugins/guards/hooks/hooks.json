@@ -1,0 +1,22 @@
+{
+  "description": "guards — interactive Allow/Deny/Объясни gate on destructive Bash ops (git work-loss/hook-bypass + risky process kills), built on one shared confirm-dialog engine.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/guard-dispatch.sh guard-git-destructive-detect.py '🛡 Опасная git-операция'",
+            "timeout": 60
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/guard-dispatch.sh guard-process-kill-detect.py '🛡 Убийство процесса'",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

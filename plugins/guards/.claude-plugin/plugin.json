@@ -1,0 +1,11 @@
+{
+  "name": "guards",
+  "version": "0.1.0",
+  "description": "Interactive Allow/Deny/Объясни gate on destructive Bash operations — git work-loss & hook-bypass + risky process kills — built on one shared confirm-dialog engine (fix once, every guard benefits)",
+  "author": {
+    "name": "JAINE",
+    "email": "jaine@local"
+  },
+  "repository": "https://github.com/A3IO/jaine-plugins",
+  "homepage": "https://github.com/A3IO/jaine-plugins/tree/guards/main/plugins/guards"
+}

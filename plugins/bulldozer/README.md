@@ -40,7 +40,7 @@ Open URL in JAINE Browser (CDP :9333), take screenshot, show it.
 /bulldozer:look file:///tmp/page.html — проверить рендеринг таблицы  # URL + task description (description is your own brief, not passed to scripts)
 ```
 
-**17 CDP commands (zero dependencies — websocket-client bundled):**
+**CDP commands (zero dependencies — websocket-client bundled):**
 
 | Category | Commands |
 |----------|----------|
@@ -54,7 +54,7 @@ Open URL in JAINE Browser (CDP :9333), take screenshot, show it.
 
 Screenshot prints `PATH  W×H` to stdout. Default output is at native DPR (Retina ≈ 2×); `--clip X Y W H` captures a CSS-pixel region; `--scale 1` forces CSS-pixel output via `clip.scale = 1 / window.devicePixelRatio`.
 
-Multi-channel: CDP WebSocket (primary) → AppleScript + DOM injection (fallback) → macOS screencapture (screenshot fallback). 13/17 commands work without websocket.
+Multi-channel: CDP WebSocket (primary) → AppleScript + DOM injection (fallback) → macOS screencapture (screenshot fallback). Most commands work without websocket; CDP-only commands are marked in Quick Reference.
 
 **Log:** `~/.claude/hooks/bulldozer-look.log`
 

@@ -86,6 +86,16 @@
       },
       "source": "./plugins/jaine-matrix",
       "category": "channels"
+    },
+    {
+      "name": "guards",
+      "description": "Interactive Allow/Deny/Объясни gate on destructive Bash operations — git work-loss & hook-bypass + risky process kills — built on one shared confirm-dialog engine (fix once, every guard benefits)",
+      "author": {
+        "name": "JAINE",
+        "email": "jaine@local"
+      },
+      "source": "./plugins/guards",
+      "category": "development"
     }
   ]
 }

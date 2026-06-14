@@ -13,6 +13,7 @@ Usage:
                                        to its navigation (verify-core)
                                      stdout always prints "PATH  W×H"
   cdp.py js 'EXPRESSION'           — execute JS in main world
+  cdp.py js --ref N 'EXPR'         — execute EXPR with `el` bound to ref element
   cdp.py navigate URL [--wait [load|domcontentloaded|networkidle]] [--expect-url SUBSTR] [--timeout S]
                                    — navigate; --wait blocks until the lifecycle
                                      event + prints final URL & loaderId (verify-core)
@@ -28,9 +29,22 @@ Usage:
                                      --actionable = visible + enabled + hit-test;
                                      ASSERT_PASS/ASSERT_FAIL + exit 0/1, flap
                                      diagnostics distinguish flaky from absent
+  cdp.py assert --ref N [--visible|--actionable] [--stable MS] [--timeout S]
+                                   — assert by AX ref (default: node resolvable)
   cdp.py click SELECTOR [--require-trusted]
                                    — click element; --require-trusted refuses the
                                      untrusted el.click() fallback (exit 1, no click)
+  cdp.py click --ref N             — click by AX ref (always trusted, no fallback)
+  cdp.py fill --ref N VALUE        — fill by AX ref + dispatch events
+  cdp.py hover SELECTOR             — hover element (triggers CSS :hover, CDP only)
+  cdp.py hover --ref N              — hover by AX ref
+  cdp.py drag SRC_SEL DST_SEL [--html5 | --cancel]
+                                   — drag element (CDP only); mouse-series default,
+                                     --html5 for native DnD, --cancel for Esc mid-drag
+  cdp.py drag --ref N --to-ref M [--html5 | --cancel]
+                                   — drag by AX ref pair
+  cdp.py key --ref N KEY           — send key to ref-focused element (ref-only)
+                                     supported: Enter, Escape, Tab, ArrowDown, ArrowUp
   cdp.py fill SELECTOR VALUE       — fill input/textarea
   cdp.py console [--gate]          — console messages + uncaught exceptions;
                                      --gate: exit 1 if any error/exception (verify-core)
@@ -38,6 +52,12 @@ Usage:
   cdp.py pdf [FILE]                — save page as PDF
   cdp.py viewport WIDTH HEIGHT     — change viewport size
   cdp.py window [bounds|upper|lower|activate] — window management
+  cdp.py ax [--max-nodes N] [--raw] [--ref N]
+                                   — accessibility tree snapshot (CDP only)
+                                     --max-nodes N : limit rendered nodes (default 500, 0=all)
+                                     --raw : disable all filters (show ignored/InlineTextBox)
+                                     --ref N : scoped snapshot of subtree at ref N
+                                     stdout: AX_OK header + Playwright-parity tree
   cdp.py [--target SEL] CMD ...    — pin every tab resolution in the call to SEL
 
 Channels: CDP WebSocket (primary), AppleScript+DOM injection (fallback), macOS native (screenshot).
@@ -739,6 +759,50 @@ def cmd_screenshot(args):
     return 0
 
 def cmd_js(args):
+    args, ref_val = _pop_num(list(args), "--ref", int, None)
+    if ref_val is not None:
+        if not args:
+            print("Usage: cdp.py js --ref N 'EXPR'")
+            return 1
+        expr = args[0]
+        if not has_websocket():
+            print("ERROR: js --ref requires websocket-client", file=sys.stderr)
+            return 1
+        tab = get_tab(TARGET)
+        import websocket
+        try:
+            ws = websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=30)
+        except (websocket.WebSocketException, OSError, ConnectionError) as e:
+            print("WebSocket connect failed: {}".format(e), file=sys.stderr)
+            return 1
+        try:
+            result = _ref_resolve(ws, ref_val)
+            if result is None:
+                return 1
+            obj_id, tag = result
+            cid = 10
+            cid += 1
+            ws.send(json.dumps({"id": cid, "method": "Runtime.callFunctionOn",
+                "params": {"objectId": obj_id, "returnByValue": True,
+                    "functionDeclaration": "function(){{ var el=this; return ({}); }}".format(expr)}}))
+            r = _recv_for_id(ws, cid)
+            if "error" in r:
+                print(_REF_STALE_MSG.format(ref_val))
+                return 1
+            val = (r.get("result", {}).get("result", {}) or {}).get("value")
+            if val is not None:
+                print(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False))
+            else:
+                desc = (r.get("result", {}).get("result", {}) or {}).get("description",
+                    (r.get("result", {}).get("result", {}) or {}).get("type", "undefined"))
+                print(desc)
+            log("js", channel="cdp", ref=ref_val, expr=expr[:80])
+            return 0
+        except (websocket.WebSocketException, json.JSONDecodeError, OSError) as e:
+            print("WebSocket I/O error: {}".format(e), file=sys.stderr)
+            return 1
+        finally:
+            ws.close()
     if not args:
         print("Usage: cdp.py js 'expression'")
         return 1
@@ -967,11 +1031,238 @@ def cmd_wait(args):
 # used to carry diverging copies; cmd_click's measure keeps its own dict-shaped
 # variant — cross-ref there). Expects `el` in scope; returns false when not
 # rendered/visible.
+
+# --- AX renderer (§3.1-3.2) ---
+
+INTERACTIVE_ROLES = frozenset({
+    "button", "link", "checkbox", "textbox", "combobox", "option",
+    "menuitem", "radio", "switch", "tab", "slider", "searchbox",
+})
+
+_AX_ATTRS = {
+    "disabled": lambda v: "[disabled]" if v is True else None,
+    "checked": lambda v: "[checked=mixed]" if v == "mixed" else (
+        "[checked]" if v in (True, "true") else None),
+    "expanded": lambda v: "[expanded]" if v is True else None,
+    "selected": lambda v: "[selected]" if v is True else None,
+    "required": lambda v: "[required]" if v is True else None,
+    "readonly": lambda v: "[readonly]" if v is True else None,
+    "multiline": lambda v: "[multiline]" if v is True else None,
+    "invalid": lambda v: "[invalid={}]".format(v) if v and v != "false" else None,
+    "level": lambda v: "[level={}]".format(v) if v else None,
+}
+
+
+def _sanitize_name(name, max_len=200):
+    import re as _re
+    s = _re.sub(r'\s+', ' ', name).strip()
+    s = s.replace('"', "'")
+    if len(s) > max_len:
+        s = s[:max_len] + "…"
+    return s
+
+
+def _render_ax_tree(frame_node_lists, max_nodes, raw, shadow_map,
+                    frame_urls=None):
+    """Pure-function AX renderer. Returns (lines, meta).
+
+    frame_node_lists: list of node-lists, one per frame (main first).
+    shadow_map: {backendDOMNodeId: "open"|"closed"} from DOM.getDocument.
+    frame_urls: parallel list of frame URLs (empty string for main).
+    meta: {nodes, shown, frames, truncated, oopif_count}.
+    """
+    lines = []
+    total_raw_nodes = sum(len(f) for f in frame_node_lists)
+    shown = 0
+    truncated = False
+    iframe_role_count = 0
+
+    for frame_idx, nodes in enumerate(frame_node_lists):
+        if not nodes:
+            continue
+        by_id = {n["nodeId"]: n for n in nodes}
+        roots = [n for n in nodes
+                 if "parentId" not in n or n["parentId"] not in by_id]
+        visited = set()
+
+        if frame_idx > 0 and frame_urls and frame_idx < len(frame_urls):
+            lines.append("")
+            lines.append("frame: {}".format(frame_urls[frame_idx]))
+
+        def rec(n, depth):
+            nonlocal shown, truncated, iframe_role_count
+            nid = n["nodeId"]
+            if nid in visited:
+                return
+            visited.add(nid)
+            if max_nodes > 0 and shown >= max_nodes:
+                if not truncated:
+                    truncated = True
+                    lines.append("… [truncated: shown {} of {} nodes"
+                                 " — re-run with --max-nodes 0]".format(
+                                     shown, total_raw_nodes))
+                return
+
+            role = (n.get("role") or {}).get("value", "unknown")
+            name_raw = ((n.get("name") or {}).get("value") or "").strip()
+            name = _sanitize_name(name_raw) if name_raw else ""
+            backend_id = n.get("backendDOMNodeId")
+            is_shadow_host = backend_id is not None and backend_id in shadow_map
+
+            if role == "Iframe":
+                iframe_role_count += 1
+
+            skip = False
+            if not raw:
+                if n.get("ignored"):
+                    skip = True
+                elif role == "InlineTextBox":
+                    skip = True
+                elif role in ("generic", "none", "presentation") and not name:
+                    if not is_shadow_host:
+                        skip = True
+                elif role == "StaticText":
+                    if not name:
+                        skip = True
+                    else:
+                        parent = by_id.get(n.get("parentId", ""))
+                        if parent:
+                            pname = ((parent.get("name") or {}).get("value") or "").strip()
+                            if name == _sanitize_name(pname):
+                                skip = True
+                elif role == "RootWebArea" and not name:
+                    skip = True
+
+            child_depth = depth
+            if not skip:
+                role_out = "text" if role == "StaticText" else role
+                line = "  " * depth + "- " + role_out
+                if role_out == "text":
+                    line += ": " + name
+                elif name:
+                    line += ' "{}"'.format(name)
+
+                attrs = []
+                if raw and n.get("ignored"):
+                    attrs.append("[ignored]")
+                for prop in (n.get("properties") or []):
+                    pname = prop.get("name", "")
+                    pval = (prop.get("value") or {}).get("value")
+                    fmt = _AX_ATTRS.get(pname)
+                    if fmt:
+                        a = fmt(pval)
+                        if a:
+                            attrs.append(a)
+                if is_shadow_host:
+                    attrs.append("[shadow={}]".format(shadow_map[backend_id]))
+                if attrs:
+                    line += " " + " ".join(attrs)
+
+                if role in INTERACTIVE_ROLES and backend_id is not None:
+                    line += " [ref={}]".format(backend_id)
+
+                val_raw = ((n.get("value") or {}).get("value") or "")
+                if val_raw:
+                    val = _sanitize_name(str(val_raw))
+                    line += ": " + val
+
+                lines.append(line)
+                shown += 1
+                child_depth = depth + 1
+
+            for cid in (n.get("childIds") or []):
+                child = by_id.get(cid)
+                if child is not None:
+                    rec(child, child_depth)
+
+        for r in roots:
+            rec(r, 0)
+
+    frames_walked = len([f for f in frame_node_lists if f])
+    oopif_count = max(0, iframe_role_count - (frames_walked - 1)) if frames_walked > 0 else 0
+
+    meta = {
+        "nodes": total_raw_nodes,
+        "shown": shown,
+        "frames": frames_walked,
+        "truncated": truncated,
+        "oopif_count": oopif_count,
+    }
+    return lines, meta
+
+
 _VISIBLE_PRED_JS = ("var r=el.getBoundingClientRect();"
                     "if(r.width<=0||r.height<=0)return false;"
                     "var s=getComputedStyle(el);"
                     "if(s.visibility==='hidden'||s.display==='none'"
                     "||parseFloat(s.opacity||'1')<=0)return false;")
+
+# --- Ref-bridge helpers (§4) ---
+
+_REF_STALE_MSG = "REF_STALE: ref {} not resolvable — re-run ax for fresh refs"
+
+_HIT_TEST_JS = ("function(){"
+    "var el=this; el.scrollIntoView({block:'center',inline:'center',behavior:'instant'});"
+    "var r=el.getBoundingClientRect();"
+    "var cx=r.left+r.width/2, cy=r.top+r.height/2;"
+    "var hit=document.elementFromPoint(cx,cy);"
+    "var ok=r.width>0 && r.height>0 && !!hit;"
+    "if(ok){ok=(hit===el||el.contains(hit));"
+    "if(!ok){var h=el; while(h&&h.getRootNode){var rn=h.getRootNode();"
+    "if(rn.host){if(hit===rn.host||rn.host.contains(hit)){ok=true;break;}"
+    "h=rn.host;}else break;}}}"
+    "return {cx:cx, cy:cy, tag:el.tagName, hittable:ok};}")
+
+
+def _ref_hit_test(ws, ref):
+    """Resolve ref, scroll, hit-test. Returns (cx, cy, tag, hittable, obj_id) or None."""
+    call_id = [0]
+
+    def call(method, params):
+        call_id[0] += 1
+        ws.send(json.dumps({"id": call_id[0], "method": method, "params": params}))
+        return _recv_for_id(ws, call_id[0])
+
+    r = call("DOM.getDocument", {})
+    if "error" in r:
+        print(_REF_STALE_MSG.format(ref))
+        return None
+    rr = call("DOM.resolveNode", {"backendNodeId": ref})
+    if "error" in rr:
+        print(_REF_STALE_MSG.format(ref))
+        return None
+    obj_id = rr.get("result", {}).get("object", {}).get("objectId")
+    hr = call("Runtime.callFunctionOn", {
+        "objectId": obj_id, "returnByValue": True,
+        "functionDeclaration": _HIT_TEST_JS})
+    hres = (hr.get("result", {}).get("result", {}) or {}).get("value", {})
+    if not isinstance(hres, dict):
+        print(_REF_STALE_MSG.format(ref))
+        return None
+    return hres.get("cx", 0), hres.get("cy", 0), hres.get("tag", "?"), hres.get("hittable", False), obj_id
+
+
+def _ref_resolve(ws, ref):
+    """Resolve ref to objectId + tag. Returns (obj_id, tag) or None (prints REF_STALE)."""
+    call_id = [0]
+
+    def call(method, params):
+        call_id[0] += 1
+        ws.send(json.dumps({"id": call_id[0], "method": method, "params": params}))
+        return _recv_for_id(ws, call_id[0])
+
+    call("DOM.getDocument", {})
+    rr = call("DOM.resolveNode", {"backendNodeId": ref})
+    if "error" in rr:
+        print(_REF_STALE_MSG.format(ref))
+        return None
+    obj_id = rr.get("result", {}).get("object", {}).get("objectId")
+    tr = call("Runtime.callFunctionOn", {
+        "objectId": obj_id, "returnByValue": True,
+        "functionDeclaration": "function(){ return this.tagName; }"})
+    tag = (tr.get("result", {}).get("result", {}) or {}).get("value", "?")
+    return obj_id, tag
+
 
 def cmd_assert(args):
     """Verify-core assertion: condition must hold true CONTINUOUSLY for
@@ -995,6 +1286,127 @@ def cmd_assert(args):
         return 1
     args, timeout_s = _pop_num(args, "--timeout", float, 10.0)
     if timeout_s is None:
+        return 1
+    args, ref_val = _pop_num(args, "--ref", int, None)
+    if ref_val is not None:
+        if is_js:
+            print("ERROR: --js and --ref are mutually exclusive",
+                  file=sys.stderr)
+            return 1
+        if args:
+            print("Usage: cdp.py assert --ref N [--visible|--actionable] "
+                  "[--stable MS] [--timeout S]")
+            return 1
+        if visible:
+            ref_pred = (_VISIBLE_PRED_JS + "return true;")
+            what = "visible-ref: ref={}".format(ref_val)
+        elif actionable:
+            ref_pred = (_VISIBLE_PRED_JS +
+                "if(el.disabled===true)return false;"
+                "var cx=r.left+r.width/2, cy=r.top+r.height/2;"
+                "var hit=document.elementFromPoint(cx,cy);"
+                "var ok=!!hit&&(hit===el||el.contains(hit));"
+                "if(!ok){var h=el; while(h&&h.getRootNode){var rn=h.getRootNode();"
+                "if(rn.host){if(hit===rn.host||rn.host.contains(hit)){ok=true;break;}"
+                "h=rn.host;}else break;}}"
+                "return ok;")
+            what = "actionable-ref: ref={}".format(ref_val)
+        else:
+            ref_pred = "return true;"
+            what = "present-ref: ref={}".format(ref_val)
+
+        tab = get_tab(TARGET)
+        import websocket
+        try:
+            ws = websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=10)
+        except (websocket.WebSocketException, OSError, ConnectionError) as e:
+            print("WebSocket connect failed: {}".format(e), file=sys.stderr)
+            return 1
+        start = time.time()
+        deadline = start + timeout_s
+        streak_start = None
+        longest_ms = 0.0
+        flaps = 0
+        ever_true = False
+        call_id = 0
+
+        def ref_poll():
+            nonlocal call_id
+            call_id += 1
+            ws.send(json.dumps({"id": call_id, "method": "DOM.resolveNode",
+                "params": {"backendNodeId": ref_val}}))
+            ws.settimeout(max(0.1, min(1.0, deadline - time.time())))
+            try:
+                r = _recv_for_id(ws, call_id)
+            except websocket.WebSocketTimeoutException:
+                return None
+            if "error" in r:
+                return "stale"
+            obj_id = r.get("result", {}).get("object", {}).get("objectId")
+            if not obj_id:
+                return "stale"
+            call_id += 1
+            ws.send(json.dumps({"id": call_id, "method": "Runtime.callFunctionOn",
+                "params": {"objectId": obj_id, "returnByValue": True,
+                    "functionDeclaration": "function(){{ var el=this; {} }}".format(ref_pred)}}))
+            try:
+                pr = _recv_for_id(ws, call_id)
+            except websocket.WebSocketTimeoutException:
+                return None
+            return (pr.get("result", {}).get("result", {}) or {}).get("value") is True
+
+        try:
+            if actionable:
+                call_id += 1
+                ws.send(json.dumps({"id": call_id, "method": "DOM.scrollIntoViewIfNeeded",
+                    "params": {"backendNodeId": ref_val}}))
+                sr = _recv_for_id(ws, call_id)
+                if "error" in sr:
+                    print(_REF_STALE_MSG.format(ref_val))
+                    return 1
+            while True:
+                val = ref_poll()
+                now = time.time()
+                if val == "stale":
+                    print(_REF_STALE_MSG.format(ref_val))
+                    return 1
+                if val is not None:
+                    if val:
+                        ever_true = True
+                        if streak_start is None:
+                            streak_start = now
+                        held_ms = (now - streak_start) * 1000
+                        longest_ms = max(longest_ms, held_ms)
+                        if held_ms >= stable_ms:
+                            total = int((now - start) * 1000)
+                            print("ASSERT_PASS {} held {}ms (total {}ms{})".format(
+                                what, int(held_ms), total,
+                                ", flapped {}x first".format(flaps) if flaps else ""))
+                            log("assert", what=what[:60], result="pass",
+                                held_ms=int(held_ms), flaps=flaps)
+                            return 0
+                    else:
+                        if streak_start is not None:
+                            flaps += 1
+                        streak_start = None
+                if now >= deadline:
+                    break
+                time.sleep(0.1)
+        except (websocket.WebSocketException, json.JSONDecodeError, OSError) as e:
+            print("WebSocket I/O error: {}".format(e), file=sys.stderr)
+            return 1
+        finally:
+            ws.close()
+        if not ever_true:
+            reason = "never true within {}s".format(timeout_s)
+        elif flaps:
+            reason = ("unstable: flapped {}x (longest true streak {}ms < stable {}ms)"
+                      .format(flaps, int(longest_ms), stable_ms))
+        else:
+            reason = "true but held only {}ms < stable {}ms at timeout".format(
+                int(longest_ms), stable_ms)
+        print("ASSERT_FAIL {} — {}".format(what, reason))
+        log("assert", what=what[:60], result="fail", flaps=flaps)
         return 1
     if not args:
         print("Usage: cdp.py assert [--js] EXPR_OR_SELECTOR [--visible|--actionable] "
@@ -1126,6 +1538,45 @@ def cmd_reload(args):
 
 def cmd_click(args):
     args, require_trusted = _pop_flag(args, "--require-trusted")
+    args, ref_val = _pop_num(args, "--ref", int, None)
+    if ref_val is not None:
+        if args:
+            print("Usage: cdp.py click --ref N (no selector with --ref)")
+            return 1
+        if not has_websocket():
+            print("ERROR: click --ref requires websocket-client", file=sys.stderr)
+            return 1
+        tab = get_tab(TARGET)
+        import websocket
+        try:
+            ws = websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=30)
+        except (websocket.WebSocketException, OSError, ConnectionError) as e:
+            print("WebSocket connect failed: {}".format(e), file=sys.stderr)
+            return 1
+        try:
+            result = _ref_hit_test(ws, ref_val)
+            if result is None:
+                return 1
+            cx, cy, tag, hittable, obj_id = result
+            if not hittable:
+                print("CLICK_REF_NOT_HITTABLE: ref {} (hidden/occluded)"
+                      " — refusing dispatch".format(ref_val))
+                return 1
+            call_id = 100
+            for evt_type, buttons in [("mousePressed", 1), ("mouseReleased", 0)]:
+                call_id += 1
+                ws.send(json.dumps({"id": call_id, "method": "Input.dispatchMouseEvent",
+                    "params": {"type": evt_type, "x": cx, "y": cy,
+                               "button": "left", "buttons": buttons, "clickCount": 1}}))
+                _recv_for_id(ws, call_id)
+            print("clicked {} (trusted, ref={})".format(tag, ref_val))
+            log("click", channel="cdp", ref=ref_val, trusted="yes")
+            return 0
+        except (websocket.WebSocketException, json.JSONDecodeError, OSError) as e:
+            print("WebSocket I/O error: {}".format(e), file=sys.stderr)
+            return 1
+        finally:
+            ws.close()
     if not args:
         print("Usage: cdp.py click SELECTOR [--require-trusted]")
         return 1
@@ -1225,6 +1676,49 @@ def cmd_click(args):
     return 0
 
 def cmd_fill(args):
+    args, ref_val = _pop_num(list(args), "--ref", int, None)
+    if ref_val is not None:
+        if len(args) != 1:
+            print("Usage: cdp.py fill --ref N VALUE")
+            return 1
+        value = args[0]
+        if not has_websocket():
+            print("ERROR: fill --ref requires websocket-client", file=sys.stderr)
+            return 1
+        tab = get_tab(TARGET)
+        import websocket
+        try:
+            ws = websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=30)
+        except (websocket.WebSocketException, OSError, ConnectionError) as e:
+            print("WebSocket connect failed: {}".format(e), file=sys.stderr)
+            return 1
+        try:
+            result = _ref_resolve(ws, ref_val)
+            if result is None:
+                return 1
+            obj_id, tag = result
+            call_id = 1
+            call_id += 1
+            ws.send(json.dumps({"id": call_id, "method": "Runtime.callFunctionOn",
+                "params": {"objectId": obj_id, "returnByValue": True,
+                    "functionDeclaration": "function(v){ this.value=v;"
+                        " this.dispatchEvent(new Event('input',{bubbles:true}));"
+                        " this.dispatchEvent(new Event('change',{bubbles:true}));"
+                        " return 'filled ' + this.tagName; }",
+                    "arguments": [{"value": value}]}}))
+            r = _recv_for_id(ws, call_id)
+            if "error" in r:
+                print(_REF_STALE_MSG.format(ref_val))
+                return 1
+            val = (r.get("result", {}).get("result", {}) or {}).get("value", "?")
+            print(val)
+            log("fill", channel="cdp", ref=ref_val)
+            return 0
+        except (websocket.WebSocketException, json.JSONDecodeError, OSError) as e:
+            print("WebSocket I/O error: {}".format(e), file=sys.stderr)
+            return 1
+        finally:
+            ws.close()
     if len(args) < 2:
         print("Usage: cdp.py fill SELECTOR VALUE")
         return 1
@@ -1477,6 +1971,513 @@ def cmd_window(args):
     log("window", action=action)
     return 0
 
+_DND_JS = """function(target){
+  var dt = new DataTransfer();
+  var fire = function(el, type){
+    var ev = new DragEvent(type, {bubbles: true, cancelable: true, dataTransfer: dt});
+    el.dispatchEvent(ev);
+  };
+  fire(this, 'dragstart');
+  fire(target, 'dragenter');
+  fire(target, 'dragover');
+  fire(target, 'drop');
+  fire(this, 'dragend');
+  return 'dnd-dispatched';
+}"""
+
+
+def _measure_selector(ws_url, selector):
+    """Measure element for hover/drag. Returns dict or None."""
+    sel = json.dumps(selector)
+    measure = ("(function(){ var el=document.querySelector(" + sel + ");"
+               " if(!el) return {found:false};"
+               " el.scrollIntoView({block:'center',inline:'center',behavior:'instant'});"
+               " var r=el.getBoundingClientRect();"
+               " var cx=r.left+r.width/2, cy=r.top+r.height/2;"
+               " var hit=document.elementFromPoint(cx,cy);"
+               " return {found:true,cx:cx,cy:cy,tag:el.tagName,"
+               " hittable:(r.width>0 && r.height>0 && !!hit && (hit===el||el.contains(hit)))}; })()")
+    mr = ws_send(ws_url, "Runtime.evaluate", {"expression": measure, "returnByValue": True})
+    if mr is None:
+        return None
+    return (mr.get("result", {}).get("result") or {}).get("value")
+
+
+def cmd_drag(args):
+    """Drag element — selector pair or --ref pair (§4.7). websocket-only."""
+    if not has_websocket():
+        print("ERROR: drag requires websocket-client (CDP Input domain)",
+              file=sys.stderr)
+        return 1
+    args, html5 = _pop_flag(list(args), "--html5")
+    args, cancel = _pop_flag(args, "--cancel")
+    if html5 and cancel:
+        print("Usage: --cancel and --html5 are mutually exclusive")
+        return 1
+    args, ref_val = _pop_num(args, "--ref", int, None)
+    args, to_ref = _pop_num(args, "--to-ref", int, None)
+
+    if ref_val is not None:
+        if args or to_ref is None:
+            print("Usage: cdp.py drag --ref N --to-ref M [--html5 | --cancel]")
+            return 1
+        tab = get_tab(TARGET)
+        import websocket
+        try:
+            ws = websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=30)
+        except (websocket.WebSocketException, OSError, ConnectionError) as e:
+            print("WebSocket connect failed: {}".format(e), file=sys.stderr)
+            return 1
+        cid = [0]
+
+        def call(method, params):
+            cid[0] += 1
+            ws.send(json.dumps({"id": cid[0], "method": method, "params": params}))
+            return _recv_for_id(ws, cid[0])
+
+        try:
+            call("DOM.getDocument", {})
+            if html5:
+                sr = call("DOM.resolveNode", {"backendNodeId": ref_val})
+                if "error" in sr:
+                    print(_REF_STALE_MSG.format(ref_val)); return 1
+                src_oid = sr.get("result", {}).get("object", {}).get("objectId")
+                if not src_oid:
+                    print(_REF_STALE_MSG.format(ref_val)); return 1
+                dr = call("DOM.resolveNode", {"backendNodeId": to_ref})
+                if "error" in dr:
+                    print(_REF_STALE_MSG.format(to_ref)); return 1
+                dst_oid = dr.get("result", {}).get("object", {}).get("objectId")
+                if not dst_oid:
+                    print(_REF_STALE_MSG.format(to_ref)); return 1
+                r = call("Runtime.callFunctionOn", {
+                    "objectId": src_oid, "returnByValue": True,
+                    "functionDeclaration": _DND_JS,
+                    "arguments": [{"objectId": dst_oid}]})
+                if "error" in r:
+                    print(_REF_STALE_MSG.format(ref_val)); return 1
+                sr2 = call("Runtime.callFunctionOn", {
+                    "objectId": src_oid, "returnByValue": True,
+                    "functionDeclaration": "function(){ return this.tagName; }"})
+                dr2 = call("Runtime.callFunctionOn", {
+                    "objectId": dst_oid, "returnByValue": True,
+                    "functionDeclaration": "function(){ return this.tagName; }"})
+                st = (sr2.get("result", {}).get("result", {}) or {}).get("value", "?")
+                dt = (dr2.get("result", {}).get("result", {}) or {}).get("value", "?")
+                print("dragged {} -> {} (html5)".format(st, dt))
+                log("drag", mode="html5", ref=ref_val, to_ref=to_ref)
+                return 0
+            # mouse-series ref path
+            src_ht = _ref_hit_test(ws, ref_val)
+            if src_ht is None:
+                return 1
+            sx, sy, s_tag, s_hit, _ = src_ht
+            if not s_hit:
+                print("DRAG_NOT_HITTABLE: src ref {} (hidden/occluded)".format(ref_val))
+                return 1
+            dst_ht = _ref_hit_test(ws, to_ref)
+            if dst_ht is None:
+                return 1
+            dx, dy, d_tag, d_hit, _ = dst_ht
+            if not d_hit and not cancel:
+                print("DRAG_NOT_HITTABLE: dst ref {} (hidden/occluded)".format(to_ref))
+                return 1
+            return _drag_mouse_dispatch(ws, cid, sx, sy, dx, dy, s_tag, d_tag, cancel, ref_val)
+        except (websocket.WebSocketException, json.JSONDecodeError, OSError) as e:
+            print("WebSocket I/O error: {}".format(e), file=sys.stderr)
+            return 1
+        finally:
+            ws.close()
+
+    if to_ref is not None:
+        print("Usage: --to-ref requires --ref (homogeneous pair)")
+        return 1
+    if len(args) < 2:
+        print("Usage: cdp.py drag SRC_SEL DST_SEL [--html5 | --cancel]")
+        return 1
+    src_sel, dst_sel = args[0], args[1]
+    tab = get_tab(TARGET)
+    ws_url = tab["webSocketDebuggerUrl"]
+
+    if html5:
+        sel_s = json.dumps(src_sel)
+        sel_d = json.dumps(dst_sel)
+        expr = ("(function(){{ var s=document.querySelector({ss});"
+                " var d=document.querySelector({ds});"
+                " if(!s) return {{err:'src not found'}};"
+                " if(!d) return {{err:'dst not found'}};"
+                " var dt=new DataTransfer();"
+                " function fire(el,t){{el.dispatchEvent(new DragEvent(t,"
+                "{{bubbles:true,cancelable:true,dataTransfer:dt}}));}}"
+                " fire(s,'dragstart');fire(d,'dragenter');fire(d,'dragover');"
+                " fire(d,'drop');fire(s,'dragend');"
+                " return {{stag:s.tagName,dtag:d.tagName}}; }})()").format(
+                    ss=sel_s, ds=sel_d)
+        r = ws_send(ws_url, "Runtime.evaluate", {"expression": expr, "returnByValue": True})
+        if r is None:
+            return 1
+        val = (r.get("result", {}).get("result") or {}).get("value", {})
+        if isinstance(val, dict) and "err" in val:
+            print("ERROR: {}".format(val["err"]), file=sys.stderr)
+            return 1
+        st = val.get("stag", "?") if isinstance(val, dict) else "?"
+        dt_tag = val.get("dtag", "?") if isinstance(val, dict) else "?"
+        print("dragged {} -> {} (html5)".format(st, dt_tag))
+        log("drag", mode="html5", src=src_sel, dst=dst_sel)
+        return 0
+
+    src_m = _measure_selector(ws_url, src_sel)
+    if not isinstance(src_m, dict) or not src_m.get("found"):
+        print("ERROR: src '{}' not found".format(src_sel), file=sys.stderr)
+        return 1
+    dst_m = _measure_selector(ws_url, dst_sel)
+    if not isinstance(dst_m, dict) or not dst_m.get("found"):
+        print("ERROR: dst '{}' not found".format(dst_sel), file=sys.stderr)
+        return 1
+    if not src_m.get("hittable"):
+        print("DRAG_NOT_HITTABLE: src '{}' (hidden/occluded)".format(src_sel))
+        return 1
+    if not dst_m.get("hittable") and not cancel:
+        print("DRAG_NOT_HITTABLE: dst '{}' (hidden/occluded)".format(dst_sel))
+        return 1
+
+    import websocket
+    try:
+        ws = websocket.create_connection(ws_url, timeout=30)
+    except (websocket.WebSocketException, OSError, ConnectionError) as e:
+        print("WebSocket connect failed: {}".format(e), file=sys.stderr)
+        return 1
+    cid = [0]
+    try:
+        return _drag_mouse_dispatch(ws, cid,
+            src_m["cx"], src_m["cy"], dst_m["cx"], dst_m["cy"],
+            src_m.get("tag", "?"), dst_m.get("tag", "?"), cancel)
+    except (websocket.WebSocketException, json.JSONDecodeError, OSError) as e:
+        print("WebSocket I/O error: {}".format(e), file=sys.stderr)
+        return 1
+    finally:
+        ws.close()
+
+
+def _drag_mouse_dispatch(ws, cid, sx, sy, dx, dy, s_tag, d_tag, cancel, ref=None):
+    """Shared mouse-series drag dispatch (default + --cancel)."""
+    def send(method, params):
+        cid[0] += 1
+        ws.send(json.dumps({"id": cid[0], "method": method, "params": params}))
+        _recv_for_id(ws, cid[0])
+
+    send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": sx, "y": sy})
+    send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": sx, "y": sy,
+         "button": "left", "buttons": 1, "clickCount": 1})
+
+    steps = 5
+    end_step = steps // 2 if cancel else steps
+    for i in range(1, end_step + 1):
+        mx = sx + (dx - sx) * i / steps
+        my = sy + (dy - sy) * i / steps
+        send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": mx, "y": my,
+             "buttons": 1})
+
+    if cancel:
+        send("Input.dispatchKeyEvent", {"type": "rawKeyDown",
+             "windowsVirtualKeyCode": 27, "code": "Escape", "key": "Escape"})
+        send("Input.dispatchKeyEvent", {"type": "keyUp",
+             "windowsVirtualKeyCode": 27, "code": "Escape", "key": "Escape"})
+        send("Input.dispatchMouseEvent", {"type": "mouseReleased",
+             "x": mx, "y": my, "button": "left", "buttons": 0, "clickCount": 1})
+        print("DRAG_CANCELLED {} (esc)".format(s_tag))
+        log("drag", mode="cancel", src_tag=s_tag)
+        return 0
+
+    send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": dx, "y": dy,
+         "button": "left", "buttons": 0, "clickCount": 1})
+    print("dragged {} -> {} (mouse)".format(s_tag, d_tag))
+    log("drag", mode="mouse", src_tag=s_tag, dst_tag=d_tag)
+    return 0
+
+
+def cmd_hover(args):
+    """Hover over element — selector or --ref (§4.6). websocket-only."""
+    if not has_websocket():
+        print("ERROR: hover requires websocket-client (CDP Input domain)",
+              file=sys.stderr)
+        return 1
+    args, ref_val = _pop_num(list(args), "--ref", int, None)
+    if ref_val is not None:
+        if args:
+            print("Usage: cdp.py hover --ref N (no selector with --ref)")
+            return 1
+        tab = get_tab(TARGET)
+        import websocket
+        try:
+            ws = websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=30)
+        except (websocket.WebSocketException, OSError, ConnectionError) as e:
+            print("WebSocket connect failed: {}".format(e), file=sys.stderr)
+            return 1
+        try:
+            result = _ref_hit_test(ws, ref_val)
+            if result is None:
+                return 1
+            cx, cy, tag, hittable, obj_id = result
+            if not hittable:
+                print("HOVER_NOT_HITTABLE: ref {} (hidden/occluded)".format(ref_val))
+                return 1
+            cid = 200
+            cid += 1
+            ws.send(json.dumps({"id": cid, "method": "Input.dispatchMouseEvent",
+                "params": {"type": "mouseMoved", "x": cx, "y": cy}}))
+            _recv_for_id(ws, cid)
+            print("hovered {} (ref={})".format(tag, ref_val))
+            log("hover", channel="cdp", ref=ref_val)
+            return 0
+        except (websocket.WebSocketException, json.JSONDecodeError, OSError) as e:
+            print("WebSocket I/O error: {}".format(e), file=sys.stderr)
+            return 1
+        finally:
+            ws.close()
+    if not args:
+        print("Usage: cdp.py hover SELECTOR | hover --ref N")
+        return 1
+    selector = args[0]
+    tab = get_tab(TARGET)
+    ws_url = tab["webSocketDebuggerUrl"]
+    meas = _measure_selector(ws_url, selector)
+    if not isinstance(meas, dict) or not meas.get("found"):
+        print("ERROR: '{}' not found".format(selector), file=sys.stderr)
+        return 1
+    tag = meas.get("tag", "?")
+    hittable = meas.get("hittable", False)
+    if not hittable:
+        print("HOVER_NOT_HITTABLE: '{}' (hidden/occluded)".format(selector))
+        return 1
+    cx, cy = meas["cx"], meas["cy"]
+    hr = ws_send(ws_url, "Input.dispatchMouseEvent",
+                 {"type": "mouseMoved", "x": cx, "y": cy})
+    if hr is None:
+        return 1
+    print("hovered {}".format(tag))
+    log("hover", channel="cdp", selector=selector)
+    return 0
+
+
+KEYDEFS = {
+    "Enter": {"windowsVirtualKeyCode": 13, "code": "Enter", "key": "Enter", "text": "\r"},
+    "Escape": {"windowsVirtualKeyCode": 27, "code": "Escape", "key": "Escape"},
+    "Tab": {"windowsVirtualKeyCode": 9, "code": "Tab", "key": "Tab"},
+    "ArrowDown": {"windowsVirtualKeyCode": 40, "code": "ArrowDown", "key": "ArrowDown"},
+    "ArrowUp": {"windowsVirtualKeyCode": 38, "code": "ArrowUp", "key": "ArrowUp"},
+}
+
+
+def cmd_key(args):
+    """Send keyboard event to a ref-focused element (§4.5). Ref-only."""
+    if not has_websocket():
+        print("ERROR: key requires websocket-client (CDP Input domain)",
+              file=sys.stderr)
+        return 1
+    args, ref_val = _pop_num(list(args), "--ref", int, None)
+    if ref_val is None:
+        print("Usage: cdp.py key --ref N KEY\n"
+              "Supported keys: {}".format(", ".join(sorted(KEYDEFS))))
+        return 1
+    if not args:
+        print("Usage: cdp.py key --ref N KEY\n"
+              "Supported keys: {}".format(", ".join(sorted(KEYDEFS))))
+        return 1
+    key_name = args[0]
+    if key_name not in KEYDEFS:
+        print("Unknown key: {}. Supported: {}".format(
+            key_name, ", ".join(sorted(KEYDEFS))))
+        return 1
+
+    tab = get_tab(TARGET)
+    ws_url = tab["webSocketDebuggerUrl"]
+    import websocket
+    try:
+        ws = websocket.create_connection(ws_url, timeout=30)
+    except (websocket.WebSocketException, OSError, ConnectionError) as e:
+        print("WebSocket connect failed: {}".format(e), file=sys.stderr)
+        return 1
+    call_id = 0
+
+    def call(method, params):
+        nonlocal call_id
+        call_id += 1
+        ws.send(json.dumps({"id": call_id, "method": method, "params": params}))
+        r = _recv_for_id(ws, call_id)
+        if "error" in r:
+            return None
+        return r.get("result", {})
+
+    try:
+        call("DOM.getDocument", {})
+        fr = call("DOM.focus", {"backendNodeId": ref_val})
+        if fr is None:
+            print(_REF_STALE_MSG.format(ref_val))
+            return 1
+        kd = KEYDEFS[key_name]
+        down = dict(kd, type="rawKeyDown")
+        text_char = down.pop("text", None)
+        call("Input.dispatchKeyEvent", down)
+        if text_char:
+            call("Input.dispatchKeyEvent", {"type": "char", "text": text_char})
+        up = {k: v for k, v in kd.items() if k != "text"}
+        up["type"] = "keyUp"
+        call("Input.dispatchKeyEvent", up)
+        print("pressed {} (ref={})".format(key_name, ref_val))
+        log("key", ref=ref_val, key=key_name)
+        return 0
+    except (websocket.WebSocketException, json.JSONDecodeError, OSError) as e:
+        print("WebSocket I/O error: {}".format(e), file=sys.stderr)
+        return 1
+    finally:
+        ws.close()
+
+
+def cmd_ax(args):
+    """Accessibility tree snapshot (§3). websocket-only."""
+    if not has_websocket():
+        print("ERROR: ax requires websocket-client (CDP Accessibility domain)",
+              file=sys.stderr)
+        return 1
+    args, raw = _pop_flag(args, "--raw")
+    args, max_nodes = _pop_num(args, "--max-nodes", int, 500)
+    if max_nodes is None:
+        return 1
+    args, ref_val = _pop_num(args, "--ref", int, None)
+
+    tab = get_tab(TARGET)
+    ws_url = tab["webSocketDebuggerUrl"]
+    import websocket
+    try:
+        ws = websocket.create_connection(ws_url, timeout=30)
+    except (websocket.WebSocketException, OSError, ConnectionError) as e:
+        print("WebSocket connect failed: {}".format(e), file=sys.stderr)
+        return 1
+    call_id = 0
+
+    def call(method, params=None):
+        nonlocal call_id
+        call_id += 1
+        msg = {"id": call_id, "method": method}
+        if params is not None:
+            msg["params"] = params
+        ws.send(json.dumps(msg))
+        r = _recv_for_id(ws, call_id)
+        if "error" in r:
+            err = r["error"]
+            print("CDP error: {} (code {})".format(
+                err.get("message", "unknown"), err.get("code", "?")),
+                file=sys.stderr)
+            return None
+        return r.get("result", {})
+
+    try:
+        ft = call("Page.getFrameTree")
+        if ft is None:
+            return 1
+        frame_tree = ft.get("frameTree", {})
+        frame_ids = [frame_tree.get("frame", {}).get("id")]
+        frame_urls = [""]
+
+        def walk_children(tree_node):
+            for child in tree_node.get("childFrames", []):
+                f = child.get("frame", {})
+                frame_ids.append(f.get("id"))
+                frame_urls.append(f.get("url", ""))
+                walk_children(child)
+        walk_children(frame_tree)
+
+        shadow_map = {}
+        doc = call("DOM.getDocument", {"depth": -1, "pierce": True})
+        if doc is not None:
+            def _walk_dom(node):
+                nid = node.get("backendNodeId")
+                for sr in node.get("shadowRoots", []):
+                    sr_type = sr.get("shadowRootType", "open")
+                    if nid:
+                        shadow_map[nid] = sr_type
+                    _walk_dom(sr)
+                for child in node.get("children", []):
+                    _walk_dom(child)
+            _walk_dom(doc.get("root", {}))
+
+        frame_node_lists = []
+        for fid in frame_ids:
+            if fid is None:
+                frame_node_lists.append([])
+                continue
+            r = call("Accessibility.getFullAXTree", {"frameId": fid})
+            if r is None:
+                if fid == frame_ids[0]:
+                    return 1
+                print("WARN: frame AX retrieval failed (skipped)",
+                      file=sys.stderr)
+                frame_node_lists.append([])
+            else:
+                frame_node_lists.append(r.get("nodes", []))
+
+        if ref_val is not None:
+            for fi, nodes in enumerate(frame_node_lists):
+                target_node = next(
+                    (n for n in nodes if n.get("backendDOMNodeId") == ref_val),
+                    None)
+                if target_node is not None:
+                    by_id = {n["nodeId"]: n for n in nodes}
+                    subtree = []
+                    sub_visited = set()
+
+                    def collect(n):
+                        if n["nodeId"] in sub_visited:
+                            return
+                        sub_visited.add(n["nodeId"])
+                        subtree.append(n)
+                        for cid in (n.get("childIds") or []):
+                            child = by_id.get(cid)
+                            if child is not None:
+                                collect(child)
+                    collect(target_node)
+                    subtree[0] = dict(target_node)
+                    subtree[0].pop("parentId", None)
+
+                    sub_lines, sub_meta = _render_ax_tree(
+                        [subtree], max_nodes, raw, shadow_map)
+                    sub_meta["frames"] = fi + 1
+                    header = "AX_OK nodes={} shown={} frames={}".format(
+                        sub_meta["nodes"], sub_meta["shown"], sub_meta["frames"])
+                    if sub_meta["truncated"]:
+                        header += " truncated=1"
+                    print(header)
+                    print("\n".join(sub_lines))
+                    log("ax", ref=ref_val, nodes=sub_meta["nodes"],
+                        shown=sub_meta["shown"])
+                    return 0
+            print("REF_STALE: ref {} not resolvable"
+                  " — re-run ax for fresh refs".format(ref_val))
+            return 1
+
+        lines, meta = _render_ax_tree(
+            frame_node_lists, max_nodes, raw, shadow_map,
+            frame_urls=frame_urls)
+        header = "AX_OK nodes={} shown={} frames={}".format(
+            meta["nodes"], meta["shown"], meta["frames"])
+        if meta["truncated"]:
+            header += " truncated=1"
+        print(header)
+        print("\n".join(lines))
+        if meta["oopif_count"] > 0:
+            print("WARN: {} out-of-process iframe(s) not included".format(
+                meta["oopif_count"]), file=sys.stderr)
+        log("ax", nodes=meta["nodes"], shown=meta["shown"],
+            frames=meta["frames"])
+        return 0
+    except (websocket.WebSocketException, json.JSONDecodeError, OSError) as e:
+        print("WebSocket I/O error: {}".format(e), file=sys.stderr)
+        return 1
+    finally:
+        ws.close()
+
+
 COMMANDS = {
     "status": cmd_status,
     "tabs": cmd_tabs,
@@ -1497,12 +2498,23 @@ COMMANDS = {
     "pdf": cmd_pdf,
     "viewport": cmd_viewport,
     "window": cmd_window,
+    "ax": cmd_ax,
+    "key": cmd_key,
+    "hover": cmd_hover,
+    "drag": cmd_drag,
 }
 
 def main(argv):
     """Parse the global --target/--tab selector (from anywhere in argv) into the
     module global TARGET, then dispatch the command. --target requires the
     CDP/websocket channel (fail loud otherwise)."""
+    import io
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+    elif isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, errors="replace",
+            line_buffering=sys.stdout.line_buffering)
     global TARGET
     TARGET = None
     rest = []

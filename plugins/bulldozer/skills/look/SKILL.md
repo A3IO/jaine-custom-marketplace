@@ -60,7 +60,13 @@ Auto-detected: `cdp.py status` shows active channel. Fallback is transparent —
 
 **Known Chrome behavior (Chromium #543437):** AppleScript `execute javascript` runs in isolated world — page variables invisible. Our DOM injection bridge solves this: injects `<script>` tag (runs in main world), writes result to `dataset`, reads back. Automatic in `cdp.py js`.
 
-## Quick Reference — 17 Commands
+## Shared or isolated — decide BEFORE your first command
+
+**Port 9333** = the user's live browser (cookies, logins, co-browsing). Use `open` + `--target` to work in a new tab; do NOT `navigate` the active tab away from the user's page.
+
+**Your own task** (file://, localhost preview, UI iteration) → launch an **isolated lane** (`CDP_PORT=0 --automation` for ephemeral, or a named port). This keeps you from touching the user's session.
+
+## Quick Reference
 
 ```bash
 CDP="${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py"
@@ -84,12 +90,27 @@ python3 "$CDP" screenshot [FILE] [--full-page] [--clip X Y W H] [--scale N]
   # Always prints "PATH  W×H" on stdout — verify actual dimensions before any cropping.
 python3 "$CDP" title                     # page title
 python3 "$CDP" html                      # full HTML (CDP only)
+python3 "$CDP" ax [--max-nodes N] [--raw] [--ref N]  # accessibility tree snapshot (CDP only)
+  # Playwright-parity format: roles, states, [ref=N] for interactive elements
+  # AX_OK header + tree body; --ref N for scoped subtree; --raw disables filters
 
 # Execute
 python3 "$CDP" js 'EXPRESSION'           # JS in main world
+python3 "$CDP" js --ref N 'EXPR'         # EXPR with `el` bound to ref element (CDP only)
 python3 "$CDP" wait [--js] SELECTOR_OR_EXPR [TIMEOUT]  # CSS selector; --js for JS expression
 python3 "$CDP" click SELECTOR            # click element (trusted gesture on CDP channel)
+python3 "$CDP" click --ref N             # click by AX ref (always trusted, no fallback, CDP only)
 python3 "$CDP" fill SELECTOR VALUE       # fill input + dispatch events
+python3 "$CDP" fill --ref N VALUE        # fill by AX ref (CDP only)
+python3 "$CDP" hover SELECTOR            # hover element, triggers CSS :hover (CDP only)
+python3 "$CDP" hover --ref N             # hover by AX ref (CDP only)
+python3 "$CDP" key --ref N KEY           # send key to ref element (CDP only; Enter/Escape/Tab/ArrowDown/ArrowUp)
+python3 "$CDP" drag SRC DST [--html5|--cancel]  # drag (CDP only; mouse default, --html5 for DnD, --cancel for Esc)
+python3 "$CDP" drag --ref N --to-ref M [--html5|--cancel]  # drag by AX ref pair (CDP only)
+
+# Verify
+python3 "$CDP" assert [--js] EXPR_OR_SEL [--visible|--actionable] [--stable MS] [--timeout S]
+python3 "$CDP" assert --ref N [--visible|--actionable] [--stable MS] [--timeout S]  # (CDP only)
 
 # Debug
 python3 "$CDP" console                   # console messages + uncaught exceptions (CDP only)
@@ -226,6 +247,11 @@ unaffected.
 
 ## Decision Rules (for JAINE)
 
+**ax vs screenshot — choose by what you need:**
+- **Text/states/structure** (what's on the page, is button disabled, what's in the table, form values) → `ax`. Cheapest structured channel: ~200-600 tokens vs 1300-1600 for screenshot. Absence of `[disabled]` = element is enabled.
+- **Layout/color/visual/pixels** (alignment, overlapping, canvas content, CSS styling) → `screenshot`. Do NOT replace screenshot with ax for visual checks — ax has no geometry.
+- **Interaction after reading** → `ax` then `click/fill/key --ref N` (ref from snapshot). No CSS selectors needed.
+
 **screenshot:**
 - `--full-page` — verify below-fold content (long pages, tables, grids). Omit for quick viewport checks.
 - `--clip X Y W H` — capture a CSS-pixel region (mutually exclusive with `--full-page`). Use for UI-detail verification. Output dimensions are W × H × native DPR by default — pair with `--scale 1` for exact W×H CSS-pixel output.
@@ -344,6 +370,8 @@ Review: `column -t -s'|' ~/.claude/hooks/bulldozer-look.log`
 | navigate, reload | WebSocket | AppleScript | — |
 | screenshot | WebSocket | — | screencapture |
 | html, console, network, pdf | WebSocket | unavailable | — |
+| ax, hover, key, drag | WebSocket | unavailable (CDP only) | — |
+| assert, `--ref` variants | WebSocket | unavailable (CDP only) | — |
 | viewport | WebSocket | window bounds (approximate) | — |
 | window | WebSocket (bounds) | AppleScript (bounds fallback; upper/lower/activate) | — |
 | `--target` | WebSocket (required) | — (active tab only) | — |

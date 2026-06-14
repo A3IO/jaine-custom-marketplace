@@ -485,11 +485,13 @@ def test_status_shows_channel():
 
 
 def test_all_commands_registered():
-    """All 18 agent-facing commands must be in COMMANDS dict (17 look + assert)."""
+    """All commands must be in COMMANDS dict (look-facing + verify-core + internal + new)."""
     expected = {
         "status", "tabs", "screenshot", "js", "navigate", "open",
         "title", "html", "reload", "wait", "assert", "click", "fill",
         "console", "network", "pdf", "viewport", "window",
+        "normalize-url",
+        "ax", "hover", "key", "drag",
     }
     source = Path(CDP_SCRIPT).read_text()
     for cmd in expected:
@@ -536,11 +538,12 @@ def test_navigate_fallback_to_applescript():
 
 
 def test_help_shows_all_commands():
-    """--help must list all 18 agent-facing commands (17 look + assert)."""
+    """--help must list all agent-facing commands."""
     r = run_cdp(["--help"])
     for cmd in ["status", "tabs", "screenshot", "js", "navigate", "open",
                  "title", "html", "reload", "wait", "assert", "click", "fill",
-                 "console", "network", "pdf", "viewport", "window"]:
+                 "console", "network", "pdf", "viewport", "window",
+                 "ax", "hover", "key", "drag"]:
         assert cmd in r.stdout, f"--help missing '{cmd}' command"
 
 
@@ -2085,6 +2088,241 @@ if __name__ == "__main__":
             failed += 1
     print(f"\n=== {passed} passed, {failed} failed ===")
     sys.exit(0 if failed == 0 else 1)
+
+
+# ── #188: surrogate-safe stdout ──
+
+
+def test_issue_188_surrogate_safe_reconfigure_in_main():
+    """main() must reconfigure stdout for surrogate safety (§5.3)."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "main":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno])
+            assert "reconfigure" in func_src or "errors" in func_src, (
+                "main() must reconfigure stdout for surrogate safety (§5.3)")
+            return
+    raise AssertionError("main function not found")
+
+
+# ── AX command (§3) ──
+
+
+def test_cmd_ax_registered():
+    """cmd_ax must be in COMMANDS dict."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert '"ax"' in source, "ax not in COMMANDS"
+
+
+def test_cmd_ax_exists():
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def cmd_ax(" in source
+
+
+def test_cmd_ax_uses_get_full_ax_tree():
+    """§3: ax must call Accessibility.getFullAXTree, NOT enable."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_ax":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno])
+            assert "getFullAXTree" in func_src, "must use getFullAXTree"
+            assert "Accessibility.enable" not in func_src, (
+                "must NOT call Accessibility.enable (perf cost)")
+            return
+    raise AssertionError("cmd_ax not found")
+
+
+def test_cmd_ax_websocket_only():
+    """§3: ax must check has_websocket() and refuse on AppleScript channel."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_ax":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno])
+            assert "has_websocket" in func_src, (
+                "cmd_ax must check has_websocket() (websocket-only command)")
+            assert "ax requires" in func_src.lower() or "websocket" in func_src.lower(), (
+                "cmd_ax must print websocket-related error on AppleScript channel")
+            return
+    raise AssertionError("cmd_ax not found")
+
+
+def test_cmd_ax_docstring():
+    """__doc__ must document ax command."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    docstring = ast.get_docstring(tree)
+    assert "ax" in docstring, "__doc__ missing ax command"
+
+
+def test_cmd_ax_pins_target():
+    """ax must use get_tab(TARGET) — not unpinned."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_ax":
+            for call in ast.walk(node):
+                if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                        and call.func.id == "get_tab"):
+                    pinned = (len(call.args) >= 1
+                              and isinstance(call.args[0], ast.Name)
+                              and call.args[0].id == "TARGET")
+                    assert pinned, "get_tab() in cmd_ax must use TARGET"
+                    return
+    raise AssertionError("cmd_ax does not call get_tab")
+
+
+# ── Drag command (§4.7) ──
+
+
+def test_cmd_drag_registered():
+    source = Path(CDP_SCRIPT).read_text()
+    assert '"drag"' in source, "drag not in COMMANDS"
+
+
+def test_cmd_drag_websocket_only():
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_drag":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno])
+            assert "has_websocket" in func_src
+            return
+    raise AssertionError("cmd_drag not found")
+
+
+# ── Hover command (§4.6) ──
+
+
+def test_cmd_hover_registered():
+    source = Path(CDP_SCRIPT).read_text()
+    assert '"hover"' in source, "hover not in COMMANDS"
+
+
+def test_cmd_hover_websocket_only():
+    """hover requires websocket (Input domain)."""
+    source = Path(CDP_SCRIPT).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_hover":
+            func_src = "\n".join(
+                source.splitlines()[node.lineno - 1 : node.end_lineno])
+            assert "has_websocket" in func_src
+            return
+    raise AssertionError("cmd_hover not found")
+
+
+# ── Key command (§4.5) ──
+
+
+def test_cmd_key_registered():
+    source = Path(CDP_SCRIPT).read_text()
+    assert '"key"' in source, "key not in COMMANDS"
+
+
+def test_cmd_key_ref_only():
+    """key is ref-only — no global key without --ref."""
+    r = run_cdp(["key", "Enter"], env_override={"CDP_PORT": "19111"})
+    assert r.returncode != 0
+    assert "--ref" in r.stdout or "ref" in r.stderr.lower() or "Usage" in r.stdout
+
+
+def test_cmd_key_unknown_key_is_error():
+    r = run_cdp(["key", "--ref", "42", "F13"],
+                env_override={"CDP_PORT": "19111"})
+    assert r.returncode != 0
+    assert "Enter" in r.stdout or "Enter" in r.stderr
+
+
+# ── Doc-test: shadow routing in drive SKILL.md (§6) ──
+
+
+class TestShadowRoutingDocTest:
+    DRIVE_SKILL = Path(__file__).parent.parent / "skills" / "drive" / "SKILL.md"
+
+    def test_shadow_routing_section_exists(self):
+        content = self.DRIVE_SKILL.read_text()
+        assert "shadow" in content.lower()
+        assert "ax" in content
+        assert "--ref" in content
+
+    def test_shadow_three_routes(self):
+        content = self.DRIVE_SKILL.read_text()
+        assert "semantic" in content.lower() or "button" in content.lower()
+        assert "canvas" in content.lower()
+        assert "screenshot" in content
+
+    def test_shadow_marker_documented(self):
+        content = self.DRIVE_SKILL.read_text()
+        assert "[shadow=" in content
+
+
+# ── Parser matrix (§6 — per-command, NOT generic) ──
+
+
+class TestParserMatrix:
+    """§6: per-command --ref grammar. Generic 'ref+positional=error' was a bug."""
+
+    def test_click_ref_plus_selector_is_error(self):
+        r = run_cdp(["click", "--ref", "42", ".btn"],
+                    env_override={"CDP_PORT": "19111"})
+        assert r.returncode != 0
+
+    def test_click_ref_alone_accepted(self):
+        r = run_cdp(["click", "--ref", "42"],
+                    env_override={"CDP_PORT": "19111"})
+        assert "Usage" not in r.stdout
+
+    def test_fill_ref_needs_value(self):
+        r = run_cdp(["fill", "--ref", "42"],
+                    env_override={"CDP_PORT": "19111"})
+        assert r.returncode != 0
+
+    def test_fill_ref_with_value_accepted(self):
+        r = run_cdp(["fill", "--ref", "42", "hello"],
+                    env_override={"CDP_PORT": "19111"})
+        assert "Usage" not in r.stdout
+
+    def test_js_ref_needs_expr(self):
+        r = run_cdp(["js", "--ref", "42"],
+                    env_override={"CDP_PORT": "19111"})
+        assert r.returncode != 0
+
+    def test_js_ref_with_expr_accepted(self):
+        r = run_cdp(["js", "--ref", "42", "el.tagName"],
+                    env_override={"CDP_PORT": "19111"})
+        assert "Usage" not in r.stdout
+
+    def test_assert_ref_plus_selector_is_error(self):
+        r = run_cdp(["assert", "--ref", "42", ".btn"],
+                    env_override={"CDP_PORT": "19111"})
+        assert r.returncode != 0
+
+    def test_hover_ref_plus_selector_is_error(self):
+        r = run_cdp(["hover", "--ref", "42", ".btn"],
+                    env_override={"CDP_PORT": "19111"})
+        assert r.returncode != 0
+
+    def test_drag_mixed_ref_selector_is_error(self):
+        r = run_cdp(["drag", "--ref", "42", ".dst"],
+                    env_override={"CDP_PORT": "19111"})
+        assert r.returncode != 0
+
+    def test_drag_cancel_plus_html5_is_error(self):
+        r = run_cdp(["drag", "--cancel", "--html5", "src", "dst"],
+                    env_override={"CDP_PORT": "19111"})
+        assert r.returncode != 0
+
+    def test_ref_non_numeric_is_error(self):
+        r = run_cdp(["click", "--ref", "abc"],
+                    env_override={"CDP_PORT": "19111"})
+        assert r.returncode != 0
 
 
 class TestAssertStructural:

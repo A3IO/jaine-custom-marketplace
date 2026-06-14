@@ -283,15 +283,22 @@ serve CDP for a few seconds after SIGTERM):
 Selector-based `assert` uses `document.querySelector` — two DOM structures need
 `--js` instead:
 
-**Shadow DOM** (wavesurfer, Shoelace, web components): querySelector doesn't pierce
-shadow boundaries. Use `--js` to traverse manually:
-```bash
-assert --js "!!document.querySelector('waveform-element')?.shadowRoot?.querySelector('canvas')"
-```
+**Shadow DOM — three-route routing** (wavesurfer, Shoelace, web components):
+
+The `ax` snapshot sees through shadow DOM including **closed** roots (the only
+channel that can — `.shadowRoot` returns null for closed). Shadow hosts appear with
+`[shadow=open]` or `[shadow=closed]` markers in the snapshot.
+
+| What's inside shadow | Route | Example |
+|---|---|---|
+| **Semantic elements** (buttons, inputs, headings) | `ax` → `assert/click --ref N` | Button in closed Shoelace component — `ax` shows it with `[ref=N]`, click it directly |
+| **Canvas / non-semantic** (open shadow) | `--js` with `.shadowRoot` | `assert --js "!!document.querySelector('waveform-element')?.shadowRoot?.querySelector('canvas')"` |
+| **Canvas / non-semantic** (closed shadow) | `screenshot` | No AX node, no JS access — visual channel only |
 
 **Reactive frameworks** (Alpine `x-if`, Vue `v-if`, React conditional render): the
 element may be removed and re-inserted during a reactive cycle → flap → stability
-window resets. Assert on **reactive state**, not DOM presence:
+window resets. Assert on **reactive state**, not DOM presence (ref also stales on
+re-insert — honest `REF_STALE`, not a solution for this class):
 ```bash
 # Alpine: check the data property, not the DOM node
 assert --js "Alpine.\$data(document.querySelector('[x-data]')).showPopup === true" --stable 300
@@ -300,6 +307,12 @@ assert --js "Alpine.\$data(document.querySelector('[x-data]')).showPopup === tru
 When neither pattern applies and you see `ASSERT_FAIL never true`, use
 `screenshot` as ground truth — if the screenshot shows the element, the selector
 is wrong for the DOM structure (not an assert bug).
+
+**ax as default text ground truth:** For text/state verification (what's on the page,
+button states, table contents), use `ax` before `screenshot` — it's 2-6× cheaper in
+tokens and more accurate for cheap models. Always `wait` or `assert` before `ax` to
+avoid snapshotting intermediate state. The chain `ax` → `click/fill/key --ref` replaces
+the old `js querySelector → click SELECTOR` pattern with zero CSS selectors.
 
 ## Red flags — STOP and reassess
 

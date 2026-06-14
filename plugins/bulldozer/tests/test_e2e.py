@@ -596,3 +596,297 @@ def test_secure_lane_blocks_file_fetch(jaine_browser, test_server):
     target = "http://127.0.0.1:{}/lan-probe.txt".format(test_server)
     result = _fetch_result(CDP_PORT, target)  # CDP_PORT = the secure jaine_browser lane
     assert result.startswith("FAIL:"), "secure lane must block the cross-origin fetch, got {!r}".format(result)
+
+
+# ── AX & Ref-Bridge (#185) ──
+
+import re as _re
+
+AX_PAGE = os.path.join(FIXTURES_DIR, "ax-page.html")
+
+
+def _navigate_ax_page(jaine_browser):
+    r = run_cdp(["navigate", AX_PAGE, "--wait", "load"])
+    assert r.returncode == 0, "navigate failed: {}".format(r.stderr)
+
+
+def _find_ref(ax_stdout, name_substr):
+    for line in ax_stdout.splitlines():
+        m = _re.search(r'\[ref=(\d+)\]', line)
+        if m and name_substr in line:
+            return m.group(1)
+    return None
+
+
+def test_ax_grammar_first_line(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    assert r.returncode == 0, "ax failed: {}".format(r.stderr)
+    first = r.stdout.splitlines()[0]
+    assert _re.match(r'^AX_OK nodes=\d+ shown=\d+ frames=\d+( truncated=1)?$', first), \
+        "First line doesn't match AX_OK grammar: {!r}".format(first)
+
+
+def test_ax_snapshot_has_roles_and_states(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    assert r.returncode == 0
+    out = r.stdout
+    assert "button" in out
+    assert "[disabled]" in out
+    assert "[checked]" in out
+    assert "[ref=" in out
+    assert "heading" in out
+
+
+def test_ax_table_15_rows(jaine_browser):
+    """§6: fixture has 15-row table, ax must show them."""
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax", "--max-nodes", "0"])
+    assert r.returncode == 0
+    row_count = r.stdout.count("- row")
+    assert row_count >= 15, "Expected >= 15 rows, got {}".format(row_count)
+
+
+def test_ax_iframe_frame_section(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    assert r.returncode == 0
+    assert "frame:" in r.stdout
+    assert "Frame Button" in r.stdout
+
+
+def test_click_ref_from_live_snapshot(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    assert r.returncode == 0
+    ref = _find_ref(r.stdout, "Submit")
+    assert ref, "Could not find Submit button ref"
+    cr = run_cdp(["click", "--ref", ref])
+    assert cr.returncode == 0
+    assert "clicked BUTTON (trusted, ref={})".format(ref) in cr.stdout
+    jr = run_cdp(["js", "JSON.stringify(window.__actions)"])
+    assert "click:ax-btn" in jr.stdout
+
+
+def test_fill_ref_sets_value_and_events(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Search")
+    assert ref, "No Search textbox ref"
+    fr = run_cdp(["fill", "--ref", ref, "test-value"])
+    assert fr.returncode == 0
+    assert "filled" in fr.stdout.lower()
+    vr = run_cdp(["js", "document.getElementById('ax-input').value"])
+    assert "test-value" in vr.stdout
+    er = run_cdp(["js", "document.getElementById('ax-input').dataset.inputFired"])
+    assert "true" in er.stdout
+
+
+def test_js_ref_accesses_element(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Submit")
+    assert ref
+    jr = run_cdp(["js", "--ref", ref, "el.tagName"])
+    assert jr.returncode == 0
+    assert "BUTTON" in jr.stdout
+
+
+def test_assert_ref_actionable_pass(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Submit")
+    assert ref
+    ar = run_cdp(["assert", "--ref", ref, "--actionable", "--stable", "200"])
+    assert ar.returncode == 0
+    assert "ASSERT_PASS" in ar.stdout
+
+
+def test_assert_ref_occluded_fail(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Occluded AX")
+    assert ref
+    ar = run_cdp(["assert", "--ref", ref, "--actionable", "--stable", "200", "--timeout", "2"])
+    assert ar.returncode != 0
+    assert "ASSERT_FAIL" in ar.stdout
+
+
+def test_click_ref_not_hittable(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Occluded AX")
+    assert ref
+    cr = run_cdp(["click", "--ref", ref])
+    assert cr.returncode != 0
+    assert "CLICK_REF_NOT_HITTABLE" in cr.stdout
+
+
+def test_key_ref_enter_submits_form(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Form field")
+    assert ref, "No form textbox ref (look for 'Form field' label)"
+    kr = run_cdp(["key", "--ref", ref, "Enter"])
+    assert kr.returncode == 0
+    assert "pressed Enter (ref={})".format(ref) in kr.stdout
+    sr = run_cdp(["js", "window.__submitted"])
+    assert "true" in sr.stdout
+
+
+def test_hover_selector_shows_tooltip(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    hr = run_cdp(["hover", "#hover-target"])
+    assert hr.returncode == 0
+    assert "hovered DIV" in hr.stdout
+    vr = run_cdp(["js", "getComputedStyle(document.getElementById('hover-tooltip')).display"])
+    assert vr.stdout.strip() != "none"
+
+
+def test_hover_ref_path(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Submit")
+    assert ref
+    hr = run_cdp(["hover", "--ref", ref])
+    assert hr.returncode == 0
+    assert "hovered BUTTON (ref={})".format(ref) in hr.stdout
+
+
+def test_hover_not_hittable(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    hr = run_cdp(["hover", "#occluded-ax-btn"])
+    assert hr.returncode != 0
+    assert "HOVER_NOT_HITTABLE" in hr.stdout
+
+
+def test_ax_scoped_ref(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    full = run_cdp(["ax"])
+    assert full.returncode == 0
+    ref = _find_ref(full.stdout, "Submit")
+    assert ref
+    scoped = run_cdp(["ax", "--ref", ref])
+    assert scoped.returncode == 0
+    assert "AX_OK" in scoped.stdout
+    assert len(scoped.stdout) < len(full.stdout)
+
+
+def test_drag_mouse_pointer_zone(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    dr = run_cdp(["drag", "#drag-src", "#drag-dst"])
+    assert dr.returncode == 0
+    assert "dragged DIV -> DIV (mouse)" in dr.stdout
+    pr = run_cdp(["js", "window.__pointerDropped"])
+    assert "true" in pr.stdout
+
+
+def test_drag_html5_zone(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    run_cdp(["js", "window.__html5Dropped=null"])
+    dr = run_cdp(["drag", "--html5", "#html5-src", "#html5-dst"])
+    assert dr.returncode == 0
+    assert "dragged DIV -> DIV (html5)" in dr.stdout
+    pr = run_cdp(["js", "window.__html5Dropped"])
+    assert "payload-42" in pr.stdout
+
+
+def test_drag_cancel_esc(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    run_cdp(["js", "window.__actions=[]"])
+    dr = run_cdp(["drag", "--cancel", "#esc-src", "#drag-dst"])
+    assert dr.returncode == 0
+    assert "DRAG_CANCELLED" in dr.stdout and "(esc)" in dr.stdout
+    jr = run_cdp(["js", "JSON.stringify(window.__actions)"])
+    assert "esc-cancel" in jr.stdout
+
+
+def test_drag_not_hittable(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    dr = run_cdp(["drag", "#occluded-ax-btn", "#drag-dst"])
+    assert dr.returncode != 0
+    assert "DRAG_NOT_HITTABLE" in dr.stdout
+
+
+def test_ref_stale_after_reload_all_commands(jaine_browser):
+    """§4 REF_STALE: after reload, old refs stale for ALL ref-commands."""
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Submit")
+    assert ref
+    run_cdp(["reload"])
+    run_cdp(["wait", "h1", "5"])
+    for cmd_args in [
+        ["click", "--ref", ref],
+        ["fill", "--ref", ref, "x"],
+        ["js", "--ref", ref, "el.tagName"],
+        ["assert", "--ref", ref, "--timeout", "1"],
+        ["key", "--ref", ref, "Enter"],
+        ["hover", "--ref", ref],
+        ["ax", "--ref", ref],
+    ]:
+        cr = run_cdp(cmd_args)
+        assert cr.returncode != 0, "Expected REF_STALE for {}".format(cmd_args)
+        assert "REF_STALE" in cr.stdout, "Missing REF_STALE marker for {}".format(cmd_args)
+
+
+def test_shadow_markers_in_snapshot(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    assert r.returncode == 0
+    assert "[shadow=open]" in r.stdout
+    assert "[shadow=closed]" in r.stdout
+
+
+def test_assert_ref_actionable_shadow_button(jaine_browser):
+    """Regression: assert --ref --actionable must PASS on shadow buttons (shadow-walk parity with click)."""
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Shadow Open Btn")
+    assert ref
+    ar = run_cdp(["assert", "--ref", ref, "--actionable", "--stable", "200"])
+    assert ar.returncode == 0, "shadow button should be actionable (shadow-walk hit-test): {}".format(ar.stdout)
+    assert "ASSERT_PASS" in ar.stdout
+
+
+def test_shadow_open_button_clickable_via_ref(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Shadow Open Btn")
+    assert ref, "No shadow open button ref"
+    cr = run_cdp(["click", "--ref", ref])
+    assert cr.returncode == 0
+    jr = run_cdp(["js", "JSON.stringify(window.__actions)"])
+    assert "click:shadow-open" in jr.stdout
+
+
+def test_shadow_closed_button_clickable_via_ref(jaine_browser):
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Shadow Closed Btn")
+    assert ref, "No shadow closed button ref"
+    cr = run_cdp(["click", "--ref", ref])
+    assert cr.returncode == 0
+    jr = run_cdp(["js", "JSON.stringify(window.__actions)"])
+    assert "click:shadow-closed" in jr.stdout
+
+
+def test_shadow_canvas_absent_from_ax(jaine_browser):
+    """§2.5 honest negative: canvas in shadow has NO AX node."""
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax", "--raw", "--max-nodes", "0"])
+    assert r.returncode == 0
+    lines_lower = r.stdout.lower()
+    assert "canvas" not in lines_lower or "shadow" not in lines_lower.split("canvas")[0][-50:]
+
+
+def test_click_ref_child_frame(jaine_browser):
+    """§4 R1-F2: ref from child frame clickable from parent session."""
+    _navigate_ax_page(jaine_browser)
+    r = run_cdp(["ax"])
+    ref = _find_ref(r.stdout, "Frame Button")
+    assert ref, "No iframe button ref"
+    cr = run_cdp(["click", "--ref", ref])
+    assert cr.returncode == 0
+    assert "clicked" in cr.stdout.lower()

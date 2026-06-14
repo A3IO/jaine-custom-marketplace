@@ -14,6 +14,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  EmptyResultSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import {
@@ -368,8 +369,6 @@ mcp.setNotificationHandler(
 
 // --- Sync loop ---
 
-await mcp.connect(new StdioServerTransport())
-
 let syncToken: string | undefined
 let shuttingDown = false
 
@@ -383,6 +382,38 @@ process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
+
+// Die with the session — backstop for the stdin-close handler above. CC's spawn
+// topology can leave stdin EOF undelivered (bun#3255), and we run behind a `bun run
+// start` wrapper, so our direct ppid is the wrapper (rarely 1) — the ping is what
+// actually catches a dead client here. Arms only once a real MCP client initializes
+// (manual `bun server.ts` runs never arm it): exit when re-parented to launchd
+// (ppid BECAME 1) or after 2 consecutive ping timeouts (a live client auto-pongs).
+const PING_MS = 15_000
+let armed = false
+mcp.oninitialized = () => {
+  if (armed) return
+  armed = true
+  const ppidAtArm = process.ppid
+  let pingFails = 0
+  let inFlight = false
+  setInterval(() => {
+    if (shuttingDown) return // already exiting via stdin-close/SIGTERM — don't ping a closing pipe
+    // Hard-exit (not shutdown()): the watchdog exists for the event-loop-starved /
+    // dead-client case, where shutdown()'s setTimeout(exit) might never fire. Matches
+    // jainechat's #175 watchdog exactly. shutdown() stays for the graceful signal paths.
+    if (process.ppid === 1 && ppidAtArm !== 1) return process.exit(0)
+    if (inFlight) return // ≤1 ping in flight: a slow tick must not stack timeouts
+    inFlight = true
+    // ping() takes no options → request() directly for a timeout shorter than the tick
+    mcp.request({ method: 'ping' }, EmptyResultSchema, { timeout: PING_MS - 5_000 }).then(
+      () => { inFlight = false; pingFails = 0 },
+      () => { inFlight = false; if (++pingFails >= 2) process.exit(0) },
+    )
+  }, PING_MS)
+}
+
+await mcp.connect(new StdioServerTransport())
 
 // Bootstrap: fast sync to get current position (skip backlog) and accept room invite
 async function bootstrap(): Promise<void> {
@@ -413,15 +444,30 @@ await bootstrap()
 
 // Main sync loop — long-poll for new events in the configured room
 void (async () => {
+  // Loop floor: a minimum gap between /sync calls. Defense-in-depth — the presence
+  // filter above is advisory (a homeserver may ignore it), so this floor guarantees
+  // the long-poll can never degrade into a tight CPU loop regardless of the filter,
+  // keeping the event-loop breathing so the watchdog + stdin-close always get a tick.
+  const MIN_LOOP_MS = 1_000
   for (let attempt = 1; !shuttingDown; ) {
+    const iterStart = Date.now()
     try {
       const res = await matrixFetch('GET', '/_matrix/client/v3/sync', undefined, {
         since: syncToken!,
         timeout: '30000',
         filter: JSON.stringify({
+          // Mute presence/account_data/ephemeral noise. Without this the bot's own
+          // presence heartbeats make /sync return in ~10ms every few seconds, degrading
+          // the 30s long-poll into a tight CPU loop (observed ~80% CPU × N orphans).
+          // That loop also starves the event-loop, so the stdin-close shutdown and the
+          // watchdog below never get a tick — which is how zombies piled up (#177).
+          presence: { types: [] },
+          account_data: { types: [] },
           room: {
             rooms: [ROOM_ID],
             timeline: { limit: 50, types: ['m.room.message'] },
+            ephemeral: { types: [] },
+            account_data: { types: [] },
           },
         }),
       }) as {
@@ -506,6 +552,12 @@ void (async () => {
         }).catch(err => {
           process.stderr.write(`matrix channel: failed to deliver to Claude: ${err}\n`)
         })
+      }
+
+      // Enforce the loop floor on the success path (the catch branch has its own backoff).
+      const elapsed = Date.now() - iterStart
+      if (!shuttingDown && elapsed < MIN_LOOP_MS) {
+        await new Promise(r => setTimeout(r, MIN_LOOP_MS - elapsed))
       }
     } catch (err) {
       if (shuttingDown) return

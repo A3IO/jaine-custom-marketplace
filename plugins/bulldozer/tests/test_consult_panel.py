@@ -5,13 +5,14 @@ Spec: docs/superpowers/specs/2026-06-02-consult-panel-design.md
 
 Pure functions are imported and tested directly (fast, offline). The real-CLI
 end-to-end panel run is a separate @pytest.mark.slow case (needs codex/grok/
-gemini + auth).
+agy + auth).
 """
 from __future__ import annotations
 
 import importlib.util
 import json
 import sys
+from pathlib import Path
 
 from conftest import PLUGIN_ROOT
 
@@ -140,8 +141,18 @@ def test_wrap_find_holes_repo_tells_model_to_read_code():
     assert "Is the error handling in run_model sound?" in w
 
 
-def test_wrap_find_holes_repo_requests_holes():
-    assert "holes" in panel.wrap_find_holes_repo("x").lower() or "risks" in panel.wrap_find_holes_repo("x").lower()
+def test_wrap_find_holes_repo_uses_behavioral_framing():
+    """#189: informed find-holes uses safety-robust BEHAVIORAL wording ('behave
+    incorrectly / not as a caller expects'), NOT 'holes/bugs/vulnerabilities' — the
+    latter trips Gemini-via-agy's safety refusal on security-flavoured code (proven
+    on auth.py: 'holes/bugs' framing → refused ×2; behavioral framing → full 4/4
+    review). codex/grok read it as an equivalent find-holes prompt."""
+    w = panel.wrap_find_holes_repo("Is the data pipeline correct?")
+    low = w.lower()
+    assert "incorrectly" in low or "not as a caller expects" in low or "surprising" in low
+    assert "holes, risks, or bugs" not in w  # old trigger-word phrasing gone
+    for trigger in ("vulnerabilit", "find bugs", "security scan", "security hole"):
+        assert trigger not in low
 
 
 def test_wrap_find_holes_repo_differs_from_isolated():
@@ -229,47 +240,21 @@ def test_parse_grok_missing_text_is_none():
     assert panel.parse_grok(json.dumps({"stopReason": "stop"})) is None
 
 
-def test_parse_gemini_extracts_response_field():
-    # real gemini -o json keys: session_id, response, stats
-    raw = json.dumps({"session_id": "x", "response": "gemini critique", "stats": {}})
-    assert panel.parse_gemini(raw) == "gemini critique"
+def test_parse_agy_returns_clean_stdout():
+    # agy (Antigravity CLI) prints PLAIN TEXT, no JSON — parse_agy is parse_codex
+    out = "1. SQL injection in get_user\n2. MD5 hashing in hash_password"
+    assert panel.parse_agy(out) == out
 
 
-def test_parse_gemini_malformed_json_is_none():
-    assert panel.parse_gemini("<<<") is None
+def test_parse_agy_strips_surrounding_whitespace():
+    assert panel.parse_agy("\n  finding body  \n") == "finding body"
 
 
-def test_parse_gemini_missing_response_is_none():
-    assert panel.parse_gemini(json.dumps({"stats": {}})) is None
+def test_parse_agy_empty_is_none():
+    assert panel.parse_agy("   \n  ") is None
 
 
-# ── three-way parser: present-but-empty field → "" sentinel (gemini write_file bug) ──
-
-
-def test_parse_gemini_present_but_empty_returns_empty_sentinel():
-    # the actual bug payload: valid JSON, response present but empty → "" sentinel, NOT None
-    assert panel.parse_gemini(json.dumps({"session_id": "x", "response": "", "stats": {}})) == ""
-
-
-def test_parse_gemini_multi_candidate_empty_last_keeps_non_empty():
-    # banner/payload stream: a trailing empty candidate must NOT clobber an earlier non-empty one
-    raw = json.dumps({"response": "ok"}) + "\n" + json.dumps({"response": ""})
-    assert panel.parse_gemini(raw) == "ok"
-
-
-def test_parse_gemini_multi_candidate_empty_first_keeps_non_empty():
-    raw = json.dumps({"response": ""}) + "\n" + json.dumps({"response": "ok"})
-    assert panel.parse_gemini(raw) == "ok"
-
-
-def test_parse_gemini_multi_candidate_all_empty_returns_sentinel():
-    raw = json.dumps({"response": ""}) + "\n" + json.dumps({"response": ""})
-    assert panel.parse_gemini(raw) == ""
-
-
-def test_parse_gemini_field_absent_still_none():
-    # regression: field never present (not just empty) stays None
-    assert panel.parse_gemini(json.dumps({"stats": {}})) is None
+# ── three-way parser: present-but-empty field → "" sentinel (grok empty-text field) ──
 
 
 def test_parse_grok_present_but_empty_returns_empty_sentinel():
@@ -282,7 +267,7 @@ def test_parse_grok_multi_candidate_empty_last_keeps_non_empty():
 
 
 def test_parse_grok_multi_candidate_empty_first_keeps_non_empty():
-    # full grok symmetry with gemini (spec test 2b: "the same three orderings")
+    # full grok ordering symmetry (spec test 2b: "the same three orderings")
     raw = json.dumps({"text": ""}) + "\n" + json.dumps({"text": "ok"})
     assert panel.parse_grok(raw) == "ok"
 
@@ -292,35 +277,306 @@ def test_parse_grok_multi_candidate_all_empty_returns_sentinel():
     assert panel.parse_grok(raw) == ""
 
 
-def test_parse_gemini_nested_field_does_not_override_top_level():
-    # code-review R1-F1: a NESTED object carrying the same key must NOT override the real
-    # top-level field. _json_candidates must not descend into an already-parsed object.
-    raw = json.dumps({"response": "REAL", "meta": {"response": "FAKE-nested"}})
-    assert panel.parse_gemini(raw) == "REAL"
-
-
 def test_parse_grok_nested_field_does_not_override_top_level():
     raw = json.dumps({"text": "REAL", "meta": {"text": "FAKE-nested"}})
     assert panel.parse_grok(raw) == "REAL"
 
 
-# ── §3.3 per-model sandboxes — NARROW auth-only allowlists (R1-F1 blocker) ──
+# ── §3.3 agy (Antigravity CLI) command + conversation-db cleanup (#189) ──
 
 
-def test_gemini_sandbox_links_only_auth_files(tmp_path):
-    """gemini sandbox links auth files ONLY — never GEMINI.md/settings/extensions."""
-    real = tmp_path / "real_gem"
-    real.mkdir()
-    (real / "oauth_creds.json").write_text("{}")
-    (real / "google_accounts.json").write_text("{}")
-    (real / "GEMINI.md").write_text("context that must not leak")
-    (real / "settings.json").write_text("{}")
-    (real / "extensions").mkdir()
-    home = panel.build_gemini_sandbox(tmp_path / "sb", real_gemini_home=real)
-    linked = {p.name for p in (home / ".gemini").iterdir()}
-    assert "oauth_creds.json" in linked and "google_accounts.json" in linked
-    for forbidden in ("GEMINI.md", "settings.json", "extensions"):
-        assert forbidden not in linked
+def test_agy_cmd_informed_has_add_dir_model_and_print_timeout(tmp_path):
+    """Informed (--repo): agy reads the real code via --add-dir; a Gemini Pro model;
+    --print-timeout tracks the subprocess timeout. Read-only = NO
+    --dangerously-skip-permissions. Real HOME (keychain auth) = env {} / no sandbox."""
+    cmd, env = panel.build_agy_cmd("WRAPPED_PROMPT", repo=tmp_path, timeout=180)
+    assert cmd[0] == "agy"
+    assert cmd[1] == "-p" and cmd[2] == "WRAPPED_PROMPT"  # prompt right after -p (parse seam)
+    assert "--add-dir" in cmd and str(tmp_path) in cmd
+    i = cmd.index("--model")
+    assert "Gemini" in cmd[i + 1]
+    assert "--print-timeout" in cmd
+    assert "--dangerously-skip-permissions" not in cmd  # read-only (no auto-approve)
+    assert "--sandbox" not in cmd                       # --sandbox resets cwd; not used
+    assert env == {}                                    # real HOME (keychain), no override
+
+
+def test_agy_cmd_isolated_omits_add_dir():
+    """Isolated (no --repo): NO --add-dir → agy critiques the prompt text only, no file
+    reads (the panel's text-only isolated contract)."""
+    cmd, env = panel.build_agy_cmd("W", repo=None, timeout=180)
+    assert "--add-dir" not in cmd
+    assert cmd[1] == "-p" and cmd[2] == "W"
+    assert env == {}
+
+
+def test_agy_cmd_print_timeout_under_subprocess_timeout():
+    """dogfood (Gemini): agy's soft --print-timeout must sit STRICTLY UNDER the
+    subprocess hard timeout so agy flushes its answer before run_model SIGKILLs it —
+    equal/greater timeouts race the kill against the flush. Code-review: this must hold
+    for SMALL --timeout too (the old `max(timeout-15, 30)` floor produced 30 >= timeout
+    for timeout<=30, re-introducing the race)."""
+    for t in (240, 180, 45, 30, 20, 10):
+        cmd, _ = panel.build_agy_cmd("W", repo=None, timeout=t)
+        secs = int(cmd[cmd.index("--print-timeout") + 1].rstrip("s"))
+        assert 1 <= secs < t, f"print_timeout {secs} not strictly under subprocess timeout {t}"
+
+
+def test_agy_cmd_add_dir_is_absolute_even_for_relative_repo():
+    """dogfood (ALL): --add-dir must be ABSOLUTE — informed mode also runs agy with
+    cwd=repo, so a relative --add-dir would resolve to repo/repo. Given a relative
+    path, the emitted --add-dir is absolute."""
+    cmd, _ = panel.build_agy_cmd("W", repo=Path("some/rel/dir"), timeout=180)
+    add_dir_val = cmd[cmd.index("--add-dir") + 1]
+    assert Path(add_dir_val).is_absolute()
+    assert add_dir_val.endswith("some/rel/dir")
+
+
+def test_agy_cmd_model_is_overridable(monkeypatch):
+    """code-review C10: the agy model is a single overridable module constant
+    (BULLDOZER_AGY_MODEL env) so an agy-side rename has a lever instead of
+    permanently breaking the leg. build_agy_cmd reads the constant at call time."""
+    monkeypatch.setattr(panel, "_AGY_MODEL", "Claude Sonnet 4.6")
+    cmd, _ = panel.build_agy_cmd("W", repo=None, timeout=180)
+    assert cmd[cmd.index("--model") + 1] == "Claude Sonnet 4.6"
+
+
+# ── #189 read-only enforcement: PreToolUse deny hook (agy --print auto-accepts tools) ──
+
+
+def test_seed_readonly_hook_writes_pretooluse_deny(tmp_path):
+    """The seed writes an executable hook script + a hooks.json registering a
+    PreToolUse '*' matcher pointing at it (agy's only deterministic read-only gate)."""
+    import os
+    panel._seed_readonly_hook(tmp_path)
+    hooks_f = tmp_path / ".agents" / "hooks.json"
+    script = tmp_path / ".agents" / "readonly-hook.py"
+    assert hooks_f.is_file() and script.is_file()
+    assert os.access(script, os.X_OK)  # executable
+    entry = next(iter(json.loads(hooks_f.read_text()).values()))
+    assert entry["enabled"] is True
+    pre = entry["PreToolUse"][0]
+    assert pre["matcher"] == "*"
+    assert pre["hooks"][0]["type"] == "command"
+    assert pre["hooks"][0]["command"] == str(script)
+
+
+def test_readonly_hook_script_denies_mutations_allows_reads(tmp_path):
+    """The hook script (run as agy runs it: tool-call JSON on stdin) is FAIL-CLOSED: an
+    EXACT-name allowlist of known read tools → allow; EVERYTHING else → deny. So an
+    unknown / mutating / command-exec tool is denied by default, and so is any malformed
+    input — the read-only guarantee no longer rests on a substring blocklist (#189, F3)."""
+    import subprocess
+    panel._seed_readonly_hook(tmp_path)
+    script = tmp_path / ".agents" / "readonly-hook.py"
+
+    def decide_raw(stdin_text):
+        out = subprocess.run(
+            [sys.executable, str(script)], input=stdin_text,
+            capture_output=True, text=True,
+        ).stdout
+        return json.loads(out)["decision"]
+
+    def decide(tool):
+        return decide_raw(json.dumps({"toolCall": {"name": tool}}))
+
+    # known mutating tools — denied
+    for mut in ("write_to_file", "write_file", "edit_file", "run_command",
+                "replace_file_content", "create_file", "delete_file", "edit_notebook",
+                "run_terminal_command", "apply_patch", "propose_code"):
+        assert decide(mut) == "deny", f"{mut} must be denied"
+    # F3: write-capable / command-exec names the old substring blocklist let through —
+    # now denied because they are NOT in the exact read allowlist
+    for failopen in ("save_memory", "shell", "bash", "exec", "save_file",
+                     "set_file_contents", "store_value", "totally_unknown_tool"):
+        assert decide(failopen) == "deny", f"{failopen} must be denied (fail-closed)"
+    # network-read tools are NOT local-code reads → denied (no outbound egress / exfil; #189 review)
+    for net in ("read_url_content", "view_web_document", "fetch_url", "web_search", "browser_navigate"):
+        assert decide(net) == "deny", f"{net} (network) must be denied"
+    # F3: malformed / unexpected stdin shapes — denied (never silent-allow)
+    assert decide_raw("this is not json at all") == "deny"
+    assert decide_raw("{}") == "deny"
+    assert decide_raw(json.dumps({"foo": "bar"})) == "deny"            # no toolCall
+    assert decide_raw("") == "deny"
+    assert decide_raw(json.dumps({"toolCall": ["not", "a", "dict"]})) == "deny"
+    assert decide_raw(json.dumps({"toolCall": {"name": 123}})) == "deny"  # non-string name
+    # real agy read tools (view_file + list_dir empirically confirmed) — allowed
+    for ro in ("read_file", "view_file", "list_dir", "grep_search", "code_search",
+               "find_by_name", "view_code_item"):
+        assert decide(ro) == "allow", f"{ro} must be allowed"
+
+
+def test_run_one_readonly_hook_runs_in_seeded_cwd_not_repo(tmp_path, monkeypatch):
+    """A readonly_hook leg (agy) runs in a temp cwd that CONTAINS the seeded
+    .agents/hooks.json deny gate, NOT the repo — so a denied write can't reach the
+    repo. The repo is read via --add-dir (in the cmd), never as cwd (#189)."""
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")  # keep teardown off real ~/.gemini
+    seen = {}
+
+    def runner(cmd, env, cwd, timeout):
+        seen["cwd"] = cwd
+        seen["has_hook"] = (Path(cwd) / ".agents" / "hooks.json").is_file()
+        seen["add_dir"] = "--add-dir" in cmd
+        return panel.ModelResult(True, "ok", None)
+
+    panel._run_one("agy", "W", tmp_path, 10, runner)  # informed: repo=tmp_path
+    assert seen["has_hook"], "agy leg cwd must contain the seeded .agents/hooks.json gate"
+    assert seen["cwd"] != str(tmp_path), "agy must NOT run with the repo as cwd"
+    assert seen["add_dir"], "informed agy still reaches the repo via --add-dir"
+
+
+def test_model_specs_readonly_hook_only_agy():
+    """Only agy needs the read-only hook (its --print auto-accepts tools); codex/grok
+    don't (codex --ephemeral read-only sandbox; grok --permission-mode plan)."""
+    assert panel._MODEL_SPECS["agy"].readonly_hook is True
+    assert panel._MODEL_SPECS["codex"].readonly_hook is False
+    assert panel._MODEL_SPECS["grok"].readonly_hook is False
+
+
+# agy per-call state cleanup (#189 code-review): the plaintext prompt+response live in
+# the per-call brain/<uuid>/.system_generated/logs/transcript*.jsonl (verified by a
+# unique-marker probe); the conversations/*.db is the session store. The panel snapshots
+# both subdirs and deletes the NEW entries (statelessness). _AGY_STATE_DIR is
+# monkeypatched off the real ~/.gemini in these tests.
+
+
+def _mk_state(tmp_path):
+    state = tmp_path / "agy"
+    (state / "brain").mkdir(parents=True)
+    (state / "conversations").mkdir()
+    return state
+
+
+# real agy conversation ids are 36-char UUIDs (empirically: 31a94130-59f1-4185-...)
+_OUR_UUID = "31a94130-59f1-4185-a50c-060486ef98f5"
+_VISUAL_UUID = "859e0879-5025-4394-a93a-0b29033d02a4"
+
+
+def test_agy_clean_conversation_deletes_only_that_id(tmp_path, monkeypatch):
+    """Targeted cleanup: ONLY the given conversation's brain/<id> + conversations/<id>.db*
+    are removed — a CONCURRENT session's brain/<other> (e.g. the user's visual Antigravity
+    app) is never touched. The conversations glob is anchored to ``<id>.db*`` so a DIFFERENT
+    conversation file whose name merely starts with our id is NOT swept (#189, F1)."""
+    state = _mk_state(tmp_path)
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", state)
+    ours = state / "brain" / _OUR_UUID / ".system_generated" / "logs"
+    ours.mkdir(parents=True)
+    (ours / "transcript.jsonl").write_text("our prompt+response")
+    (state / "conversations" / f"{_OUR_UUID}.db").write_text("our db")
+    (state / "conversations" / f"{_OUR_UUID}.db-wal").write_text("wal")
+    (state / "conversations" / f"{_OUR_UUID}.db-shm").write_text("shm")
+    # F1: a DIFFERENT conversation whose filename merely STARTS WITH our id (prefix) must
+    # survive — a bare ``{id}*`` glob would sweep it; ``{id}.db*`` must not.
+    (state / "conversations" / f"{_OUR_UUID}EXTRA.db").write_text("a different conversation")
+    # a CONCURRENT session's state (visual/IDE mode) — must survive untouched
+    (state / "brain" / _VISUAL_UUID).mkdir()
+    (state / "conversations" / f"{_VISUAL_UUID}.db").write_text("visual db")
+
+    panel._agy_clean_conversation(_OUR_UUID)
+
+    assert not (state / "brain" / _OUR_UUID).exists()                      # ours: transcript gone
+    assert not (state / "conversations" / f"{_OUR_UUID}.db").exists()      # ours: db gone
+    assert not (state / "conversations" / f"{_OUR_UUID}.db-wal").exists()  # ours: sidecars gone
+    assert not (state / "conversations" / f"{_OUR_UUID}.db-shm").exists()
+    assert (state / "conversations" / f"{_OUR_UUID}EXTRA.db").exists()     # F1: prefix-sibling preserved
+    assert (state / "brain" / _VISUAL_UUID).exists()                      # concurrent session preserved
+    assert (state / "conversations" / f"{_VISUAL_UUID}.db").exists()
+
+
+def test_agy_clean_conversation_ignores_non_uuid_id(tmp_path, monkeypatch):
+    """Defensive: any id that is not a full 36-char UUID (empty, path-like, '..', a short
+    label) is ignored — never rmtree a parent and never run the glob (#189, F1)."""
+    state = _mk_state(tmp_path)
+    (state / "brain" / "keep").mkdir()
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", state)
+    for bad in ("", "   ", "..", "../brain", "a/b", "x\\y", "OURID", _OUR_UUID + "X", _OUR_UUID[:-1]):
+        panel._agy_clean_conversation(bad)  # must not raise, must not delete anything
+    assert (state / "brain" / "keep").exists()
+    assert (state / "brain").is_dir()
+
+
+def test_agy_clean_new_by_nonce_targets_only_nonce_match(tmp_path, monkeypatch):
+    """F2 core: of the brain dirs created since the snapshot, delete ONLY the one whose
+    transcript carries this run's nonce. A concurrent visual session's NEW dir (no nonce)
+    and any pre-existing dir are both left untouched — even though all are 'new' relative
+    to nothing/each other. This is what makes a diff visual-safe (#189)."""
+    state = _mk_state(tmp_path)
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", state)
+    nonce = "bulldozer-consult-ref:deadbeefcafe"
+    # pre-existing (in the before-snapshot) — must survive
+    (state / "brain" / _VISUAL_UUID).mkdir()
+    before = {_VISUAL_UUID}
+    # OUR new conversation — transcript carries the nonce
+    ours = state / "brain" / _OUR_UUID / ".system_generated" / "logs"
+    ours.mkdir(parents=True)
+    (ours / "transcript.jsonl").write_text(f"prompt with [{nonce}] inside\nresponse")
+    (state / "conversations" / f"{_OUR_UUID}.db").write_text("db")
+    # a CONCURRENT visual session that started AFTER the snapshot — new, but NO nonce
+    concurrent = "c0ffee00-1111-4222-8333-444455556666"
+    (state / "brain" / concurrent / ".system_generated" / "logs").mkdir(parents=True)
+    (state / "brain" / concurrent / ".system_generated" / "logs" / "transcript.jsonl").write_text("someone else's prompt")
+    (state / "conversations" / f"{concurrent}.db").write_text("their db")
+
+    panel._agy_clean_new_by_nonce(before, nonce)
+
+    assert not (state / "brain" / _OUR_UUID).exists()              # ours (nonce match) cleaned
+    assert not (state / "conversations" / f"{_OUR_UUID}.db").exists()
+    assert (state / "brain" / concurrent).exists()                # concurrent new dir (no nonce) preserved
+    assert (state / "conversations" / f"{concurrent}.db").exists()
+    assert (state / "brain" / _VISUAL_UUID).exists()              # pre-existing preserved
+
+
+def test_agy_clean_new_by_nonce_never_raises_on_unexpected_error(tmp_path, monkeypatch):
+    """Best-effort cleanup runs in _run_one's finally — it must swallow ANY Exception (not
+    just OSError) so a helper failure can't mask the runner's real error (#189 review)."""
+    state = _mk_state(tmp_path)
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", state)
+    (state / "brain" / _OUR_UUID).mkdir()  # a new UUID dir so the scan reaches _dir_contains_token
+
+    def boom(*a, **k):
+        raise ValueError("unexpected non-OSError")
+    monkeypatch.setattr(panel, "_dir_contains_token", boom)
+
+    panel._agy_clean_new_by_nonce(set(), "bulldozer-consult-ref:x")  # must NOT propagate
+
+
+def test_run_one_readonly_injects_nonce_into_agy_prompt(tmp_path, monkeypatch):
+    """The agy prompt passed to the runner carries a unique bulldozer nonce that is NOT in
+    the original wrapped prompt — that nonce is what the post-run cleanup matches (#189)."""
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    seen = {}
+
+    def runner(cmd, env, cwd, timeout):
+        seen["prompt"] = cmd[2]  # agy: prompt right after -p
+        return panel.ModelResult(True, "ok", None)
+
+    panel._run_one("agy", "ORIGINAL_WRAPPED", None, 10, runner)
+    assert "ORIGINAL_WRAPPED" in seen["prompt"]
+    assert panel._AGY_NONCE_TAG in seen["prompt"]  # a bulldozer nonce was injected
+
+
+def test_run_one_readonly_hook_cleans_its_conversation(tmp_path, monkeypatch):
+    """Integration: the agy leg injects a nonce into its prompt; the fake agy writes a
+    brain/<uuid> transcript carrying that nonce; _run_one then deletes EXACTLY that dir
+    afterward, leaving a concurrent visual session's brain dir untouched (#189)."""
+    state = tmp_path / "agystate"
+    (state / "brain").mkdir(parents=True)
+    (state / "conversations").mkdir()
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", state)
+    (state / "brain" / _VISUAL_UUID).mkdir()  # concurrent visual session — must survive
+
+    def runner(cmd, env, cwd, timeout):
+        nonce = cmd[2].split("[", 1)[1].split("]", 1)[0]  # extract the injected [nonce]
+        logs = state / "brain" / _OUR_UUID / ".system_generated" / "logs"
+        logs.mkdir(parents=True)
+        (logs / "transcript.jsonl").write_text(f"agy logged the prompt: {nonce}")
+        (state / "conversations" / f"{_OUR_UUID}.db").write_text("t")
+        return panel.ModelResult(True, "ok", None)
+
+    panel._run_one("agy", "W", tmp_path, 10, runner)
+    assert not (state / "brain" / _OUR_UUID).exists()        # our transcript cleaned
+    assert not (state / "conversations" / f"{_OUR_UUID}.db").exists()
+    assert (state / "brain" / _VISUAL_UUID).exists()         # concurrent visual session untouched
 
 
 # ── §3.6 survivor-count merge gating + output rendering ──
@@ -381,22 +637,11 @@ def test_codex_cmd_effort_configurable():
 
 def test_grok_cmd_no_whackamole_flags():
     """The unreliable no-read flags stay deliberately ABSENT (systematic-debugging
-    2026-06-02): read is soft-allowed like codex/gemini. (HOME/flag coverage is in
+    2026-06-02): read is soft-allowed like codex. (HOME/flag coverage is in
     test_grok_cmd_real_home_no_override.)"""
     cmd, _ = panel.build_grok_cmd("WRAPPED_PROMPT")
     assert "--disallowed-tools" not in cmd
     assert "--sandbox" not in cmd
-
-
-def test_gemini_cmd_flags_and_home(tmp_path):
-    cmd, env = panel.build_gemini_cmd("WRAPPED_PROMPT", home=tmp_path / "gem")
-    assert cmd[0] == "gemini"
-    assert "--skip-trust" in cmd
-    assert "--approval-mode" in cmd and "plan" in cmd
-    assert "-e" in cmd and "none" in cmd
-    assert "-o" in cmd and "json" in cmd
-    assert "WRAPPED_PROMPT" in cmd
-    assert env["HOME"] == str(tmp_path / "gem")
 
 
 # ── §3.6 model runner (subprocess wrapper) — tested with python3 as a fake CLI ──
@@ -449,7 +694,7 @@ def _make_fake_runner(calls, fail=()):
     merged block. Models in ``fail`` return ok=False."""
     def fake(cmd, env, cwd, timeout):
         name = cmd[0]
-        prompt = cmd[-1] if name == "codex" else cmd[2]  # codex: last arg; grok/gemini: after -p
+        prompt = cmd[-1] if name == "codex" else cmd[2]  # codex: last arg; grok/agy: after -p
         calls.append({"name": name, "cwd": cwd, "prompt": prompt})
         if name in fail:
             return panel.ModelResult(False, None, "simulated failure")
@@ -458,7 +703,7 @@ def _make_fake_runner(calls, fail=()):
         canned = {
             "codex": "codex-finding",
             "grok": json.dumps({"text": "grok-finding"}),
-            "gemini": json.dumps({"response": "gemini-finding"}),
+            "agy": "agy-finding",  # agy prints PLAIN TEXT (no JSON)
         }
         return panel.ModelResult(True, canned[name], None)
     return fake
@@ -468,13 +713,13 @@ def test_run_panel_three_survivors_merges_and_shows_raw():
     calls = []
     out, _ = panel.run_panel("Q", runner=_make_fake_runner(calls))
     assert "merged-finding" in out  # summarizer ran
-    assert "codex-finding" in out and "grok-finding" in out and "gemini-finding" in out
+    assert "codex-finding" in out and "grok-finding" in out and "agy-finding" in out
     assert len(calls) == 4  # 3 models + 1 summarizer
 
 
 def test_run_panel_one_survivor_no_summarizer():
     calls = []
-    out, _ = panel.run_panel("Q", runner=_make_fake_runner(calls, fail=("grok", "gemini")))
+    out, _ = panel.run_panel("Q", runner=_make_fake_runner(calls, fail=("grok", "agy")))
     assert "codex-finding" in out
     assert "merged-finding" not in out  # no summarizer for a single survivor
     assert len(calls) == 3  # 3 model calls, no summarizer
@@ -482,7 +727,7 @@ def test_run_panel_one_survivor_no_summarizer():
 
 def test_run_panel_zero_survivors_errors_without_summarizer():
     calls = []
-    out, _ = panel.run_panel("Q", runner=_make_fake_runner(calls, fail=("codex", "grok", "gemini")))
+    out, _ = panel.run_panel("Q", runner=_make_fake_runner(calls, fail=("codex", "grok", "agy")))
     assert "merged-finding" not in out
     assert len(calls) == 3  # no summarizer attempted on total failure
     assert "failed" in out.lower() or "error" in out.lower()
@@ -491,9 +736,29 @@ def test_run_panel_zero_survivors_errors_without_summarizer():
 def test_run_panel_informed_runs_models_in_repo_cwd(tmp_path):
     calls = []
     panel.run_panel("Q", repo=tmp_path, runner=_make_fake_runner(calls))
-    model_calls = [c for c in calls if "deduplicated" not in c["prompt"]]
+    # cwd-reading legs (codex/grok) see the repo as cwd (resolved → robust to a
+    # non-canonical tmp). agy reads via --add-dir from a read-only hook cwd (#189), so
+    # it's excluded here and covered by the readonly-hook + build_agy_cmd tests.
+    model_calls = [c for c in calls if "deduplicated" not in c["prompt"] and c["name"] != "agy"]
+    assert model_calls
     for c in model_calls:
-        assert c["cwd"] == str(tmp_path)  # informed → models see the repo
+        assert c["cwd"] == str(tmp_path.resolve())
+
+
+def test_run_panel_informed_resolves_symlinked_repo(tmp_path):
+    """code-review C9: a symlinked --repo is resolved ONCE so the cwd-reading legs
+    (codex/grok) get the resolved target — no symlink/canonical divergence. (agy reads
+    via its resolved --add-dir; build_agy_cmd test covers that.)"""
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    calls = []
+    panel.run_panel("Q", repo=link, runner=_make_fake_runner(calls))
+    model_calls = [c for c in calls if "deduplicated" not in c["prompt"] and c["name"] != "agy"]
+    assert model_calls
+    for c in model_calls:
+        assert c["cwd"] == str(real.resolve())  # resolved target, NOT the symlink path
 
 
 def test_run_panel_isolated_does_not_use_repo_cwd(tmp_path):
@@ -537,8 +802,9 @@ def test_main_verdict_flag(capsys):
 def test_main_repo_flag_is_informed(tmp_path, capsys):
     calls = []
     panel.main(["--repo", str(tmp_path), "Q"], runner=_make_fake_runner(calls))
-    model_calls = [c for c in calls if "deduplicated" not in c["prompt"]]
-    assert model_calls and all(c["cwd"] == str(tmp_path) for c in model_calls)
+    # codex/grok read via cwd=repo; agy reads via --add-dir from its read-only hook cwd
+    model_calls = [c for c in calls if "deduplicated" not in c["prompt"] and c["name"] != "agy"]
+    assert model_calls and all(c["cwd"] == str(tmp_path.resolve()) for c in model_calls)
 
 
 def test_main_no_repo_is_isolated(tmp_path, capsys):
@@ -552,43 +818,78 @@ def test_main_no_repo_is_isolated(tmp_path, capsys):
 
 
 def test_run_panel_isolated_model_cwd_is_empty():
-    """P0 (dogfood): models must run in an EMPTY cwd — the grok/gem sandbox dirs
-    must NOT leak into the model's working directory."""
+    """P0 (dogfood): models must run in an EMPTY cwd — the per-model tempdir must
+    NOT leak into the model's working directory."""
     import os
 
     def runner(cmd, env, cwd, timeout):
-        assert os.listdir(cwd) == [], f"model cwd leaked sandbox dirs: {os.listdir(cwd)}"
-        canned = {"codex": "c-find", "grok": json.dumps({"text": "g"}), "gemini": json.dumps({"response": "ge"})}
+        # isolated → no REPO content in cwd. agy's cwd carries ONLY its .agents/
+        # read-only hook (#189); codex/grok are empty. Never any repo files.
+        assert set(os.listdir(cwd)) <= {".agents"}, f"model cwd leaked content: {os.listdir(cwd)}"
+        canned = {"codex": "c-find", "grok": json.dumps({"text": "g"}), "agy": "ge"}
         return panel.ModelResult(True, canned.get(cmd[0], "x"), None)
 
     panel.run_panel("Q", runner=runner)
 
 
-def test_run_panel_grok_real_home_gemini_sandboxed():
-    """grok runs with NO HOME override (its HOME-sandbox broke --repo); gemini still
-    gets its OWN per-model tempdir sandbox (no cross-model ../sibling auth reach)."""
+def test_run_panel_grok_and_agy_real_home():
+    """All three run on the real HOME now (no override): codex isolates via flags;
+    grok's HOME-sandbox broke its --repo worker; agy's auth is keychain-bound (no
+    copyable token, no sandbox). No per-model HOME isolation remains (#189)."""
     homes = {}
 
     def runner(cmd, env, cwd, timeout):
-        homes[cmd[0]] = env.get("HOME")  # None for grok/codex (real HOME), set for gemini
-        canned = {"codex": "c", "grok": json.dumps({"text": "g"}), "gemini": json.dumps({"response": "ge"})}
+        homes[cmd[0]] = env.get("HOME")  # None everywhere → real HOME inherited
+        canned = {"codex": "c", "grok": json.dumps({"text": "g"}), "agy": "ge"}
         return panel.ModelResult(True, canned.get(cmd[0], "x"), None)
 
     panel.run_panel("Q", runner=runner)
     assert homes["grok"] is None, "grok must run on the real HOME (no override)"
-    assert homes["gemini"], "gemini still gets its own isolated HOME sandbox"
+    assert homes["agy"] is None, "agy runs on the real HOME (keychain auth, no sandbox)"
 
 
-def test_run_panel_survives_sandbox_build_error(monkeypatch):
-    """R2 (dogfood): a sandbox build error (copy perm/ENOSPC) must become a
-    per-model failure, not crash the whole panel. (gemini is the sandboxed model
-    now; grok runs on the real HOME.)"""
-    def boom(*a, **k):
-        raise PermissionError("simulated copy failure")
-    monkeypatch.setattr(panel, "build_gemini_sandbox", boom)
+def test_run_panel_survives_prepare_error(monkeypatch):
+    """R2 (dogfood): a per-model command-build (prepare) error must become a
+    per-model failure leg, not crash the whole panel (the agy leg replaces the old
+    gemini-sandbox-build-error path — agy has no sandbox to fail)."""
+    def boom_prepare(wrapped, repo, timeout):
+        raise RuntimeError("prepare boom")
+    boom_spec = panel.ModelSpec("Agy-boom", panel.parse_agy, boom_prepare)
+    monkeypatch.setitem(panel._MODEL_SPECS, "agy", boom_spec)
     out, ok = panel.run_panel("Q", runner=_make_fake_runner([]))
     assert ok  # codex + grok still survived
-    assert "failed" in out.lower()  # gemini rendered as a failure block
+    assert "failed" in out.lower()  # the booming leg rendered as a failure block
+
+
+def test_run_panel_cleans_agy_session_state(tmp_path, monkeypatch):
+    """#189: through the full panel, the agy leg's transcript (brain/<uuid>) + db are
+    deleted BY NONCE (statelessness, visual-safe) and a pre-existing/concurrent session is
+    preserved. Wiring test: the fake agy leg writes a transcript carrying the injected
+    nonce; the panel removes exactly that dir, leaving the pre-existing one."""
+    state = tmp_path / "agy"
+    (state / "brain").mkdir(parents=True)
+    (state / "conversations").mkdir()
+    (state / "brain" / "preexisting-sess").mkdir()
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", state)
+
+    def runner(cmd, env, cwd, timeout):
+        prompt = cmd[-1] if cmd[0] == "codex" else cmd[2]
+        if "deduplicated" in prompt:  # summarizer
+            return panel.ModelResult(True, "## SHARED\n[ALL] m", None)
+        if cmd[0] == "agy":
+            nonce = prompt.split("[", 1)[1].split("]", 1)[0]  # the injected [nonce]
+            logs = state / "brain" / _OUR_UUID / ".system_generated" / "logs"
+            logs.mkdir(parents=True)
+            (logs / "transcript.jsonl").write_text(f"the consult prompt + response {nonce}")
+            (state / "conversations" / f"{_OUR_UUID}.db").write_text("db")
+            return panel.ModelResult(True, "agy-find", None)
+        canned = {"codex": "c-find", "grok": json.dumps({"text": "g-find"})}
+        return panel.ModelResult(True, canned[cmd[0]], None)
+
+    panel.run_panel("Q", runner=runner)
+    assert not (state / "brain" / _OUR_UUID).exists()             # transcript cleaned by nonce
+    assert not (state / "conversations" / f"{_OUR_UUID}.db").exists()  # db cleaned
+    assert (state / "brain" / "preexisting-sess").exists()        # pre-existing/concurrent preserved
 
 
 def test_run_panel_survives_summarizer_exception():
@@ -598,7 +899,7 @@ def test_run_panel_survives_summarizer_exception():
         prompt = cmd[-1] if cmd[0] == "codex" else cmd[2]
         if "deduplicated" in prompt:  # the summarizer call
             raise RuntimeError("summarizer boom")
-        canned = {"codex": "c-find", "grok": json.dumps({"text": "g-find"}), "gemini": json.dumps({"response": "ge-find"})}
+        canned = {"codex": "c-find", "grok": json.dumps({"text": "g-find"}), "agy": "ge-find"}
         return panel.ModelResult(True, canned.get(cmd[0], "x"), None)
 
     out, ok = panel.run_panel("Q", runner=runner)
@@ -611,11 +912,6 @@ def test_parse_grok_tolerates_banner_before_json():
     successful model look failed."""
     raw = "warning: deprecated flag\n\x1b[0m\n" + json.dumps({"text": "g-finding"})
     assert panel.parse_grok(raw) == "g-finding"
-
-
-def test_parse_gemini_tolerates_trailing_noise():
-    raw = json.dumps({"response": "ge-finding"}) + "\nRipgrep is not available."
-    assert panel.parse_gemini(raw) == "ge-finding"
 
 
 def test_parse_grok_still_none_when_no_json_present():
@@ -639,7 +935,7 @@ def test_parse_grok_returns_last_json_object_not_banner():
 def test_main_returns_nonzero_on_total_failure(capsys):
     """P1 (dogfood): when every model fails, main must exit non-zero so callers
     can distinguish total failure from success."""
-    rc = panel.main(["Q"], runner=_make_fake_runner([], fail=("codex", "grok", "gemini")))
+    rc = panel.main(["Q"], runner=_make_fake_runner([], fail=("codex", "grok", "agy")))
     assert rc != 0
 
 
@@ -709,11 +1005,6 @@ def test_wrap_isolated_cells_have_no_no_write_clause():
     assert "do NOT call write_file" not in panel.wrap("q", verdict=True)  # verdict isolated
 
 
-def test_gemini_cmd_redirects_xdg_into_sandbox(tmp_path):
-    _, env = panel.build_gemini_cmd("Q", home=tmp_path / "gem")
-    assert env.get("XDG_CONFIG_HOME", "").startswith(str(tmp_path / "gem"))
-
-
 def test_run_model_strips_claude_session_env():
     """P1 (dogfood): CC session vars must not reach an isolated reviewer."""
     import os
@@ -781,15 +1072,6 @@ def test_filter_env_exact_provider_match_not_substring():
         assert leaked not in out
 
 
-def test_gemini_sandbox_copies_auth_not_symlinks(tmp_path):
-    real = tmp_path / "real_gem"
-    real.mkdir()
-    (real / "oauth_creds.json").write_text("{}")
-    home = panel.build_gemini_sandbox(tmp_path / "sb", real_gemini_home=real)
-    creds = home / ".gemini" / "oauth_creds.json"
-    assert creds.exists() and not creds.is_symlink()
-
-
 # ── SKILL.md integration (dogfood #1 reachability + #6 parsing-fix) ──
 
 _SKILL_MD = (PLUGIN_ROOT / "skills" / "consult" / "SKILL.md").read_text()
@@ -835,24 +1117,43 @@ def test_model_specs_registry_complete():
     in _run_one. A missing site is structurally impossible — adding a model is one
     row. Display names + parser wiring preserved (behavior-preserving)."""
     specs = panel._MODEL_SPECS
-    assert set(specs) == {"codex", "grok", "gemini"}
+    assert set(specs) == {"codex", "grok", "agy"}
     for spec in specs.values():
         assert spec.display
         assert callable(spec.parser)
         assert callable(spec.prepare)
     assert specs["codex"].display == "GPT"
     assert specs["grok"].display == "Grok"
-    assert specs["gemini"].display == "Gemini"
+    assert specs["agy"].display == "Gemini"  # Gemini models, via the Antigravity CLI
     assert specs["codex"].parser is panel.parse_codex
     assert specs["grok"].parser is panel.parse_grok
-    assert specs["gemini"].parser is panel.parse_gemini
+    assert specs["agy"].parser is panel.parse_agy
 
 
-def test_model_spec_prepare_returns_cmd_with_wrapped_prompt(tmp_path):
-    """Each spec.prepare(wrapped, model_root) → (argv, env) carrying the wrapped
+def test_run_one_readonly_hook_cleans_conversation_even_on_runner_failure(tmp_path, monkeypatch):
+    """The transcript cleanup must run even when the agy runner fails — a failed run
+    still wrote a brain/<uuid>, which must not leak (statelessness, #189)."""
+    state = tmp_path / "agystate"
+    (state / "brain").mkdir(parents=True)
+    (state / "conversations").mkdir()
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", state)
+
+    def runner(cmd, env, cwd, timeout):
+        nonce = cmd[2].split("[", 1)[1].split("]", 1)[0]  # the injected [nonce]
+        logs = state / "brain" / _OUR_UUID / ".system_generated" / "logs"
+        logs.mkdir(parents=True)
+        (logs / "transcript.jsonl").write_text(f"partial output {nonce}")
+        return panel.ModelResult(False, None, "boom")  # leg fails AFTER writing state
+
+    panel._run_one("agy", "W", None, 10, runner)
+    assert not (state / "brain" / _OUR_UUID).exists()  # cleaned despite the runner failure
+
+
+def test_model_spec_prepare_returns_cmd_with_wrapped_prompt():
+    """Each spec.prepare(wrapped, repo, timeout) → (argv, env) carrying the wrapped
     prompt — the single seam _run_one uses to build any model's invocation."""
     for name, spec in panel._MODEL_SPECS.items():
-        cmd, env = spec.prepare("WRAPPED_PROMPT", tmp_path / name)
+        cmd, env = spec.prepare("WRAPPED_PROMPT", None, 180)
         assert isinstance(cmd, list) and cmd
         assert cmd[0] == name
         assert "WRAPPED_PROMPT" in cmd
@@ -871,10 +1172,12 @@ def test_wrap_selects_2x2_header_and_footer():
     w = panel.wrap(q)
     assert q in w and "SKIP SKILLS" in w
     assert "holes" in w.lower() and "verdict" not in w.lower()
-    # informed find-holes: read the real code, no SKIP SKILLS, still holes
+    # informed find-holes: read the real code, no SKIP SKILLS, behavioral framing
+    # (#189: safety-robust wording, not 'holes/bugs') — see _WRAP_TABLE[(False, True)]
     w = panel.wrap(q, repo=True)
     assert q in w and "SKIP SKILLS" not in w
-    assert "read" in w.lower() and "holes" in w.lower()
+    assert "read" in w.lower()
+    assert "incorrectly" in w.lower() or "not as a caller expects" in w.lower()
     # isolated verdict: SKIP SKILLS + anchored VERDICT tail
     w = panel.wrap(q, verdict=True)
     assert q in w and "SKIP SKILLS" in w and "VERDICT: GO" in w
@@ -1003,7 +1306,7 @@ def test_run_panel_notes_summarizer_failure():
         if "deduplicated" in prompt:  # the summarizer codex call
             return panel.ModelResult(False, None, "summarizer down")
         canned = {"codex": "c-find", "grok": json.dumps({"text": "g-find"}),
-                  "gemini": json.dumps({"response": "ge-find"})}
+                  "agy": "ge-find"}
         return panel.ModelResult(True, canned.get(cmd[0], "x"), None)
 
     out, ok = panel.run_panel("Q", runner=runner)
@@ -1073,7 +1376,7 @@ def test_run_one_empty_output_reason():
 
 
 def test_run_one_empty_response_field_is_honest_not_unparseable():
-    """A valid-JSON-but-empty-field (the gemini write_file bug) → honest 'empty
+    """A valid-JSON-but-empty-field (grok empty-text field) → honest 'empty
     response', NOT the misleading 'unparseable output'."""
     def runner(cmd, env, cwd, timeout):
         return panel.ModelResult(True, json.dumps({"text": ""}), None)  # grok empty field
