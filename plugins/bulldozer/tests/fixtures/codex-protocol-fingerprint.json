@@ -1,0 +1,26 @@
+{
+  "_comment": "Coherence snapshot of the bridge's protocol surface. NOT codex-drift detection — it only fails when code constants are edited without updating this file. Real codex-drift = the slow-e2e live-version assert (test_live_codex_version_matches_pin). Intentionally a SUBSET of the spec's listed fixture keys: only facts with a code constant to compare (bridged/unsupported methods, decision variants, version). turn_start_params is omitted by design — it has no code constant to diff against, so committing it would be dead snapshot data, not a coherence tripwire.",
+  "bridged_methods": [
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+    "execCommandApproval",
+    "applyPatchApproval"
+  ],
+  "unsupported_methods": [
+    "item/tool/call",
+    "account/chatgptAuthTokens/refresh",
+    "attestation/generate"
+  ],
+  "command_decision_variants": [
+    "accept",
+    "acceptForSession",
+    "decline",
+    "cancel",
+    {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["allow foo"]}},
+    {"applyNetworkPolicyAmendment": {"network_policy_amendment": {"host": "x"}}}
+  ],
+  "last_verified_codex_version": "0.141"
+}
