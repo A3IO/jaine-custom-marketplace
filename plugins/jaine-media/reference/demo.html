@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JAINE Gemini Media — как это работает</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2430; --line:#2d3644;
+    --amber:#f0a04b; --amber2:#ffcb6b; --gem1:#4285f4; --gem2:#9b72cb; --gem3:#d96570;
+    --ok:#3fb950; --txt:#c9d1d9; --dim:#8b949e; --hit:#3fb950; --miss:#d96570;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:1100px;margin:0 auto;padding:32px 20px 80px}
+  h1{font-size:30px;margin:0 0 6px;
+    background:linear-gradient(90deg,var(--amber2),var(--gem2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{color:var(--dim);margin:0 0 28px;font-size:15px}
+  .tag{display:inline-block;background:#2a2118;color:var(--amber2);border:1px solid #4a3a22;
+    border-radius:20px;padding:2px 12px;font-size:12px;margin:0 6px 6px 0}
+  .gemtag{background:#1a2340;color:#9ec1ff;border-color:#2d4173}
+  section{margin:34px 0}
+  .h{font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--amber);margin:0 0 14px;font-weight:600}
+
+  /* architecture */
+  .arch{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;align-items:center;gap:8px}
+  .node{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;text-align:center;transition:.25s}
+  .node.act{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber),0 0 24px -6px var(--amber)}
+  .node.gem.act{border-color:var(--gem1);box-shadow:0 0 0 1px var(--gem1),0 0 24px -6px var(--gem1)}
+  .node .ic{font-size:26px}
+  .node b{display:block;margin:6px 0 2px;font-size:14px}
+  .node small{color:var(--dim);font-size:11.5px;line-height:1.4;display:block}
+  .arrow{color:var(--line);font-size:22px;transition:.25s;text-align:center}
+  .arrow.act{color:var(--amber)}
+  .arrow.gem.act{color:var(--gem1)}
+
+  /* sim layout */
+  .sim{display:grid;grid-template-columns:1fr 1.15fr;gap:16px}
+  @media(max-width:860px){.sim{grid-template-columns:1fr}.arch{grid-template-columns:1fr;gap:4px}.arrow{transform:rotate(90deg);margin:2px 0}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  .lbl{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em;width:100%;margin-bottom:2px}
+  button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:8px;
+    padding:8px 12px;font-size:13px;cursor:pointer;transition:.15s}
+  button:hover:not(:disabled){border-color:var(--amber);color:var(--amber2)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.sel{background:#2a2118;border-color:var(--amber);color:var(--amber2)}
+  button.q{text-align:left;width:100%}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .seg button{border:0;border-radius:0;border-right:1px solid var(--line)}
+  .seg button:last-child{border-right:0}
+  .file{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--gem2)}
+
+  /* chat */
+  .chat{min-height:120px;max-height:280px;overflow-y:auto;margin-bottom:6px}
+  .msg{margin:8px 0;padding:9px 12px;border-radius:10px;font-size:13.5px;max-width:92%}
+  .msg.u{background:#1d2735;border:1px solid #2d4173;margin-left:auto}
+  .msg.g{background:#171f1a;border:1px solid #234027}
+  .msg .who{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:3px}
+  .msg.g .who{color:#7fd99a}
+  .msg.u .who{color:#9ec1ff}
+
+  /* trace */
+  .trace{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;min-height:200px}
+  .step{display:flex;gap:8px;padding:5px 0;opacity:0;transform:translateX(-6px);
+    transition:.3s;border-bottom:1px dashed #232c39}
+  .step.show{opacity:1;transform:none}
+  .step .dot{color:var(--amber)}
+  .step.gem .dot{color:var(--gem1)}
+  .step.hit .dot{color:var(--hit)} .step.miss .dot{color:var(--miss)}
+  .step b{color:#e6edf3} .step .note{color:var(--dim)}
+  .pill{font-size:10.5px;padding:1px 7px;border-radius:10px;margin-left:6px}
+  .pill.hit{background:#11281a;color:var(--hit);border:1px solid #1f5132}
+  .pill.miss{background:#2a1418;color:var(--miss);border:1px solid #5c2730}
+  .bar{height:6px;background:#0a0e14;border-radius:4px;overflow:hidden;margin:3px 0;border:1px solid #232c39}
+  .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--gem1),var(--gem2));transition:width .08s linear}
+
+  /* cache table */
+  .cache{margin-top:10px}
+  table{width:100%;border-collapse:collapse;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+  th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:500;text-transform:uppercase;font-size:10px;letter-spacing:.06em}
+  td .u{color:var(--gem2)} .exp{color:var(--ok)}
+  .empty{color:var(--dim);font-style:italic;padding:8px}
+
+  .stat{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:12px}
+  .stat div{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;text-align:center}
+  .stat b{display:block;font-size:20px;color:var(--amber2)} .stat small{color:var(--dim);font-size:11px}
+
+  /* compare cards */
+  .cmp{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:680px){.cmp{grid-template-columns:1fr}.stat{grid-template-columns:1fr}}
+  .cmp .card.bad{border-color:#5c2730} .cmp .card.good{border-color:#1f5132}
+  .cmp h4{margin:0 0 8px;font-size:14px} .cmp .bad h4{color:var(--miss)} .cmp .good h4{color:var(--ok)}
+  .cmp ul{margin:0;padding-left:18px;font-size:13px;color:var(--dim)} .cmp li{margin:4px 0}
+  .note2{font-size:12.5px;color:var(--dim);margin-top:10px;padding:10px 12px;background:#13181f;border-left:3px solid var(--amber);border-radius:0 8px 8px 0}
+  code{background:#0a0e14;border:1px solid #232c39;border-radius:4px;padding:1px 5px;font-size:12px;color:var(--amber2)}
+  .foot{margin-top:40px;color:var(--dim);font-size:12px;text-align:center;border-top:1px solid var(--line);padding-top:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>JAINE Gemini Media</h1>
+  <p class="sub">Глаза и уши для Claude Code. Claude не принимает видео и не слышит аудио — Gemini принимает и то, и другое. Этот плагин — мост. Демо ниже симулирует поток (ответы Gemini — заглушки), чтобы показать механику.</p>
+  <div>
+    <span class="tag">scope: видео + аудио</span>
+    <span class="tag">транспорт: stdio</span>
+    <span class="tag">bundled · без npx</span>
+    <span class="gemtag tag">Gemini Files API</span>
+    <span class="gemtag tag">fileUri-кэш 48ч на диске</span>
+  </div>
+
+  <section>
+    <p class="h">Архитектура</p>
+    <div class="arch" id="arch">
+      <div class="node" id="n-cc"><div class="ic">🧠</div><b>Claude Code</b><small>мозг · зовёт tool<br>analyze_video / analyze_audio</small></div>
+      <div class="arrow" id="a1">→</div>
+      <div class="node" id="n-mcp"><div class="ic">🔌</div><b>MCP-сервер</b><small>Python · bundled<br>sha256→fileUri кэш на диске</small></div>
+      <div class="arrow gem" id="a2">→</div>
+      <div class="node gem" id="n-gem"><div class="ic">👁️</div><b>Gemini Files API</b><small>смотрит кадры<br>+ слышит дорожку</small></div>
+    </div>
+  </section>
+
+  <section>
+    <p class="h">Попробуй: задай вопросы одному и тому же файлу</p>
+    <div class="sim">
+      <!-- LEFT: controls + chat -->
+      <div class="card">
+        <div class="row">
+          <span class="lbl">Файл</span>
+          <button class="sel" id="f-vid" onclick="pickFile('vid')">🎬 tutorial.mp4 <span style="color:var(--dim)">· 210 МБ</span></button>
+          <button id="f-aud" onclick="pickFile('aud')">🎧 lecture.mp3 <span style="color:var(--dim)">· 38 МБ</span></button>
+        </div>
+        <div class="row">
+          <span class="lbl">Режим multi-turn</span>
+          <div class="seg">
+            <button class="sel" id="m-less" onclick="setMode('stateless')">stateless re-query</button>
+            <button id="m-full" onclick="setMode('stateful')">stateful chat</button>
+          </div>
+        </div>
+        <div class="row" style="margin-bottom:6px"><span class="lbl">Вопросы (жми по порядку)</span></div>
+        <div id="qbox"></div>
+
+        <div class="row" style="margin-top:14px"><span class="lbl">Диалог</span></div>
+        <div class="chat" id="chat"><div class="empty">Диалог пуст — задай первый вопрос ☝️</div></div>
+        <button onclick="resetAll()" style="margin-top:6px">↺ Сбросить (очистить кэш и диалог)</button>
+      </div>
+
+      <!-- RIGHT: trace + cache -->
+      <div class="card">
+        <div class="row" style="margin-bottom:8px"><span class="lbl">Что происходит под капотом</span></div>
+        <div class="trace" id="trace"><div class="empty">Здесь по шагам появится: sha256 → проверка кэша → загрузка/переиспользование → вызов Gemini.</div></div>
+
+        <div class="cache">
+          <div class="row" style="margin:8px 0 4px"><span class="lbl">Кэш fileUri (на диске, переживает рестарт)</span></div>
+          <table><thead><tr><th>sha256(файла)</th><th>fileUri</th><th>истекает</th></tr></thead>
+          <tbody id="cacheBody"><tr><td colspan="3" class="empty">пусто</td></tr></tbody></table>
+        </div>
+
+        <div class="stat">
+          <div><b id="s-up">0</b><small>загрузок в Gemini</small></div>
+          <div><b id="s-hit">0</b><small>попаданий в кэш</small></div>
+          <div><b id="s-saved">0 МБ</b><small>сэкономлено трафика</small></div>
+        </div>
+      </div>
+    </div>
+    <div class="note2" id="modeNote">
+      <b>stateless re-query:</b> каждый вопрос независим. Переиспользуется только <i>загруженный файл</i> (fileUri) — Gemini заново смотрит, но не помнит прошлые вопросы. Дёшево, по умолчанию.
+    </div>
+  </section>
+
+  <section>
+    <p class="h">Почему bundled, а не npx (твой инцидент: 38 серверов · 3.8 ГБ)</p>
+    <div class="cmp">
+      <div class="card bad">
+        <h4>✗ npx / uvx @latest</h4>
+        <ul>
+          <li>ре-резолв пакета на каждый старт (15–30с, в облаке сервер молча дропается)</li>
+          <li>version drift — <code>@latest</code> тянет что попало</li>
+          <li>cache bloat: <code>uvx datahub@latest</code> → 3765 venv ≈ 150 ГБ</li>
+          <li>supply-chain риск (litellm PyPI-компромет), Windows <code>spawn ENOENT</code></li>
+        </ul>
+      </div>
+      <div class="card good">
+        <h4>✓ bundled-local (uv, frozen+offline)</h4>
+        <ul>
+          <li>депы ставятся <b>один раз</b> в <code>${CLAUDE_PLUGIN_DATA}/.venv</code> (SessionStart-hook, diff по lock)</li>
+          <li>запуск: <code>uv run --frozen --offline</code> → ноль сети, ноль дрейфа</li>
+          <li>reuse проверенного <code>gemini_files.py</code> из goat (TDD+bulldozer+E2E)</li>
+          <li>video-сервер idle-дёшев: нет upstream-соединения (в отличие от channel-плагина)</li>
+        </ul>
+      </div>
+    </div>
+    <div class="note2">
+      <b>Ключевое отличие от channel-боли:</b> те плагины плодили RAM, потому что держали постоянное соединение (Matrix <code>/sync</code>, web-порт). Video-сервер спит на stdin и просыпается только на вызов → «38 серверов 3.8 ГБ» структурно не грозит.
+    </div>
+  </section>
+
+  <div class="foot">Макет для понимания дизайна · ответы Gemini — заглушки · реальный MCP-сервер строится после одобрения дизайна</div>
+</div>
+
+<script>
+const FILES={
+  vid:{name:'tutorial.mp4',size:210,sha:'a3f8e1c4',icon:'🎬',kind:'video'},
+  aud:{name:'lecture.mp3',size:38, sha:'7b21d0af',icon:'🎧',kind:'audio'}
+};
+// canned Q&A per file; [0]=first (cold), rest are follow-ups
+const QA={
+  vid:[
+    {q:'Что происходит в видео?',
+     a:'Разработчик настраивает MCP-сервер: открывает терминал, правит .mcp.json, запускает Claude Code. На дорожке слышна речь (ru): «…теперь добавим сервер и перезапустим…» — Gemini её транскрибирует.'},
+    {q:'Какие команды он вводил в терминал?',
+     aLess:'(смотрю видео заново) В кадре команды: «uv run server.py», затем «claude». Курсор подтверждает запуск на ~0:47.',
+     aFull:'Как я отметил выше — он настраивал MCP. Конкретные команды в терминале: «uv run server.py», потом «claude».'},
+    {q:'На какой секунде запустился сервер?',
+     aLess:'(смотрю видео заново) Лог «server listening» появляется на ~0:47.',
+     aFull:'Те самые команды дали «server listening» примерно на 0:47.'}
+  ],
+  aud:[
+    {q:'О чём эта аудиозапись?',
+     a:'Лекция о Model Context Protocol: спикер объясняет stdio-транспорт и жизненный цикл сервера. Тон спокойный, ~12 минут, один голос (ru).'},
+    {q:'Какие термины он упоминал?',
+     aLess:'(слушаю заново) Звучат: «stdio», «JSON-RPC», «fileUri», «кэш на 48 часов».',
+     aFull:'В продолжение — ключевые термины из той же лекции: «stdio», «JSON-RPC», «fileUri», «кэш 48ч».'}
+  ]
+};
+
+let cur='vid', mode='stateless', step=0, cache={}, ups=0, hits=0, saved=0, busy=false;
+
+function pickFile(f){ if(busy)return; cur=f; step=0;
+  document.getElementById('f-vid').classList.toggle('sel',f==='vid');
+  document.getElementById('f-aud').classList.toggle('sel',f==='aud');
+  document.getElementById('chat').innerHTML='<div class="empty">Диалог пуст — задай первый вопрос ☝️</div>';
+  renderQ();
+}
+function setMode(m){ if(busy)return; mode=m;
+  document.getElementById('m-less').classList.toggle('sel',m==='stateless');
+  document.getElementById('m-full').classList.toggle('sel',m==='stateful');
+  document.getElementById('modeNote').innerHTML = m==='stateless'
+    ? '<b>stateless re-query:</b> каждый вопрос независим. Переиспользуется только <i>загруженный файл</i> (fileUri) — Gemini заново смотрит, но не помнит прошлые вопросы. Дёшево, по умолчанию.'
+    : '<b>stateful chat:</b> Gemini держит <i>историю диалога</i> о файле — помнит, что уже спросили и ответили, можно ссылаться на прошлое. Тот же fileUri-кэш, но тащим историю реплик. Дороже (контекст растёт).';
+}
+function renderQ(){
+  const list=QA[cur], box=document.getElementById('qbox'); box.innerHTML='';
+  list.forEach((item,i)=>{
+    const b=document.createElement('button'); b.className='q'; b.disabled=(i!==step)||busy;
+    b.textContent=(i===0?'① ':(i+1)+'⃝ ').replace(/\d⃝/, (i+1)+'.') + item.q;
+    b.textContent=(i+1)+'. '+item.q + (i===step?'  ⟵':'');
+    b.onclick=()=>ask(i); box.appendChild(b);
+  });
+}
+function addMsg(cls,who,txt){
+  const c=document.getElementById('chat'); if(c.querySelector('.empty'))c.innerHTML='';
+  const d=document.createElement('div'); d.className='msg '+cls;
+  d.innerHTML='<div class="who">'+who+'</div>'+txt; c.appendChild(d); c.scrollTop=c.scrollHeight;
+}
+function clearTrace(){document.getElementById('trace').innerHTML='';}
+function addStep(cls,html,delay){
+  return new Promise(res=>{ setTimeout(()=>{
+    const t=document.getElementById('trace'); if(t.querySelector('.empty'))t.innerHTML='';
+    const d=document.createElement('div'); d.className='step '+cls; d.innerHTML='<span class="dot">●</span><span>'+html+'</span>';
+    t.appendChild(d); requestAnimationFrame(()=>d.classList.add('show')); t.scrollTop=t.scrollHeight; res(d);
+  },delay); });
+}
+function setLight(id,on,gem){const e=document.getElementById(id);e.classList.toggle('act',on);if(gem)e.classList.toggle('act',on);}
+function lights(cc,mcp,gem){
+  document.getElementById('n-cc').classList.toggle('act',cc);
+  document.getElementById('a1').classList.toggle('act',cc||mcp);
+  document.getElementById('n-mcp').classList.toggle('act',mcp);
+  document.getElementById('a2').classList.toggle('act',mcp&&gem);
+  document.getElementById('n-gem').classList.toggle('act',gem);
+}
+async function upload(sizeMB){
+  const d=await addStep('gem','загрузка в Files API <span class="bar"><i id="bar"></i></span>',120);
+  const bar=document.getElementById('bar');
+  for(let p=0;p<=100;p+=4){ bar.style.width=p+'%'; await new Promise(r=>setTimeout(r,18)); }
+  return 'gs://files/'+Math.random().toString(36).slice(2,8);
+}
+function renderCache(){
+  const b=document.getElementById('cacheBody'); const keys=Object.keys(cache);
+  if(!keys.length){b.innerHTML='<tr><td colspan="3" class="empty">пусто</td></tr>';return;}
+  b.innerHTML=keys.map(k=>`<tr><td>${k}…</td><td class="u">${cache[k].uri}</td><td class="exp">${cache[k].exp}</td></tr>`).join('');
+}
+function stats(){document.getElementById('s-up').textContent=ups;
+  document.getElementById('s-hit').textContent=hits;
+  document.getElementById('s-saved').textContent=saved+' МБ';}
+
+async function ask(i){
+  if(busy||i!==step)return; busy=true; renderQ();
+  const F=FILES[cur], item=QA[cur][i];
+  addMsg('u','ты → Claude', item.q);
+  clearTrace(); lights(true,false,false);
+  await addStep('','Claude зовёт <b>'+(F.kind==='video'?'analyze_video':'analyze_audio')+'</b>('+F.name+', "'+item.q.slice(0,24)+'…")',150);
+  lights(false,true,false);
+  await addStep('','MCP-сервер: sha256('+F.name+') = <b>'+F.sha+'</b>',500);
+
+  const cold=!cache[F.sha];
+  if(cold){
+    await addStep('miss','проверка кэша → <b>MISS</b><span class="pill miss">холодный файл</span>',500);
+    lights(false,true,true);
+    const uri=await upload(F.size);
+    const exp='через 48:00';
+    cache[F.sha]={uri,exp}; ups++;
+    await addStep('gem','получен fileUri = <b>'+uri+'</b>',150);
+    await addStep('hit','сохранили в кэш на диск (TTL 48ч) → переживёт рестарт',420);
+    renderCache(); stats();
+  }else{
+    await addStep('hit','проверка кэша → <b>HIT</b><span class="pill hit">уже загружен</span>',520);
+    hits++; saved+=F.size;
+    await addStep('hit','переиспользуем fileUri <b>'+cache[F.sha].uri+'</b> — <b>пропущена загрузка '+F.size+' МБ</b>',430);
+    lights(false,true,true); stats();
+  }
+
+  // mode behaviour
+  if(mode==='stateful' && i>0){
+    await addStep('gem','режим stateful: прикладываем историю диалога ('+i+' прошлых реплик) — Gemini помнит контекст',500);
+  }else if(mode==='stateless' && i>0){
+    await addStep('','режим stateless: история НЕ прикладывается — независимый запрос',500);
+  }
+  await addStep('gem','Gemini '+(F.kind==='video'?'смотрит кадры + слышит дорожку':'слушает аудио')+' → формирует ответ',650);
+  lights(false,false,true);
+
+  let ans = item.a || (mode==='stateful'?item.aFull:item.aLess);
+  await new Promise(r=>setTimeout(r,250));
+  addMsg('g','Gemini ('+(F.kind==='video'?'видео':'аудио')+')', ans);
+  await addStep('hit','ответ возвращён Claude ✓',200);
+  lights(false,false,false);
+
+  step++; busy=false; renderQ();
+}
+function resetAll(){ if(busy)return; cache={};ups=0;hits=0;saved=0;step=0;
+  renderCache();stats();clearTrace();
+  document.getElementById('trace').innerHTML='<div class="empty">Здесь по шагам появится: sha256 → проверка кэша → загрузка/переиспользование → вызов Gemini.</div>';
+  document.getElementById('chat').innerHTML='<div class="empty">Диалог пуст — задай первый вопрос ☝️</div>';
+  renderQ();
+}
+renderQ();renderCache();stats();
+</script>
+</body>
+</html>

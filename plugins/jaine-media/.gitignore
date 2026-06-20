@@ -1,0 +1,11 @@
+# bundled venv (recreated via uv sync / SessionStart bootstrap)
+server/.venv/
+**/__pycache__/
+*.pyc
+# runtime media workspace (uploaded copies, extracted frames, gemini answers)
+workspace/
+.jaine-media-workspace/
+# local dev data dir (fileUri cache + workspace fallback when CLAUDE_PLUGIN_DATA unset)
+.aitemp/
+# pytest
+.pytest_cache/

@@ -96,6 +96,16 @@
       },
       "source": "./plugins/guards",
       "category": "development"
+    },
+    {
+      "name": "jaine-media",
+      "description": "Media understanding for Claude Code via Gemini — see video, hear audio, extract frames",
+      "author": {
+        "name": "JAINE",
+        "email": "jaine@local"
+      },
+      "source": "./plugins/jaine-media",
+      "category": "development"
     }
   ]
 }
