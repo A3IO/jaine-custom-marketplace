@@ -38,6 +38,14 @@ def test_frame_timecodes_never_exceeds_window_end():
     assert min(out) >= 0.0
 
 
+def test_frame_timecodes_includes_window_end_with_nonround_step():
+    # #214.2: int((end-start)/step) floors; tc=1.0,window=0.15,step=0.1 → 0.3/0.1=2.9999→2
+    # silently drops the window-end frame (t=1.15==end) — the symmetric opposite of the #5
+    # overshoot. An epsilon before the floor recovers it (the t<=end clamp keeps it in range).
+    out = media.frame_timecodes(1.0, window=0.15, step=0.1, duration=20.0)
+    assert 1.15 in out             # the window-end frame must be present
+
+
 def test_probe_duration_na_raises_clear_error(monkeypatch):
     # review #10: a duration-less container (live segment → 'N/A') or a failed ffprobe
     # (empty stdout) must raise a CLEAR error, not an opaque float() ValueError.

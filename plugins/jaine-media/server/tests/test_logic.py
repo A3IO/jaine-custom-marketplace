@@ -80,6 +80,16 @@ def test_body_carries_the_question_text():
     assert "when does it flash red?" in text
 
 
+def test_body_never_steers_answer_length():
+    # #223: _build_request_body must NOT inject any answer-length steer — the model answers
+    # freely and the cap is applied client-side in _frame_answer (a soft steer measurably
+    # shortened Gemini's output, truncating even the full-text file dropped to disk).
+    body = server._build_request_body([_ref()], "опиши видео", max_tokens=2048)
+    text = body["contents"][0]["parts"][-1]["text"].lower()
+    assert "concise" not in text
+    assert "character" not in text
+
+
 def test_body_multi_refs_make_one_filepart_each():
     # #202: several videos as several file-parts in ONE request (full res each)
     parts = server._build_request_body([_ref(), _ref()], "compare", max_tokens=512)["contents"][0]["parts"]
@@ -146,6 +156,8 @@ def test_body_skips_history_turn_with_empty_parts():
                {"role": "model", "text": ""}]            # empty model turn (e.g. EMPTY finish)
     contents = server._build_request_body([_ref()], "next", max_tokens=512, history=history)["contents"]
     assert all(c["parts"] for c in contents)             # no empty parts array survives
+    assert len(contents) == 2                            # the empty model turn was dropped, not kept
+    assert [c["role"] for c in contents] == ["user", "user"]   # prior user + new user, no empty model
 
 
 # --- _collect_targets (path | paths → validated existing-file list) ---
@@ -257,3 +269,84 @@ def test_parse_handles_empty_response():
     assert text == ""
     assert audio == 0
     assert finish == "EMPTY"            # no candidate, no block reason
+
+
+# --- _finish_note (structured cause diagnostics — B1/B2, panel-validated) ---
+
+def test_finish_note_blames_thinking_when_it_ate_the_budget():
+    # MAX_TOKENS with thought >> cand: thinking consumed the shared output pool
+    # (empirically the common case on thinking models — probe + python-genai #2062).
+    note = server._finish_note("MAX_TOKENS", thought=460, cand=5)
+    assert note is not None
+    assert "thinking" in note.lower()
+
+
+def test_finish_note_plain_truncation_when_the_answer_itself_was_long():
+    # cand dominates: the visible answer hit the cap, thinking wasn't the culprit
+    note = server._finish_note("MAX_TOKENS", thought=10, cand=500)
+    assert note is not None
+    assert "thinking" not in note.lower()
+
+
+def test_finish_note_safety_block_does_not_advise_switching_model():
+    # panel consensus + B2: a safety block is content/prompt-driven; switching to pro is futile
+    note = server._finish_note("BLOCKED:SAFETY")
+    assert note is not None
+    assert "pro" not in note.lower()
+
+
+# --- _usage_tokens (thinking vs visible-answer token split — Grok's observability point) ---
+
+def test_usage_tokens_extracts_thought_and_candidate_counts():
+    d = {"usageMetadata": {"thoughtsTokenCount": 460, "candidatesTokenCount": 5}}
+    thought, cand = server._usage_tokens(d)
+    assert thought == 460
+    assert cand == 5
+
+
+def test_usage_tokens_default_zero_when_absent():
+    # 2.5-family without a thinkingConfig may omit thoughtsTokenCount entirely
+    thought, cand = server._usage_tokens({})
+    assert thought == 0
+    assert cand == 0
+
+
+# --- _frame_answer (client-side visible-answer cap — Chris: think freely, frame the answer) ---
+
+def test_frame_answer_keeps_short_answer_whole():
+    visible, truncated = server._frame_answer("short answer", 100)
+    assert visible == "short answer"
+    assert truncated is False
+
+
+def test_frame_answer_truncates_over_limit_and_flags():
+    visible, truncated = server._frame_answer("a" * 100, 40)
+    assert truncated is True
+    assert visible.startswith("a" * 40)        # keeps the first `limit` chars verbatim
+    assert "jaine-media" in visible.lower()    # marker tells the reader it was cut
+    assert "full_answer_file" in visible       # default (saved) marker points at the file
+
+
+def test_frame_answer_unsaved_marker_does_not_promise_file():
+    # when the full text could NOT be saved (data-fs failure), the marker must be honest —
+    # it must not point at a full_answer_file that does not exist.
+    visible, truncated = server._frame_answer("a" * 100, 40, saved=False)
+    assert truncated is True
+    assert visible.startswith("a" * 40)
+    assert "full_answer_file" not in visible
+
+
+# --- _answer_char_limit (detail → visible char cap, with override) ---
+
+def test_answer_char_limit_maps_detail():
+    assert server._answer_char_limit("brief") == 2000
+    assert server._answer_char_limit("normal") == 8000
+    assert server._answer_char_limit("full") == 32000
+
+
+def test_answer_char_limit_override_wins():
+    assert server._answer_char_limit("full", 500) == 500
+
+
+def test_answer_char_limit_unknown_detail_falls_back_to_normal():
+    assert server._answer_char_limit("verbose") == 8000

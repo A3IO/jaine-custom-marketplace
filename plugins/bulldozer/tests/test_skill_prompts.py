@@ -475,3 +475,19 @@ class TestE1Step:
         assert "not found" in low or "not registered" in low  # the failure signal
         assert "inline" in low                                 # the fallback action
         assert "reload-plugins" in low                         # the documented remedy
+
+
+def test_skill_md_resolves_scripts_without_requiring_plugin_root_env():
+    """#236 (sibling of #221): $CLAUDE_PLUGIN_ROOT is NOT exported to the Bash tool
+    (empirically empty in CC 2.1.185), so the documented bulldozer-round.sh invocations
+    AND the feedback `jq` version line must SELF-RESOLVE the plugin dir from the cache —
+    honoring the var if set, but never hard-requiring it. Mirrors the consult fix (PR #235).
+    Guards against reverting to the raw ${CLAUDE_PLUGIN_ROOT}/... form (the #236 bug)."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+    # self-resolving fallback present (BULLDOZER_DIR resolver + feedback jq):
+    assert "ls -dt ~/.claude/plugins/cache/*/bulldozer/*/" in text
+    assert '[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]' in text                # guarded honor-if-set
+    assert "ls -dt ~/.claude/plugins/cache/*/bulldozer/*/.claude-plugin/plugin.json" in text
+    # the OLD raw forms that break with an empty var must be gone:
+    assert '"${CLAUDE_PLUGIN_ROOT}/skills/check/scripts/bulldozer-round.sh"' not in text
+    assert 'jq -r .version "$CLAUDE_PLUGIN_ROOT/.claude-plugin/plugin.json"' not in text

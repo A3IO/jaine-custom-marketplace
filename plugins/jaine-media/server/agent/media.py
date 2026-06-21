@@ -164,7 +164,7 @@ def frame_timecodes(timecode: float, *, window: float, step: float, duration: fl
     start = max(0.0, timecode - window)
     end = min(duration, timecode + window)
     times = []
-    n = int((end - start) / step) if step > 0 else 0   # floor: start + n*step never exceeds end
+    n = int((end - start) / step + 1e-9) if step > 0 else 0   # floor (+epsilon: keep the window-end frame, #214.2)
     for i in range(n + 1):
         t = round(start + i * step, 3)
         if t <= end:                                   # guard float drift past the window end (#5)

@@ -25,7 +25,14 @@ Key wire facts (distinct from the TypeScript type names in the schema):
   - turn/completed  → params {threadId, turn:{...}} — NO final text
   - server→client REQUEST: both "id" AND "method" present (jsonrpc_lite)
     e.g. {id:"req-1", method:"item/commandExecution/requestApproval",
-          params:{threadId, turnId, itemId, startedAtMs, command}}
+          params:{threadId, turnId, itemId, startedAtMs, command, cwd, reason,
+                  commandActions, proposedExecpolicyAmendment,
+                  proposedNetworkPolicyAmendments,
+                  availableDecisions:['accept',
+                                      {acceptWithExecpolicyAmendment:{…}},
+                                      'cancel']}}
+    NO "approvalId" — it is OPTIONAL in the stable schema and codex omits it
+    in practice (spec 3c / #204), so the fake omits it too.
 """
 import json
 import os
@@ -188,9 +195,16 @@ def _handle_turn_start_with_approval(req_id, approval_reply_waiter, thread_id="T
         "startedAtMs": int(time.time() * 1000),
         "command": "echo hello",
         "cwd": "/tmp",
-        "approvalId": None,
         "reason": None,
-        "availableDecisions": ["accept", "decline"],
+        # F8 / spec 3c: real param keys (use the Step-0 recon shapes); NO phantom approvalId
+        "commandActions": [],
+        "proposedExecpolicyAmendment": ["allow echo"],
+        "proposedNetworkPolicyAmendments": [],
+        "availableDecisions": [
+            "accept",
+            {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["allow echo"]}},
+            "cancel",
+        ],
     })
 
     # 3. Wait for the client reply (with timeout)

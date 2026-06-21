@@ -1091,3 +1091,17 @@ class TestEphemeralLane:
         cfg, _ = _parse_dryrun(r.stdout)
         assert cfg["ephemeral"] == "1"
         assert "jaine-drive-eph-" in cfg["profile"]
+
+
+def test_look_skill_md_resolves_scripts_without_requiring_plugin_root_env():
+    """#236 (sibling of #221): $CLAUDE_PLUGIN_ROOT is NOT exported to the Bash tool
+    (empirically empty), so the documented cdp.py / launch.sh invocations AND the feedback
+    `jq` version line must SELF-RESOLVE the plugin dir from the cache — honoring the var if
+    set, never hard-requiring it. Mirrors the consult fix (PR #235)."""
+    skill = (PLUGIN_ROOT / "skills" / "look" / "SKILL.md").read_text()
+    assert "ls -dt ~/.claude/plugins/cache/*/bulldozer/*/" in skill
+    assert '[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]' in skill                # guarded honor-if-set
+    assert "ls -dt ~/.claude/plugins/cache/*/bulldozer/*/.claude-plugin/plugin.json" in skill
+    # no raw ${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/... invocation may remain:
+    assert "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/" not in skill
+    assert 'jq -r .version "$CLAUDE_PLUGIN_ROOT/.claude-plugin/plugin.json"' not in skill

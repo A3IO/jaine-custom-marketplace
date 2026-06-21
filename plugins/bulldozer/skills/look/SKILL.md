@@ -19,27 +19,31 @@ Example: `/bulldozer:look file:///tmp/page.html — проверить ренд�
 
 Why: `launch.sh` reads `$1` verbatim as the URL and `cdp.py navigate` does the same. Passing the full `$ARGUMENTS` produces a malformed URL whenever the user adds a description.
 
-1. Check browser status:
+1. Resolve the scripts, then check browser status. `$CLAUDE_PLUGIN_ROOT` is **not** exported to the Bash tool (#221), so resolve the plugin dir from the cache (honoring the var if it IS set). Shell state doesn't persist across Bash calls — re-run this resolver in any later Bash call that uses `$CDP`/`$LAUNCH` (it's a cheap filesystem lookup):
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" status
+BULLDOZER_DIR=$( { [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT/skills/look" ] \
+  && printf '%s\n' "$CLAUDE_PLUGIN_ROOT"; } || ls -dt ~/.claude/plugins/cache/*/bulldozer/*/ 2>/dev/null | head -1 )
+CDP="$BULLDOZER_DIR/skills/look/scripts/cdp.py"
+LAUNCH="$BULLDOZER_DIR/skills/look/scripts/launch.sh"
+python3 "$CDP" status
 ```
 
-2. If OFFLINE, launch with the parsed URL (or `about:blank` if none):
+2. If OFFLINE, launch with the parsed URL (or `about:blank` if none) — re-run the resolver above first if this is a separate Bash call:
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/launch.sh" "<parsed URL or about:blank>" &
+"$LAUNCH" "<parsed URL or about:blank>" &
 sleep 5
 ```
 
 3. If browser was already ONLINE and a URL was parsed, navigate:
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" navigate "<parsed URL>"
+python3 "$CDP" navigate "<parsed URL>"
 sleep 2
 ```
 Skip step 3 if you just launched the browser in step 2 (it already opened the URL).
 
 4. Screenshot + show:
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py" screenshot /tmp/jaine-look.jpg
+python3 "$CDP" screenshot /tmp/jaine-look.jpg
 ```
 Then Read the screenshot file to see it.
 
@@ -69,7 +73,11 @@ Auto-detected: `cdp.py status` shows active channel. Fallback is transparent —
 ## Quick Reference
 
 ```bash
-CDP="${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/cdp.py"
+# Resolve scripts ($CLAUDE_PLUGIN_ROOT is NOT in the Bash env — #221; re-run per Bash call):
+BULLDOZER_DIR=$( { [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT/skills/look" ] \
+  && printf '%s\n' "$CLAUDE_PLUGIN_ROOT"; } || ls -dt ~/.claude/plugins/cache/*/bulldozer/*/ 2>/dev/null | head -1 )
+CDP="$BULLDOZER_DIR/skills/look/scripts/cdp.py"
+LAUNCH="$BULLDOZER_DIR/skills/look/scripts/launch.sh"
 
 # Global flag — pin every command in the call to one tab (CDP/websocket only):
 #   python3 "$CDP" --target SEL CMD ...   SEL = full target id, its 12-char prefix
@@ -132,18 +140,19 @@ python3 "$CDP" window activate           # bring to front (headful only)
 JAINE Browser = separate Chrome instance, no extensions:
 - **CDP port:** 9333
 - **Profile:** `/0/.jaine/.browser/profile/`
-- **Launcher:** `${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/launch.sh [URL]`
+- **Launcher:** `$LAUNCH [URL]` (resolve `LAUNCH` via the Quick Reference snippet — `$CLAUDE_PLUGIN_ROOT` is not exported to the Bash tool, #221)
 - **Rendering fidelity:** Chrome's Auto Dark Mode (`WebContentsForceDark`) is **off** — screenshots reflect the page as a normal user sees it. The browser UI (window/tabs/menus) follows the OS appearance setting; the CDP capture path never includes browser UI anyway.
 
 ### Lanes (parallel + headless)
 
 A *lane* is an isolated browser = a set of env vars; the default invocation (no
-env, no flag) is unchanged.
+env, no flag) is unchanged. The example blocks below use `$LAUNCH`/`$CDP` from the
+Quick Reference resolver — set them in the same Bash call.
 
 ```bash
 # Isolated headless lane on port 9334 (own temp profile):
 CDP_PORT=9334 LOOK_PROFILE_DIR=/tmp/lane-a LOOK_HEADLESS=1 \
-  "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/launch.sh" "http://localhost:9401"
+  "$LAUNCH" "http://localhost:9401"
 CDP_PORT=9334 python3 "$CDP" screenshot /tmp/a.jpg
 ```
 
@@ -174,7 +183,7 @@ Chrome argv and exits without launching — useful to confirm a lane's flags.
 
 If `status` shows OFFLINE:
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/launch.sh" "http://localhost:9401"
+"$LAUNCH" "http://localhost:9401"
 ```
 
 ### Web-security lane (`--insecure` / `LOOK_INSECURE`) — isolated trusted-LAN testing only
@@ -185,7 +194,7 @@ lane may opt into Chrome's `--disable-web-security`:
 
 ```bash
 CDP_PORT=9334 LOOK_PROFILE_DIR=/tmp/look-lan LOOK_HEADLESS=1 \
-  "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/launch.sh" --insecure http://localhost:8080/page
+  "$LAUNCH" --insecure http://localhost:8080/page
 ```
 
 `--insecure` (or `LOOK_INSECURE=1`/`true`/`yes`, case-insensitive; any other value = off) is
@@ -210,7 +219,7 @@ as `curl --cacert`).
 ```bash
 # Standard drive recipe — --automation's temp profile satisfies the gate:
 CDP_PORT=9341 LOOK_HEADLESS=1 \
-  "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/launch.sh" --automation \
+  "$LAUNCH" --automation \
   --cert-spki="BASE64PIN=" https://192.168.1.50:8443/
 
 # Compute a target's pin:
@@ -409,7 +418,7 @@ gh issue create --repo A3IO/jaine-plugins \
 {what was done instead, or "none — blocked"}
 
 ## Environment
-- Plugin version: $(jq -r .version "$CLAUDE_PLUGIN_ROOT/.claude-plugin/plugin.json")
+- Plugin version: $(jq -r .version "$(ls -dt ~/.claude/plugins/cache/*/bulldozer/*/.claude-plugin/plugin.json 2>/dev/null | head -1)" 2>/dev/null || echo unknown)
 - Skill: look
 - Project: $(pwd)
 ISSUE

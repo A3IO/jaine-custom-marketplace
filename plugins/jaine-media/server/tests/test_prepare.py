@@ -106,3 +106,18 @@ async def test_prepare_media_rejects_start_after_end_before_ffmpeg(tmp_path, mon
     d = json.loads(await server.prepare_media(str(_VIDEO), start=10.0, end=5.0))
     assert d["success"] is False
     assert "start" in d["error"].lower()
+
+
+async def test_prepare_media_never_crashes_on_hash_oserror(tmp_path, monkeypatch):
+    # backfill (#2/#11): an OSError during hashing/workspace (read-only or full data-fs)
+    # must be caught — {success:false}, never propagated to FastMCP.
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    f = tmp_path / "clip.mp4"
+    f.write_bytes(b"x")
+
+    async def _boom(_p):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(server.gemini_files, "compute_file_hash", _boom)
+    d = json.loads(await server.prepare_media(str(f)))
+    assert d["success"] is False

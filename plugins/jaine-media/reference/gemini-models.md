@@ -18,7 +18,7 @@
 | gemini-3.1-flash-lite-preview | preview | YES | **MAX_TOKENS** | 0 | 9.3s | 1M / 64k |
 | gemini-3.1-pro-preview | preview | YES | **MAX_TOKENS** | 0 | 17.9s | 1M / 64k |
 | gemini-3.5-flash | stable | YES | STOP | 0 | 13.1s | 1M / 64k |
-| ~~gemini-3-pro-preview~~ | **RETIRED (404)** | — | — | — | — | listed but `generateContent` 404 |
+| gemini-3-pro-preview | preview (вернулся 2026-06-21) | ? | ? | — | — | снова в `models.list`; sweep НЕ перезапускался — capability не замерен |
 
 (`gemini-3.1-pro-preview-customtools` excluded — tool-calling variant, not for media.
 `gemini-flash-latest`/`-lite-latest`/`-pro-latest` are moving aliases — pin a real id.)
@@ -30,7 +30,9 @@
   2.5-family itemizes an AUDIO modality (1440 tok); 3.x fold audio into VIDEO (`audio_tokens=0`
   yet they transcribe). **`audio_tokens=0` is NOT deafness.**
 - **`gemini-3.5-pro` and `gemini-2.0-*` DO NOT EXIST / are retired** — don't probe them
-  (sister was guessing these; they 404). `gemini-3-pro-preview` is also retired now.
+  (sister was guessing these; they 404). NB `gemini-3-pro-preview` was 404 on 2026-06-19 but
+  **is listed again as of 2026-06-21** (live `list_models`) — the catalog drifts; trust
+  `list_models`, not this snapshot.
 - **3.1-family (flash-lite, pro) is thinking-heavy** → hit MAX_TOKENS at 2048 on a
   transcribe+describe task (reasoning ate the budget). Give them ≥4096–8192 (detail='full')
   or they truncate. 2.5-family + 3-flash-preview + 3.5-flash finished clean (STOP) at 2048.

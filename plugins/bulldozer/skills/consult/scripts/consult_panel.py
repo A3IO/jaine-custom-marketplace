@@ -20,10 +20,12 @@ import re
 import secrets
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -387,6 +389,93 @@ def _agy_clean_new_by_nonce(before_ids: set[str], nonce: str) -> None:
         pass  # never raise out of _run_one's finally (BaseException e.g. KeyboardInterrupt still propagates)
 
 
+# ── §3.3b grok per-session cleanup (#192) ──
+#
+# grok runs on the REAL ~/.grok (a HOME sandbox broke its --repo auth, #147), so each leg
+# leaks the consult prompt into THREE local places despite --no-memory (verified live, #192):
+#   • ~/.grok/sessions/session_search.sqlite — a `grok sessions search`-able FTS index;
+#   • ~/.grok/sessions/<urlencoded-cwd>/<session_id>/ — the per-session transcript;
+#   • ~/.grok/sessions/<urlencoded-cwd>/prompt_history.jsonl — one line per prompt.
+# Unlike agy (no id in output → nonce-match), grok PRINTS its sessionId in --output-format
+# json, so we delete EXACTLY this run's session by that id — never a CONCURRENT user grok
+# session in the same cwd. `grok sessions delete` is NOT used: it round-trips to the network
+# (code.grok.com) and, on the common network failure, exits 0 having cleaned nothing local.
+# _GROK_STATE_DIR is module-level so tests redirect it off the real ~/.grok.
+
+_GROK_STATE_DIR = Path.home() / ".grok"
+
+
+def _grok_session_id(stdout: str) -> str | None:
+    """The grok run's ``sessionId`` from its --output-format json output (verified key,
+    §3.2). Empty/absent → None."""
+    return _parse_json_field(stdout, "sessionId") or None
+
+
+def _grok_clean_session(session_id: str, cwd: str, owned: bool) -> None:
+    """Delete EXACTLY this grok session's local artifacts (#192): its ``session_docs`` row in
+    session_search.sqlite (the AFTER DELETE trigger cascades the removal into the FTS index)
+    and its on-disk transcript under the cwd grok keys by. ``session_id`` MUST be a full UUID
+    (grok's id form) — anything else is ignored, so a partial/path-like id can never escape
+    its scope (parity with _agy_clean_conversation).
+
+    ``owned`` says whether ``cwd`` is a throwaway tempdir created for THIS leg (isolated mode):
+      • owned → the whole cwd-encoded grok dir is exclusively ours, so remove it wholesale
+        (transcript subdir + prompt_history.jsonl together) — no read-filter-write.
+      • not owned (informed mode, cwd = the user's repo, SHARED with possible concurrent user
+        grok sessions) → remove ONLY this session's own scoped subdir; leave the shared
+        prompt_history.jsonl alone. Rewriting it would race a concurrent append and could drop
+        a concurrent user's line (codex_review P2) — the row + transcript removal already kills
+        the searchable leak (#192); the residual prompt_history line is the safe trade.
+
+    Both the row DELETE (WHERE session_id = our id) and the subdir removal are scoped to our id,
+    so a concurrent session is never touched. Best-effort: never raises (runs after the leg; an
+    exception here would mask the run)."""
+    cid = (session_id or "").strip()
+    if not _UUID_RE.match(cid):
+        return
+    sessions = _GROK_STATE_DIR / "sessions"
+    db = sessions / "session_search.sqlite"
+    try:
+        if db.is_file():
+            conn = sqlite3.connect(str(db))
+            try:
+                conn.execute("DELETE FROM session_docs WHERE session_id = ?", (cid,))
+                conn.commit()
+            finally:
+                conn.close()
+    except (sqlite3.Error, OSError):
+        pass
+    # The transcript lives under the cwd grok keys by; realpath matches what grok stores (it
+    # canonicalizes — /tmp → /private/tmp on macOS).
+    try:
+        enc = urllib.parse.quote(os.path.realpath(cwd), safe="")
+    except (OSError, ValueError):
+        return
+    cwd_dir = sessions / enc
+    target = cwd_dir if owned else cwd_dir / cid
+    try:
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _grok_post_run_clean(result: "ModelResult", cwd: str, owned: bool) -> None:
+    """After a grok leg: parse its sessionId from the JSON output and clean that session's
+    local artifacts (#192). ``owned`` is forwarded to _grok_clean_session (isolated cwd → safe
+    wholesale removal; informed/shared cwd → scoped removal only). A failed/unparseable leg (no
+    id) → nothing to clean. Never raises — it runs right after the leg, so an exception here
+    would mask the runner's real error."""
+    try:
+        if result is None or not result.output:
+            return
+        sid = _grok_session_id(result.output)
+        if sid:
+            _grok_clean_session(sid, cwd, owned)
+    except Exception:
+        pass
+
+
 # ── §3.6 survivor-count merge gating + output rendering ──
 
 
@@ -671,6 +760,11 @@ class ModelSpec:
     # mechanism (read-only enforcement + transcript cleanup) lives at _AGY_READONLY_HOOK /
     # _agy_clean_new_by_nonce — the single source of truth; not restated here (drift-prone).
     readonly_hook: bool = False
+    # session_clean(result, cwd, owned): post-run cleanup of a leg's leaked session artifacts
+    # — grok only (it persists to the real ~/.grok; #192). ``owned`` = cwd is our throwaway
+    # tempdir (isolated) vs the shared repo (informed). agy cleans via its own nonce path in
+    # the readonly_hook branch; codex is --ephemeral (nothing to clean).
+    session_clean: "Callable[[ModelResult, str, bool], None] | None" = None
 
 
 # agy's display is "Gemini" (it runs Gemini models) — keeps the panel block label and
@@ -678,7 +772,10 @@ class ModelSpec:
 # agy needs ``readonly_hook`` (its print mode auto-accepts tools).
 _MODEL_SPECS: dict[str, ModelSpec] = {
     "codex": ModelSpec("GPT", parse_codex, lambda w, repo, t: (build_codex_cmd(w), {})),
-    "grok": ModelSpec("Grok", parse_grok, lambda w, repo, t: build_grok_cmd(w)),
+    "grok": ModelSpec(
+        "Grok", parse_grok, lambda w, repo, t: build_grok_cmd(w),
+        session_clean=_grok_post_run_clean,
+    ),
     "agy": ModelSpec(
         "Gemini", parse_agy, lambda w, repo, t: build_agy_cmd(w, repo, t),
         readonly_hook=True,
@@ -737,6 +834,9 @@ def _run_one(
             # informed: run in the repo; no throwaway tempdir needed (dogfood Grok)
             cmd, env = spec.prepare(wrapped, repo, timeout)
             result = runner(cmd, env, str(repo), timeout)
+            if spec.session_clean is not None:
+                # informed: cwd is the user's SHARED repo → scoped cleanup only (owned=False)
+                spec.session_clean(result, str(repo), False)  # grok: drop its leaked session (#192)
         else:
             # isolated: run in a throwaway EMPTY cwd so the model can't read anything
             cmd, env = spec.prepare(wrapped, repo, timeout)
@@ -744,6 +844,9 @@ def _run_one(
                 empty = Path(mt) / "cwd"
                 empty.mkdir()
                 result = runner(cmd, env, str(empty), timeout)
+                if spec.session_clean is not None:
+                    # isolated: cwd is OUR throwaway tempdir → safe wholesale cleanup (owned=True)
+                    spec.session_clean(result, str(empty), True)  # grok: drop its leaked session (#192)
     except Exception as e:
         # command-build (prepare) / spawn error → per-model failure, never crash the
         # whole panel (dogfood R2 finding)

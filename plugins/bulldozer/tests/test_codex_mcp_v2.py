@@ -37,6 +37,15 @@ def _has_codex():
 skip_if_no_codex = pytest.mark.skipif(not _has_codex(), reason="codex CLI not installed")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_codex_home(request, tmp_path_factory, monkeypatch):
+    """Hermetic offline tests: CODEX_HOME → empty tmp dir. Slow (live-codex) tests
+    are exempt — they need the real ~/.codex auth (F10)."""
+    if request.node.get_closest_marker("slow"):
+        return
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path_factory.mktemp("codex-home")))
+
+
 # ---------------------------------------------------------------------------
 # Task 2: JsonRpcStream, classify, Reactor
 # ---------------------------------------------------------------------------
@@ -376,18 +385,18 @@ def test_manager_initialize_sends_clientInfo_and_experimentalApi(fake_child):
 
 
 def test_start_thread_is_nonephemeral_and_isolated(tmp_path, fake_child):
-    from codex_server import AppServerManager, STERILE_INSTRUCTIONS, ISOLATION_CONFIG
+    from codex_server import AppServerManager, STERILE_INSTRUCTIONS
     m = AppServerManager(bin=fake_child)
     m.ensure()
     m.start_thread(sandbox="read-only", approval_policy="on-request",
-                   base_instructions=STERILE_INSTRUCTIONS, config=ISOLATION_CONFIG,
-                   cwd=str(tmp_path))
+                   base_instructions=STERILE_INSTRUCTIONS,
+                   config={"model_reasoning_effort": "high"}, cwd=str(tmp_path))
     p = fake_child.received("thread/start")["params"]
-    assert p.get("ephemeral") in (None, False)   # NEVER True for resumable
-    assert p["baseInstructions"] == STERILE_INSTRUCTIONS  # pinned sterile constant, not a placeholder
-    assert p["config"] == ISOLATION_CONFIG               # pinned config-override policy
+    assert p.get("ephemeral") in (None, False)
+    assert p["baseInstructions"] == STERILE_INSTRUCTIONS
+    assert p["config"] == {"model_reasoning_effort": "high"}  # benign passthrough; no injected mcp_servers
     assert p["sandbox"] == "read-only"
-    assert p["cwd"] == str(tmp_path)   # cwd pinned at thread/start (app-server reads it at config-load)
+    assert p["cwd"] == str(tmp_path)
 
 
 # ── B1 helpers ─────────────────────────────────────────────────────────────
@@ -1192,12 +1201,37 @@ class ExtendedFakeChild(FakeChild):
             super()._dispatch(msg)
             return
 
+        if method == "review/start":
+            tid = params.get("threadId", "T1")
+            turn_id = "RTURN1"
+            self._write_msg({"id": mid, "result": {
+                "turn": {"id": turn_id, "items": [], "status": "running"},
+                "reviewThreadId": tid}})
+            # Review output is a COMPLETED agentMessage item (not deltas).
+            self._write_msg({"method": "item/completed", "params": {
+                "item": {"id": "RI1", "type": "agentMessage",
+                         "text": "REVIEW: minus should be plus"},
+                "threadId": tid, "turnId": turn_id}})
+            self._write_msg({"method": "turn/completed", "params": {
+                "threadId": tid,
+                "turn": {"id": turn_id, "items": [], "itemsView": "loaded",
+                         "status": "completed", "error": None,
+                         "startedAt": 0, "completedAt": 0, "durationMs": 10}}})
+            return
+
         if method == "turn/start":
             # Record params for assertion
             self.turn_start_params = params
             turn_id = "TURN1"
             item_id = "ITEM1"
             thread_id = params.get("threadId", "T1")
+            if self._turn_variant == "pre_ack_terminal_error":
+                # Emit a TERMINAL error BEFORE the ACK (no TurnStartResponse) — tests #4:
+                # a pre-ACK terminal error must be surfaced, not masked as an ACK timeout.
+                self._write_msg({"method": "error", "params": {
+                    "error": {"message": "model unavailable"}, "willRetry": False,
+                    "threadId": thread_id, "turnId": turn_id}})
+                return
             # 1. TurnStartResponse
             self._write_msg({"id": mid, "result": {
                 "turn": {
@@ -1211,6 +1245,25 @@ class ExtendedFakeChild(FakeChild):
                     "durationMs": None,
                 }
             }})
+            if self._turn_variant == "with_usage":
+                # Real wire shape: params.tokenUsage = {last, total}, camelCase breakdown (spec 2a).
+                _bd = {"inputTokens": 100, "cachedInputTokens": 0, "outputTokens": 23,
+                       "reasoningOutputTokens": 0, "totalTokens": 123}
+                self._write_msg({"method": "thread/tokenUsage/updated", "params": {
+                    "threadId": thread_id, "turnId": turn_id,
+                    "tokenUsage": {"last": _bd, "total": _bd},
+                }})
+                self._write_msg({"method": "item/agentMessage/delta", "params": {
+                    "delta": self._final_message, "threadId": thread_id,
+                    "turnId": turn_id, "itemId": item_id,
+                }})
+                self._write_msg({"method": "turn/completed", "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": turn_id, "items": [], "itemsView": "loaded",
+                             "status": "completed", "error": None,
+                             "startedAt": 0, "completedAt": 0, "durationMs": 10},
+                }})
+                return
             if self._turn_variant == "failed":
                 # Variant: turn/completed with status="failed" (no delta)
                 self._write_msg({"method": "turn/completed", "params": {
@@ -1226,6 +1279,26 @@ class ExtendedFakeChild(FakeChild):
                         "durationMs": 10,
                     },
                 }})
+                return
+            if self._turn_variant == "transient_error":
+                # transient stream reconnect (willRetry) → must NOT drift; turn completes
+                self._write_msg({"method": "error", "params": {
+                    "error": {"message": "Reconnecting... 2/5"}, "willRetry": True,
+                    "threadId": thread_id, "turnId": turn_id}})
+                self._write_msg({"method": "item/agentMessage/delta", "params": {
+                    "delta": self._final_message, "threadId": thread_id,
+                    "turnId": turn_id, "itemId": item_id}})
+                self._write_msg({"method": "turn/completed", "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": turn_id, "items": [], "itemsView": "loaded",
+                             "status": "completed", "error": None,
+                             "startedAt": 0, "completedAt": 0, "durationMs": 10}}})
+                return
+            if self._turn_variant == "terminal_error":
+                # non-retry error → surface as a structured failure, NOT UNKNOWN_NOTIFICATION
+                self._write_msg({"method": "error", "params": {
+                    "error": {"message": "fatal boom"}, "willRetry": False,
+                    "threadId": thread_id, "turnId": turn_id}})
                 return
             if self._turn_variant == "unknown_server_request":
                 # Emit a server→client REQUEST with an UNBRIDGED method (fire-and-forget:
@@ -1321,7 +1394,8 @@ def ext_child():
 def call_codex_run(fake_child_inst, prompt, mode="review", sandbox=None,
                    approval_policy=None, effort=None, cwd=None, model=None,
                    thread_id=None, _force_bad_final=None, turn_variant=None,
-                   base_instructions=None, developer_instructions=None, config=None):
+                   base_instructions=None, developer_instructions=None, config=None,
+                   mcp="isolated", timeout=None):
     """Call codex_run_v2 with a fake child wired as the manager's backend.
 
     Sentinel: None = omit (keep thread posture on resume); use the string
@@ -1345,6 +1419,7 @@ def call_codex_run(fake_child_inst, prompt, mode="review", sandbox=None,
         return None
 
     args = {"prompt": prompt, "mode": mode}
+    args["mcp"] = mcp
     if sandbox is not None:
         args["sandbox"] = sandbox
     if approval_policy is not None:
@@ -1363,8 +1438,447 @@ def call_codex_run(fake_child_inst, prompt, mode="review", sandbox=None,
         args["developer_instructions"] = developer_instructions
     if config is not None:
         args["config"] = config
+    if timeout is not None:
+        args["timeout"] = timeout
 
     return codex_run_v2(args, manager=manager, cc_write_fn=cc_write, cc_read_fn=cc_read)
+
+
+# ── Surface additions (2026-06-21): config-doc / codex_info / codex_review ──
+
+def test_config_param_documents_passthrough_keys():
+    """Q1: the config param MUST document the passthrough-reachable keys so CC knows
+    what it can pass (spec 2026-06-21 Item 1; #204 §95 required this, never shipped)."""
+    import codex_server
+    tool = next(t for t in codex_server.TOOLS if t["name"] == "codex_run")
+    desc = (tool["inputSchema"]["properties"]["config"].get("description") or "").lower()
+    for key in ("web_search", "review_model", "model_verbosity", "model_reasoning_summary"):
+        assert key in desc, f"config param description must mention {key!r}; got: {desc!r}"
+
+
+class InfoFakeChild(FakeChild):
+    """FakeChild that answers the connection-level read methods (codex_info tests)."""
+    _CANNED = {
+        "model/list": {"data": [{"id": "gpt-5.5"}], "nextCursor": None},
+        "getAuthStatus": {"authMethod": "chatgpt", "requiresOpenaiAuth": True},
+        "config/read": {
+            "config": {"model": "gpt-5.5", "web_search": None, "approvals_reviewer": "user",
+                       "projects": {"big": "x" * 200}, "tui": {"theme": "dark"},
+                       "marketplaces": {"a": 1}},
+            "origins": {"model": "x" * 500},
+        },
+        "account/rateLimits/read": {"rateLimits": {"primary": {"usedPercent": 4}}},
+        "account/usage/read": {"summary": {"lifetimeTokens": 1}},
+        "mcpServerStatus/list": {"data": [{"name": "dash"}], "nextCursor": None},
+        "experimentalFeature/list": {"data": [{"name": "shell_tool"}], "nextCursor": None},
+        "permissionProfile/list": {"data": [{"id": ":read-only"}], "nextCursor": None},
+    }
+
+    def _dispatch(self, msg):
+        method = msg.get("method")
+        if method in self._CANNED:
+            self._write_msg({"id": msg.get("id"), "result": self._CANNED[method]})
+            return
+        super()._dispatch(msg)
+
+
+def test_codex_info_tool_registered():
+    import codex_server
+    tool = next((t for t in codex_server.TOOLS if t["name"] == "codex_info"), None)
+    assert tool is not None, "codex_info tool must be registered"
+    enum = set(tool["inputSchema"]["properties"]["query"].get("enum") or [])
+    assert enum == {"models", "auth", "config", "limits", "usage",
+                    "servers", "features", "profiles"}
+
+
+def test_codex_info_maps_query_to_method():
+    from codex_server import codex_info_v2, AppServerManager
+    fake = InfoFakeChild()
+    r = codex_info_v2({"query": "models"}, manager=AppServerManager(bin=fake))
+    assert r["query"] == "models"
+    assert r["result"]["data"][0]["id"] == "gpt-5.5"
+    assert fake.received("model/list") is not None, "must send model/list to the app-server"
+    fake.kill()
+
+
+def test_codex_info_paramless_query_maps_to_method():
+    """limits/usage take NO params (undefined on the wire) — still routed correctly."""
+    from codex_server import codex_info_v2, AppServerManager
+    fake = InfoFakeChild()
+    r = codex_info_v2({"query": "limits"}, manager=AppServerManager(bin=fake))
+    assert r["result"]["rateLimits"]["primary"]["usedPercent"] == 4
+    sent = fake.received("account/rateLimits/read")
+    assert sent is not None and "params" not in sent, "paramless query must omit params"
+    fake.kill()
+
+
+def test_codex_info_config_is_compact_projection():
+    """query='config' must return a WHITELIST projection of operational knobs + an
+    `omitted` list of the other top-level config keys (so new codex keys are visible,
+    not silent), and DROP the huge `origins` map. Avoids the 71K token blowout
+    (consult MINOR-FIXES, 2026-06-21)."""
+    from codex_server import codex_info_v2, AppServerManager
+    fake = InfoFakeChild()
+    r = codex_info_v2({"query": "config"}, manager=AppServerManager(bin=fake))
+    res = r["result"]
+    assert "origins" not in res, "origins map must be dropped"
+    cfg = res["config"]
+    # whitelisted operational knobs kept
+    assert cfg.get("model") == "gpt-5.5" and "web_search" in cfg and "approvals_reviewer" in cfg
+    # bulky non-operational sections dropped from config
+    assert "projects" not in cfg and "tui" not in cfg and "marketplaces" not in cfg
+    # but visible in `omitted` (hole closed: new keys are not silently hidden)
+    assert set(["projects", "tui", "marketplaces"]).issubset(set(res["omitted"]))
+    fake.kill()
+
+
+def test_codex_info_unknown_query_errors():
+    from codex_server import codex_info_v2, AppServerManager
+    fake = InfoFakeChild()
+    r = codex_info_v2({"query": "bogus"}, manager=AppServerManager(bin=fake))
+    assert "error" in r and "bogus" in r["error"]
+    fake.kill()
+
+
+def test_transient_error_notification_does_not_drift(ext_child):
+    """A `willRetry:true` error (e.g. 'Reconnecting N/5') is a transient stream
+    reconnect — codex retries on its own. It must NOT produce _drift and the turn
+    must still complete normally (spec 2026-06-21 Item 4)."""
+    r = call_codex_run(ext_child, "p", mode="implement", turn_variant="transient_error")
+    assert "error" not in r, r
+    assert r["result"] == "fake result", "turn must complete normally after a transient retry"
+    drift_codes = {d["code"] for d in r.get("_drift", [])}
+    assert "UNKNOWN_NOTIFICATION" not in drift_codes, \
+        f"transient willRetry error must NOT drift; got: {r.get('_drift')}"
+
+
+def test_terminal_error_notification_is_surfaced(ext_child):
+    """A non-retry error must be surfaced as a structured failure (the #204
+    parking-lot signal), NOT routed to UNKNOWN_NOTIFICATION drift."""
+    r = call_codex_run(ext_child, "p", mode="implement", turn_variant="terminal_error", timeout=5)
+    assert "error" in r and "fatal boom" in r["error"], r
+    drift_codes = {d["code"] for d in r.get("_drift", [])}
+    assert "UNKNOWN_NOTIFICATION" not in drift_codes, \
+        "terminal error must be surfaced, not UNKNOWN_NOTIFICATION"
+
+
+def test_codex_review_tool_registered():
+    import codex_server
+    tool = next((t for t in codex_server.TOOLS if t["name"] == "codex_review"), None)
+    assert tool is not None, "codex_review tool must be registered"
+    assert "target" in tool["inputSchema"]["properties"]
+    assert tool["inputSchema"]["required"] == ["mcp"]
+
+
+def test_parse_review_target_variants():
+    from codex_server import _parse_review_target
+    assert _parse_review_target("uncommitted") == {"type": "uncommittedChanges"}
+    assert _parse_review_target("branch:main") == {"type": "baseBranch", "branch": "main"}
+    assert _parse_review_target("commit:abc123")["sha"] == "abc123"
+    assert _parse_review_target("custom:check the auth")["instructions"] == "check the auth"
+    assert _parse_review_target("bogus:x") is None
+
+
+def test_codex_review_routes_effort_and_model_via_thread_config(ext_child):
+    """#12: review/start carries NO effort/model, and start_thread sends neither, so
+    codex_review must route effort→config.model_reasoning_effort and model→config.model
+    (the thread-level config that start_thread DOES send) — otherwise both are silently
+    ignored and the review always runs at the codex config default."""
+    from codex_server import codex_review_v2, AppServerManager
+    codex_review_v2(
+        {"target": "uncommitted", "mcp": "isolated", "cwd": "/tmp",
+         "effort": "xhigh", "model": "gpt-5.5"},
+        manager=AppServerManager(bin=ext_child),
+        cc_write_fn=lambda m: None, cc_read_fn=lambda timeout=10.0: None,
+    )
+    sent = ext_child.received("thread/start")
+    assert sent is not None, "thread/start must be sent"
+    cfg = sent["params"]["config"]
+    assert cfg.get("model_reasoning_effort") == "xhigh", f"effort must reach thread config; got {cfg}"
+    assert cfg.get("model") == "gpt-5.5", f"model must reach thread config; got {cfg}"
+
+
+def test_codex_review_routes_model_to_review_model(ext_child):
+    """#225 P2: codex's native review (review/start) prefers the review-specific
+    `review_model` config over the thread `model`. Routing the public `model` arg only
+    to config.model means it is silently ignored whenever `review_model` is configured.
+    codex_review must ALSO set config.review_model so `model` is authoritative for native
+    reviews."""
+    from codex_server import codex_review_v2, AppServerManager
+    codex_review_v2(
+        {"target": "uncommitted", "mcp": "isolated", "cwd": "/tmp", "model": "gpt-5.5"},
+        manager=AppServerManager(bin=ext_child),
+        cc_write_fn=lambda m: None, cc_read_fn=lambda timeout=10.0: None,
+    )
+    cfg = ext_child.received("thread/start")["params"]["config"]
+    assert cfg.get("model") == "gpt-5.5", f"model must reach thread config; got {cfg}"
+    assert cfg.get("review_model") == "gpt-5.5", \
+        f"model must ALSO route to review_model (native review prefers it); got {cfg}"
+
+
+def _review_cfg(ext_child, args):
+    from codex_server import codex_review_v2, AppServerManager
+    codex_review_v2({**args, "target": "uncommitted", "mcp": "isolated", "cwd": "/tmp"},
+                    manager=AppServerManager(bin=ext_child),
+                    cc_write_fn=lambda m: None, cc_read_fn=lambda timeout=10.0: None)
+    return ext_child.received("thread/start")["params"]["config"]
+
+
+def test_codex_review_model_arg_overrides_config_model(ext_child):
+    """#226 A (model authoritative): model arg + caller config.model must NOT diverge — the
+    arg wins for BOTH model and review_model so native review uses the requested model."""
+    cfg = _review_cfg(ext_child, {"model": "A", "config": {"model": "B"}})
+    assert cfg.get("model") == "A", f"model arg must win over config.model; got {cfg}"
+    assert cfg.get("review_model") == "A", f"review_model must match the authoritative model; got {cfg}"
+
+
+def test_codex_review_config_model_only_sets_review_model(ext_child):
+    """#226 A: a caller who passes ONLY config.model (no model arg) still gets review_model
+    set to that effective model — closes the config-only hole (native review would otherwise
+    fall back to the user's configured review_model)."""
+    cfg = _review_cfg(ext_child, {"config": {"model": "X"}})
+    assert cfg.get("model") == "X", cfg
+    assert cfg.get("review_model") == "X", f"config.model must propagate to review_model; got {cfg}"
+
+
+def test_codex_review_model_arg_overrides_explicit_review_model(ext_child):
+    """#226 A: model arg is authoritative even over an explicit caller config.review_model —
+    no divergence (the chosen semantics: arg wins)."""
+    cfg = _review_cfg(ext_child, {"model": "A", "config": {"review_model": "R"}})
+    assert cfg.get("review_model") == "A", f"model arg must override explicit review_model; got {cfg}"
+    assert cfg.get("model") == "A", cfg
+
+
+def test_codex_review_collects_findings_from_item_completed(ext_child):
+    """codex_review starts via review/start and collects findings from the completed
+    agentMessage item (review output is NOT streamed as deltas)."""
+    from codex_server import codex_review_v2, AppServerManager
+    r = codex_review_v2(
+        {"target": "uncommitted", "mcp": "isolated", "cwd": "/tmp"},
+        manager=AppServerManager(bin=ext_child),
+        cc_write_fn=lambda m: None, cc_read_fn=lambda timeout=10.0: None,
+    )
+    assert "error" not in r, r
+    assert "REVIEW: minus should be plus" in r["review"], r
+    assert "result" not in r, "implement-shape `result` must be renamed to `review`"
+    assert ext_child.received("review/start") is not None, "must send review/start"
+
+
+def test_codex_review_invalid_target_errors(ext_child):
+    from codex_server import codex_review_v2, AppServerManager
+    r = codex_review_v2({"target": "bogus:x", "mcp": "isolated"},
+                        manager=AppServerManager(bin=ext_child))
+    assert "error" in r and "target" in r["error"]
+
+
+def test_pre_ack_terminal_error_is_surfaced(ext_child):
+    """#4: a terminal error arriving BEFORE the start ACK must surface as the codex error,
+    not be silently dropped and masked as a generic 'response timed out'."""
+    r = call_codex_run(ext_child, "p", mode="implement",
+                       turn_variant="pre_ack_terminal_error", timeout=5)
+    assert "error" in r and "model unavailable" in r["error"], r
+    assert "timed out" not in r["error"], f"must not mask the real error as an ACK timeout: {r}"
+
+
+def test_project_config_failclosed_on_bad_shape():
+    """#6: _project_config must NOT return raw config/read on an unexpected shape (that
+    re-introduces the ~71K origins blowout) — fail closed to a small marker."""
+    from codex_server import _project_config
+    raw = {"origins": {"x": "y" * 1000}}   # no "config" key → unexpected shape
+    out = _project_config(raw)
+    assert out.get("config") == {} and "origins" not in out, out
+    assert "note" in out
+
+
+def test_codex_info_no_codex_binary_guard(monkeypatch):
+    """#16: codex_info must use the same filesystem check as codex_run — `CODEX` is a path
+    string that's always truthy, so the old `if not CODEX` guard never fired."""
+    import codex_server as cs
+    # Isolate the module singleton: with the #225 P3 reorder, the manager=None path now
+    # calls _get_manager() before the binary check, which would otherwise cache a manager
+    # bound to this fake CODEX and leak it (bin=/nonexistent) into later tests (e.g. the
+    # slow live reads). monkeypatch restores _v2_manager after the test.
+    monkeypatch.setattr(cs, "_v2_manager", None)
+    monkeypatch.setattr(cs, "_resolve_codex_bin", lambda: "/nonexistent/codex-bin-xyz")
+    r = cs.codex_info_v2({"query": "models"})   # manager=None → guard path
+    assert "error" in r and "not found" in r["error"], r
+
+
+def test_codex_info_reuses_live_child_when_binary_missing(monkeypatch):
+    """#225 P3: codex_info is documented to reuse a live app-server child without a
+    cold start. The no-codex binary guard must therefore fire ONLY when a fresh spawn is
+    actually needed (no live child) — not unconditionally. Otherwise a removed/broken
+    codex symlink mid-session (e.g. an upgrade) wrongly rejects a connection-level read
+    that a warm child from a prior codex_run could still answer. Exercises the real
+    dispatch path (manager=None → _get_manager singleton with a live child)."""
+    import codex_server as cs
+    fake = InfoFakeChild()
+    mgr = cs.AppServerManager(bin=fake)
+    mgr.ensure([])                                   # bring a (fake) child alive
+    assert cs._is_child_alive(mgr._child)
+    monkeypatch.setattr(cs, "_v2_manager", mgr)      # dispatch singleton has a live child
+    monkeypatch.setattr(cs, "_resolve_codex_bin", lambda: "/nonexistent/codex-bin-xyz")  # binary gone mid-session
+    r = cs.codex_info_v2({"query": "models"})        # manager=None → real guard path
+    assert "error" not in r, f"must reuse live child, not reject on missing binary: {r}"
+    assert r["result"]["data"][0]["id"] == "gpt-5.5"
+    fake.kill()
+
+
+def test_codex_info_explicit_manager_not_blocked_by_global_codex(monkeypatch):
+    """#226 D: with an EXPLICIT manager (its own _bin), codex_info must NOT reject based on
+    the global CODEX path. The spawn-time binary guard is only for the singleton (manager
+    was None) path, whose _bin IS the global CODEX; an explicit manager owns its bin. Here a
+    dead child forces a respawn — which must use the manager's own bin, not global CODEX."""
+    import codex_server as cs
+    mgr = cs.AppServerManager(bin=InfoFakeChild())
+    mgr._child = type("Dead", (), {"poll": lambda self: 1})()   # dead → ensure must respawn
+    monkeypatch.setattr(cs, "_resolve_codex_bin", lambda: "/nonexistent/codex-bin-xyz")
+    r = cs.codex_info_v2({"query": "models"}, manager=mgr)
+    assert "error" not in r, f"explicit-manager call must not be blocked by global CODEX: {r}"
+    assert r["result"]["data"][0]["id"] == "gpt-5.5"
+
+
+# ---------------------------------------------------------------------------
+# #227a: lazy CODEX binary resolution (item 1) + warm-child reconnect (item 2)
+# ---------------------------------------------------------------------------
+
+def test_resolve_codex_bin_reads_env_lazily(monkeypatch):
+    """#227 item 1a: the codex binary is resolved from the CURRENT env per call, not frozen
+    at import — a mid-session JAINE_CODEX_BIN change is picked up."""
+    import codex_server as cs
+    monkeypatch.setenv("JAINE_CODEX_BIN", "/first/codex")
+    assert cs._resolve_codex_bin() == "/first/codex"
+    monkeypatch.setenv("JAINE_CODEX_BIN", "/second/codex")   # changed mid-session
+    assert cs._resolve_codex_bin() == "/second/codex"        # re-read, not frozen
+
+
+def test_resolve_codex_bin_searches_path_for_fresh_install(monkeypatch):
+    """#227 item 1b: with no JAINE_CODEX_BIN override, resolution searches PATH by bare name
+    ('codex'), so a binary installed mid-session anywhere on PATH is found — where a frozen
+    absolute fallback would miss it."""
+    import codex_server as cs
+    monkeypatch.delenv("JAINE_CODEX_BIN", raising=False)
+    monkeypatch.setattr(cs.shutil, "which",
+                        lambda name: "/freshly/installed/codex" if name == "codex" else None)
+    assert cs._resolve_codex_bin() == "/freshly/installed/codex"
+
+
+def test_get_manager_singleton_spawns_from_lazy_resolution(monkeypatch):
+    """#227 item 1c: the module singleton manager spawns the app-server from the CURRENT
+    lazy resolution, not a path frozen at construction."""
+    import codex_server as cs
+    captured = {}
+
+    class _Stub:
+        def poll(self): return None
+        def kill(self): pass
+
+    def fake_spawn(codex_bin, isolation_argv=None):
+        captured["bin"] = codex_bin
+        return _Stub()
+
+    monkeypatch.setattr(cs, "_v2_manager", None)
+    monkeypatch.setattr(cs, "_resolve_codex_bin", lambda: "/lazy/resolved/codex")
+    monkeypatch.setattr(cs, "_spawn_appserver", fake_spawn)
+    monkeypatch.setattr(cs.AppServerManager, "_adopt",
+                        lambda self, child: setattr(self, "_child", child))
+    monkeypatch.setattr(cs.AppServerManager, "_do_initialize", lambda *a, **k: None)
+    cs._get_manager().ensure([])
+    assert captured["bin"] == "/lazy/resolved/codex"
+
+
+def test_codex_info_respawns_and_retries_on_warm_child_crash(monkeypatch):
+    """#227 item 2: a warm child that dies DURING connection_request self-heals via ONE
+    respawn+retry, so connection-level reads survive a mid-read crash."""
+    import codex_server as cs
+
+    class _Child:
+        def __init__(self): self._dead = False
+        def poll(self): return 1 if self._dead else None
+        def kill(self): self._dead = True
+
+    mgr = cs.AppServerManager(bin="/unused/codex")   # explicit → binary guard not in play
+    mgr._child = _Child()                             # a warm (alive) child
+    calls = {"req": 0, "ensure": 0}
+
+    def fake_ensure(argv=None):
+        calls["ensure"] += 1
+        mgr._child = _Child()                         # respawn → fresh live child
+        return mgr._child
+
+    def fake_request(method, params=None, timeout=30.0):
+        calls["req"] += 1
+        if calls["req"] == 1:
+            mgr._child._dead = True                   # crashed during the read
+            raise RuntimeError("broken pipe during read")
+        return {"data": [{"id": "gpt-5.5"}], "nextCursor": None}
+
+    monkeypatch.setattr(mgr, "ensure", fake_ensure)
+    monkeypatch.setattr(mgr, "connection_request", fake_request)
+    r = cs.codex_info_v2({"query": "models"}, manager=mgr)
+    assert "error" not in r, r
+    assert r["result"]["data"][0]["id"] == "gpt-5.5"
+    assert calls["req"] == 2, "must retry the read once after a warm-child crash"
+    assert calls["ensure"] == 1, "must respawn exactly once"
+
+
+def test_codex_info_live_child_error_not_retried(monkeypatch):
+    """#227 item 2 boundary: an error from a still-ALIVE child is a real protocol/timeout
+    error — surface it, do NOT respawn+retry (avoid masking real failures / over-retrying)."""
+    import codex_server as cs
+
+    class _Child:
+        def poll(self): return None       # stays alive throughout
+        def kill(self): pass
+
+    mgr = cs.AppServerManager(bin="/unused/codex")
+    mgr._child = _Child()
+    calls = {"req": 0, "ensure": 0}
+
+    def fake_ensure(argv=None):
+        calls["ensure"] += 1
+        return mgr._child
+
+    def fake_request(method, params=None, timeout=30.0):
+        calls["req"] += 1
+        raise RuntimeError("model/list error: boom")
+
+    monkeypatch.setattr(mgr, "ensure", fake_ensure)
+    monkeypatch.setattr(mgr, "connection_request", fake_request)
+    r = cs.codex_info_v2({"query": "models"}, manager=mgr)
+    assert "error" in r and "boom" in r["error"]
+    assert calls["req"] == 1, "live-child error must NOT trigger a retry"
+    assert calls["ensure"] == 0
+
+
+def test_codex_info_initial_spawn_failure_not_retried(monkeypatch):
+    """#227 item 2 scope (panel finding B): the respawn+retry is for a WARM child that dies
+    mid-read — NOT for an initial spawn that fails (no warm child ever existed). An initial
+    ensure() failure must surface once, with no pointless second cold-start attempt and no
+    'after respawn-retry' relabel of the original error."""
+    import codex_server as cs
+
+    class _Dead:
+        def poll(self): return 1       # no live child → initial spawn needed
+        def kill(self): pass
+
+    mgr = cs.AppServerManager(bin="/unused/codex")
+    mgr._child = _Dead()
+    calls = {"ensure": 0}
+
+    def fake_ensure(argv=None):
+        calls["ensure"] += 1
+        raise RuntimeError("cold-start timeout")
+
+    def fake_request(*a, **k):
+        raise AssertionError("must not reach connection_request when initial spawn fails")
+
+    monkeypatch.setattr(mgr, "ensure", fake_ensure)
+    monkeypatch.setattr(mgr, "connection_request", fake_request)
+    r = cs.codex_info_v2({"query": "models"}, manager=mgr)
+    assert "error" in r and "cold-start timeout" in r["error"], r
+    assert "after respawn-retry" not in r["error"], "initial spawn failure must not be relabeled as a retry"
+    assert calls["ensure"] == 1, "initial spawn failure must NOT trigger a second ensure"
 
 
 # ── Step 1: review mode sets outputSchema ─────────────────────────────────
@@ -1476,10 +1990,11 @@ def test_implement_mode_returns_free_text(ext_child):
 def test_codex_run_no_codex_returns_error(monkeypatch):
     """If codex binary is absent, codex_run_v2 returns a clean error result (no manager → binary check)."""
     import codex_server
-    monkeypatch.setattr(codex_server, "CODEX", "/nonexistent/codex")
+    monkeypatch.setattr(codex_server, "_resolve_codex_bin", lambda: "/nonexistent/codex")
     # Call codex_run_v2 directly without an explicit manager so the binary check runs
     r = codex_server.codex_run_v2({"prompt": "test"})
     assert "error" in r
+    assert "codex binary not found" in r["error"]   # no-codex branch precedes mcp validation
 
 
 # ---------------------------------------------------------------------------
@@ -1595,6 +2110,9 @@ class TestV2Dispatcher:
             assert "approval_policy" in schema_props, (
                 f"inputSchema missing 'approval_policy' — v2 regression: {list(schema_props)}"
             )
+            assert "mcp" in schema_props, f"inputSchema missing 'mcp': {list(schema_props)}"
+            required = codex_tool.get("inputSchema", {}).get("required", [])
+            assert "mcp" in required, f"mcp must be REQUIRED, required={required}"
         finally:
             self._shutdown(proc)
 
@@ -1687,6 +2205,7 @@ def test_e2e_review_real_appserver():
     r = codex_run_v2({
         "prompt": "Review this Python function for bugs: def avg(n): return sum(n)/len(n)",
         "mode": "review",
+        "mcp": "isolated",
     })
     assert "error" not in r, f"codex_run_v2 returned error: {r.get('error')}"
     assert r.get("schema_ok") is True, f"schema_ok must be True, got: {r}"
@@ -1711,10 +2230,111 @@ def test_e2e_implement_real_appserver():
     r = codex_run_v2({
         "prompt": "Write a one-liner Python function that returns the square of a number.",
         "mode": "implement",
+        "mcp": "isolated",
     })
     assert "error" not in r, f"codex_run_v2 returned error: {r.get('error')}"
     assert r.get("thread_id"), f"thread_id must be non-empty, got: {r}"
     assert r.get("result"), f"result must be non-empty for implement mode, got: {r}"
+
+
+@skip_if_no_codex
+@pytest.mark.slow
+def test_e2e_usage_is_populated_by_real_appserver():
+    """Real codex emits thread/tokenUsage/updated; the result's usage.total_tokens must be a
+    real positive int — proves the params.tokenUsage.total.<camelCase> wire mapping (spec 2a)."""
+    from codex_server import codex_run_v2
+    r = codex_run_v2({"prompt": "Say OK.", "mode": "implement", "mcp": "isolated"})
+    assert "error" not in r, f"turn errored: {r.get('error')}"
+    assert isinstance(r.get("usage"), dict), f"no usage block: {r}"
+    assert isinstance(r["usage"].get("total_tokens"), int) and r["usage"]["total_tokens"] > 0, \
+        f"usage.total_tokens not populated (wire-key drift? reading params.tokenUsage.total?): {r['usage']}"
+
+
+@skip_if_no_codex
+@pytest.mark.slow
+def test_e2e_control_knobs_echoed_by_real_appserver():
+    """F5b — prove the camelCase forwarding mechanism works end-to-end against real codex.
+
+    approvals_reviewer is an ENUM (ApprovalsReviewer) that codex resolves and ECHOES on
+    ThreadStartResponse → a strong round-trip assertion catches a wrong wire key.
+
+    service_tier rides the IDENTICAL forwarding mechanism, BUT its echo is account-dependent:
+    ThreadStartResponse.serviceTier is a free nullable string (`["string","null"]`, NO enum —
+    schema-confirmed codex 0.141) that codex resolves to the EFFECTIVE tier. A ChatGPT-
+    subscription account returns null even when 'flex' is sent (API service tiers don't apply
+    to subscription billing — empirically verified). So serviceTier's wire key is guarded by
+    the OFFLINE test (test_approvals_reviewer_and_service_tier_reach_thread_start asserts it
+    lands in thread/start params) + the schema; here we only assert it is ACCEPTED without
+    error. (If run against an API-key account with real tiers, serviceTier may echo non-null;
+    this test stays correct either way.)"""
+    from codex_server import codex_run_v2
+    r = codex_run_v2({"prompt": "Say OK.", "mode": "implement", "mcp": "isolated",
+                      "approvals_reviewer": "user", "service_tier": "flex"})
+    assert "error" not in r, f"control knobs rejected: {r.get('error')}"
+    assert r.get("thread_id")
+    # approvals_reviewer round-trips → proves the camelCase forwarding mechanism end-to-end (F5b)
+    assert r["codex"]["approvals_reviewer"] == "user", f"approvalsReviewer not echoed: {r['codex']}"
+    # service_tier accepted (no error above); its effective echo is account-dependent (see docstring)
+    assert "service_tier" in r["codex"]
+
+
+@skip_if_no_codex
+@pytest.mark.slow
+def test_e2e_long_turn_completes_without_self_cap():
+    """A real review turn that may exceed 120s must still complete (no self-imposed cap).
+    Uses a deliberately heavier prompt; default = no timeout."""
+    from codex_server import codex_run_v2
+    r = codex_run_v2({
+        "prompt": ("Carefully review this for correctness, security, performance, and edge "
+                   "cases, enumerating every issue: def parse(s): return eval(s)"),
+        "mode": "review", "mcp": "isolated", "effort": "xhigh",
+    })
+    assert "error" not in r, f"long turn errored (regression: self-cap?): {r.get('error')}"
+    assert r.get("verdict") in ("GO", "NO-GO", "MINOR-FIXES")
+
+
+@pytest.mark.slow
+def test_e2e_codex_info_reads():
+    """Live: codex_info connection-level reads return the expected shapes (no cold-start)."""
+    import json
+    from codex_server import codex_info_v2
+    r = codex_info_v2({"query": "models"})
+    assert "error" not in r, r
+    assert isinstance(r["result"].get("data"), list) and r["result"]["data"], "model/list → data[]"
+    r2 = codex_info_v2({"query": "auth"})
+    assert "error" not in r2 and "authMethod" in r2["result"], r2
+    r3 = codex_info_v2({"query": "config"})
+    assert "error" not in r3 and "config" in r3["result"], r3
+    # compact projection: origins dropped, omitted list present, no token blowout
+    assert "origins" not in r3["result"], r3
+    assert isinstance(r3["result"].get("omitted"), list), r3
+    assert len(json.dumps(r3["result"])) < 4000, "config projection must be compact"
+    r4 = codex_info_v2({"query": "limits"})   # paramless query
+    assert "error" not in r4 and "rateLimits" in r4["result"], r4
+
+
+@pytest.mark.slow
+def test_e2e_codex_review_uncommitted(tmp_path):
+    """Live: native codex_review on a tmp repo with an uncommitted change returns
+    free-text findings (review/start → item/completed agentMessage path)."""
+    import subprocess as sp
+    from codex_server import codex_review_v2
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sp.run(["git", "init", "-q"], cwd=repo, check=True)
+    sp.run(["git", "config", "user.email", "t@t.io"], cwd=repo, check=True)
+    sp.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    sp.run(["git", "add", "-A"], cwd=repo, check=True)
+    sp.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+    # uncommitted change: a divide with no zero-check
+    (repo / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n\ndef div(a, b):\n    return a / b\n")
+    r = codex_review_v2({"target": "uncommitted", "mcp": "isolated",
+                         "cwd": str(repo), "effort": "low", "timeout": 240})
+    assert "error" not in r, r
+    assert isinstance(r.get("review"), str) and len(r["review"]) > 20, r
+    assert r.get("thread_id"), r
 
 
 # ---------------------------------------------------------------------------
@@ -1907,14 +2527,14 @@ def test_failed_turn_returns_clean_error(ext_child):
 # ---------------------------------------------------------------------------
 
 def test_config_merge_scrubs_isolation_keys():
-    """Deny-keys are scrubbed; benign keys pass; ISOLATION_CONFIG always wins."""
+    """Deny-keys are scrubbed; benign keys pass; no per-thread mcp_servers injection."""
     sent = _started_params(config={"mcp_servers": {"evil": 1}, "mcpServers": {"evil": 1},
                                    "baseInstructions": "x", "developerInstructions": "y",
                                    "model_reasoning_effort": "high"})["config"]
-    assert sent["mcp_servers"] == {}                  # ISOLATION wins
-    assert "mcpServers" not in sent                    # alias scrubbed
+    assert "mcp_servers" not in sent                    # caller injection scrubbed (no re-inject)
+    assert "mcpServers" not in sent                     # alias scrubbed
     assert "baseInstructions" not in sent and "developerInstructions" not in sent
-    assert sent["model_reasoning_effort"] == "high"    # benign key passes
+    assert sent["model_reasoning_effort"] == "high"     # benign key passes
 
 
 def test_codex_run_v2_forwards_parity_args_to_thread_start(ext_child):
@@ -1927,7 +2547,7 @@ def test_codex_run_v2_forwards_parity_args_to_thread_start(ext_child):
     p = ext_child.received("thread/start")["params"]   # codex_run_v2 calls start_thread once (new thread)
     assert p["baseInstructions"] == "custom-base"      # forwarded — overrides the STERILE default
     assert p["developerInstructions"] == "be terse"    # forwarded by codex_run_v2
-    assert p["config"]["mcp_servers"] == {}            # isolation wins after forward + merge
+    assert "mcp_servers" not in p["config"]            # caller injection scrubbed, not re-injected
     assert "mcpServers" not in p["config"]
     assert p["config"]["model_reasoning_effort"] == "high"
 
@@ -1960,7 +2580,7 @@ def test_live_codex_version_matches_pin():
     singleton pattern (mirrors test_e2e_review_real_appserver) — NO new helper/fixture.
     `cft_or_codex` and `_live_codex_user_agent` do NOT exist; do not reference them."""
     import codex_server as cs
-    cs.codex_run_v2({"prompt": "ping", "mode": "review"})   # drives ensure()+initialize on the singleton
+    cs.codex_run_v2({"prompt": "ping", "mode": "review", "mcp": "isolated"})   # drives ensure()+initialize on the singleton
     assert cs._get_manager()._codex_version == cs.LAST_VERIFIED_CODEX_VERSION
 
 
@@ -1970,3 +2590,693 @@ def test_tools_list_exposes_parity_fields_and_drift():
     for f in ("base_instructions", "developer_instructions", "config"):
         assert f in props
     assert "_drift" in cs.TOOLS[0]["description"]
+
+
+# ---------------------------------------------------------------------------
+# Task 1: isolation resolution primitives (#204 Group 1)
+# ---------------------------------------------------------------------------
+
+def test_enumerate_config_mcp_servers_reads_table(tmp_path, monkeypatch):
+    import codex_server as cs
+    (tmp_path / "config.toml").write_text(
+        'model = "gpt-5.5"\n\n'
+        '[mcp_servers.dash]\ncommand = "dash-mcp"\n\n'
+        '[mcp_servers.deepwiki]\nurl = "https://example/mcp"\n'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert cs._enumerate_config_mcp_servers() == ["dash", "deepwiki"]  # sorted
+
+def test_enumerate_config_mcp_servers_missing_file_is_empty(tmp_path, monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))   # no config.toml
+    assert cs._enumerate_config_mcp_servers() == []
+
+def test_enumerate_config_mcp_servers_malformed_is_empty(tmp_path, monkeypatch):
+    import codex_server as cs
+    (tmp_path / "config.toml").write_text("this is = = not valid toml [[[")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert cs._enumerate_config_mcp_servers() == []   # never raises
+
+def test_build_isolation_argv_all_disables_nothing():
+    import codex_server as cs
+    assert cs._build_isolation_argv("all", ["dash", "deepwiki"]) == []
+
+def test_build_isolation_argv_isolated_disables_every_server_and_apps():
+    import codex_server as cs
+    argv = cs._build_isolation_argv("isolated", ["dash", "deepwiki"])
+    # BARE keys (no quotes): codex's -c parser splits on '.' naively and does NOT honor
+    # TOML quoting — a quoted mcp_servers key CRASHES app-server startup on 0.141.
+    assert argv == [
+        "-c", "mcp_servers.dash.enabled=false",
+        "-c", "mcp_servers.deepwiki.enabled=false",
+        "--disable", "apps",
+    ]
+
+def test_build_isolation_argv_subset_keeps_named_disables_rest():
+    import codex_server as cs
+    # keep deepwiki + apps; disable dash
+    argv = cs._build_isolation_argv(["deepwiki", "apps"], ["dash", "deepwiki"])
+    assert argv == ["-c", "mcp_servers.dash.enabled=false"]   # apps kept → not disabled
+
+def test_build_isolation_argv_subset_disables_apps_when_not_listed():
+    import codex_server as cs
+    argv = cs._build_isolation_argv(["dash"], ["dash", "deepwiki"])
+    assert argv == ["-c", "mcp_servers.deepwiki.enabled=false", "--disable", "apps"]
+
+def test_build_isolation_argv_rejects_unknown_mode():
+    import codex_server as cs
+    import pytest
+    with pytest.raises(ValueError):
+        cs._build_isolation_argv("nonsense", ["dash"])
+
+def test_build_isolation_argv_skips_untargetable_server_name(capsys):
+    """A server name containing '.', '"', or '=' cannot be targeted by
+    `-c mcp_servers.<name>.enabled=false`: codex's CLI parser splits the key path on '.'
+    naively, splits key/value on the FIRST '=', and does NOT honor TOML quoting (a quoted
+    mcp_servers key even CRASHES app-server startup on 0.141 — empirically verified). Such a
+    name is SKIPPED with a stderr warning (left enabled), never silently mis-targeted/crashed.
+    F1 (#215 review): '=' must be guarded too — `mcp_servers.foo=bar.enabled=false` mis-targets
+    the key `mcp_servers.foo` (splitn(2,'=')) and silently fails to disable `foo=bar`."""
+    import codex_server as cs
+    for bad in ("weird.name", 'has"quote', "evil=injected"):
+        argv = cs._build_isolation_argv("isolated", [bad])
+        err = capsys.readouterr().err
+        assert argv == ["--disable", "apps"], f"{bad!r} should be skipped, got {argv}"
+        assert bad in err and "WARNING" in err, f"{bad!r} should emit a WARNING"
+
+
+# ---------------------------------------------------------------------------
+# Task 2: child env allowlist (#204 1c — secret-leak fix)
+# ---------------------------------------------------------------------------
+
+def test_build_child_env_keeps_essentials():
+    import codex_server as cs
+    parent = {"PATH": "/usr/bin", "HOME": "/Users/x", "CODEX_HOME": "/Users/x/.codex",
+              "TMPDIR": "/tmp", "LANG": "en_US.UTF-8", "LC_ALL": "C", "TERM": "xterm"}
+    env = cs._build_child_env(parent)
+    for k in parent:
+        assert env.get(k) == parent[k], f"{k} must pass the allowlist"
+
+def test_build_child_env_drops_secrets():
+    import codex_server as cs
+    parent = {"PATH": "/usr/bin", "FORGEJO_API_TOKEN": "secret",
+              "ANTHROPIC_API_KEY": "sk-xxx", "MY_CUSTOM_TOKEN": "leak"}
+    env = cs._build_child_env(parent)
+    assert "PATH" in env
+    assert "FORGEJO_API_TOKEN" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "MY_CUSTOM_TOKEN" not in env
+
+def test_build_child_env_keeps_codex_own_credentials_and_proxy():
+    import codex_server as cs
+    parent = {"OPENAI_API_KEY": "ok", "OPENAI_BASE_URL": "https://api",
+              "HTTPS_PROXY": "http://p", "https_proxy": "http://p",
+              "SSL_CERT_FILE": "/c.pem", "CODEX_CA_CERTIFICATE": "/corp-ca.pem"}
+    env = cs._build_child_env(parent)
+    for k in parent:
+        assert k in env, f"codex needs {k}"
+
+def test_shell_env_policy_argv_is_a_c_override():
+    """F1: layer-2 shell_environment_policy is a `-c` spawn override (defense-in-depth)."""
+    import codex_server as cs
+    assert cs._SHELL_ENV_POLICY_ARGV[0] == "-c"
+    assert cs._SHELL_ENV_POLICY_ARGV[1].startswith("shell_environment_policy.inherit=")
+
+
+# ---------------------------------------------------------------------------
+# Task 3: isolation-aware spawn + signature respawn
+# ---------------------------------------------------------------------------
+
+def test_spawn_appserver_appends_isolation_argv_and_scrubs_env(monkeypatch):
+    """_spawn_appserver builds `app-server <isolation_argv>` and passes a scrubbed env."""
+    import codex_server as cs
+    captured = {}
+
+    class _FakeProc:
+        def __init__(self, argv, **kw):
+            captured["argv"] = argv
+            captured["env"] = kw.get("env")
+            self.stdin = self.stdout = self.stderr = None
+            self.returncode = None
+        def poll(self): return None
+        def kill(self): pass
+
+    monkeypatch.setattr(cs.subprocess, "Popen", _FakeProc)
+    monkeypatch.setenv("FORGEJO_API_TOKEN", "secret")
+    cs._spawn_appserver("/bin/codex", ["-c", "mcp_servers.dash.enabled=false", "--disable", "apps"])
+    # layer-2 shell_environment_policy (F1) is prepended, then the isolation argv
+    assert captured["argv"] == ["/bin/codex", "app-server",
+                                *cs._SHELL_ENV_POLICY_ARGV,
+                                "-c", "mcp_servers.dash.enabled=false", "--disable", "apps"]
+    assert "FORGEJO_API_TOKEN" not in captured["env"]   # scrubbed (layer 1)
+    assert "PATH" in captured["env"]
+
+def test_manager_warm_reuse_same_isolation_signature(fake_child):
+    from codex_server import AppServerManager
+    m = AppServerManager(bin=fake_child)
+    c1 = m.ensure(["-c", "a=b"])
+    c2 = m.ensure(["-c", "a=b"])      # same signature → warm reuse
+    assert c2 is c1
+
+def test_manager_respawns_on_isolation_signature_change():
+    from codex_server import AppServerManager
+    fc = FakeChild()
+    try:
+        m = AppServerManager(bin=fc)
+        c1 = m.ensure(["-c", "x=1"])
+        c2 = m.ensure(["-c", "y=2"])   # different signature → respawn
+        assert c2 is not c1
+    finally:
+        fc.kill()
+
+def test_manager_ensure_clears_state_when_initialize_fails(monkeypatch):
+    """F2 (#215 review): if _do_initialize() raises (e.g. cold-start timeout), ensure() must
+    NOT leave an alive-but-uninitialised child committed — else the next same-sig call would
+    warm-reuse a server with no session (hang on start_thread). Both _child AND _isolation_sig
+    must be cleared on failure, and the exception re-raised."""
+    import pytest
+    import codex_server as cs
+    from codex_server import AppServerManager
+    fc = FakeChild()
+    try:
+        m = AppServerManager(bin=fc)
+        monkeypatch.setattr(cs.AppServerManager, "_do_initialize",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("initialize timed out")))
+        with pytest.raises(RuntimeError):
+            m.ensure(["-c", "x=1"])
+        assert m._child is None, "child must be cleared on initialize failure (no stale wedge)"
+        assert m._isolation_sig is None, "signature must be cleared on initialize failure"
+    finally:
+        fc.kill()
+
+def test_manager_respawn_passes_new_isolation_argv_to_spawn(monkeypatch):
+    """F6 (#215 review): a string-bin manager that respawns on signature change must call
+    _spawn_appserver with the NEW isolation argv. The FakeChild respawn test above takes the
+    __class__() path (no argv), so this is the only coverage of the ensure()→_spawn_appserver
+    argv hand-off on respawn."""
+    import codex_server as cs
+    calls = []
+
+    class _Stub:
+        def poll(self): return None
+        def kill(self): pass
+
+    def fake_spawn(codex_bin, isolation_argv=None):
+        calls.append(list(isolation_argv or []))
+        return _Stub()
+
+    monkeypatch.setattr(cs, "_spawn_appserver", fake_spawn)
+    monkeypatch.setattr(cs.AppServerManager, "_adopt", lambda self, child: setattr(self, "_child", child))
+    monkeypatch.setattr(cs.AppServerManager, "_do_initialize", lambda *a, **k: None)
+    m = cs.AppServerManager(bin="/bin/codex")
+    m.ensure(["-c", "x=1"])            # first spawn
+    m.ensure(["-c", "y=2"])            # sig change → respawn must carry NEW argv
+    assert calls == [["-c", "x=1"], ["-c", "y=2"]], f"respawn must pass new argv: {calls}"
+
+
+# ---------------------------------------------------------------------------
+# Task 5: the REQUIRED mcp knob + list discovery
+# ---------------------------------------------------------------------------
+
+def test_mcp_required_missing_is_error(ext_child):
+    from codex_server import codex_run_v2, AppServerManager
+    m = AppServerManager(bin=ext_child)
+    r = codex_run_v2({"prompt": "hi"}, manager=m, cc_write_fn=lambda f: None,
+                     cc_read_fn=lambda timeout=10: None)   # no mcp
+    assert "error" in r and "mcp" in r["error"].lower()
+
+def test_mcp_invalid_value_is_error(ext_child):
+    from codex_server import codex_run_v2, AppServerManager
+    m = AppServerManager(bin=ext_child)
+    r = codex_run_v2({"prompt": "hi", "mcp": "wat"}, manager=m,
+                     cc_write_fn=lambda f: None, cc_read_fn=lambda timeout=10: None)
+    assert "error" in r
+
+def test_mcp_list_returns_available_without_spawn(tmp_path, monkeypatch):
+    """mcp='list' enumerates config servers + builtins and returns WITHOUT a turn."""
+    import codex_server as cs
+    (tmp_path / "config.toml").write_text('[mcp_servers.dash]\ncommand="x"\n')
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    # No manager needed — list never spawns. But the no-codex check precedes it,
+    # so point CODEX at a real-enough path via monkeypatch.
+    monkeypatch.setattr(cs, "_resolve_codex_bin", lambda: sys.executable)   # any existing file passes the binary check
+    # codex_run_v2(manager=None) creates the module singleton _v2_manager with bin=CODEX.
+    # Register it with monkeypatch so teardown restores it — else this test's sys.executable
+    # manager would poison a later singleton-using (slow) test.
+    monkeypatch.setattr(cs, "_v2_manager", None)
+    r = cs.codex_run_v2({"prompt": "ignored", "mcp": "list"})
+    assert r.get("available_mcp_servers") == ["dash"]
+    assert "apps" in r["builtins"] and "computer-use" in r["builtins"]
+    assert "thread_id" not in r or r["thread_id"] is None   # never ran a turn
+
+def test_mcp_isolated_resolves_argv_and_passes_to_ensure(tmp_path, monkeypatch, ext_child):
+    """codex_run_v2 with mcp='isolated' calls ensure() with the disable argv."""
+    import codex_server as cs
+    (tmp_path / "config.toml").write_text('[mcp_servers.dash]\ncommand="x"\n')
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    captured = {}
+    m = cs.AppServerManager(bin=ext_child)
+    orig = m.ensure
+    def spy(argv=None):
+        captured["argv"] = argv
+        return orig(argv)
+    m.ensure = spy
+    cs.codex_run_v2({"prompt": "hi", "mcp": "isolated"}, manager=m,
+                    cc_write_fn=lambda f: None, cc_read_fn=lambda timeout=10: None)
+    assert captured["argv"] == ['-c', 'mcp_servers.dash.enabled=false', '--disable', 'apps']
+
+
+# ---------------------------------------------------------------------------
+# Task 6: tokenUsage + metadata (additive)
+# ---------------------------------------------------------------------------
+
+def test_result_carries_usage_and_metadata(ext_child):
+    ext_child.script_turn_variant("with_usage")     # emits thread/tokenUsage/updated
+    r = call_codex_run(ext_child, prompt="hi", mode="implement", mcp="isolated")
+    assert "error" not in r
+    assert r["usage"]["total_tokens"] == 123
+    assert r["codex"]["mcp_mode"] == "isolated"
+    # F2b: computer-use is bundled (never disabled) → always present, even in isolated
+    assert r["codex"]["mcp_servers_enabled"] == ["computer-use"]
+    assert "duration_ms" in r["timing"]
+    assert r["status"] == "completed"
+    # additive: existing keys still present
+    assert "result" in r
+
+def test_metadata_absent_keys_do_not_break_review_shape(ext_child):
+    r = call_codex_run(ext_child, prompt="hi", mode="review", mcp="all")
+    assert "error" not in r
+    assert {"thread_id", "verdict", "findings", "schema_ok"} <= set(r)  # unchanged core
+    assert r["codex"]["mcp_mode"] == "all"
+    assert "computer-use" in r["codex"]["mcp_servers_enabled"]   # F2b
+
+def test_subset_unknown_names_rejected_pre_spawn(ext_child, monkeypatch, tmp_path):
+    """F2: a subset name matching no config server / builtin fails loud BEFORE spawn —
+    a typo must not silently disable the server the caller meant to keep."""
+    import codex_server as cs
+    (tmp_path / "config.toml").write_text('[mcp_servers.dash]\ncommand="x"\n')
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    r = call_codex_run(ext_child, prompt="hi", mode="implement", mcp=["dahs"])  # typo of dash
+    assert "error" in r and "dahs" in r["error"]
+    assert ext_child.turn_start_params is None   # never ran a turn
+
+def test_mcp_list_value_does_not_crash(ext_child, monkeypatch, tmp_path):
+    """F2: a valid list subset must NOT raise TypeError (`list in frozenset` is unhashable).
+    F4 (#215 review): also assert the SUBSET `mcp_servers_enabled` output — the subset branch
+    (kept server + bundled computer-use; 'apps' not listed → not enabled) had no output
+    assertion, so an inverted filter would not be caught. dash is in the subset, apps is not."""
+    import codex_server as cs
+    (tmp_path / "config.toml").write_text('[mcp_servers.dash]\ncommand="x"\n')
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    r = call_codex_run(ext_child, prompt="hi", mode="implement", mcp=["dash"])
+    assert "error" not in r   # no TypeError; dash kept
+    assert r["codex"]["mcp_servers_enabled"] == ["dash", "computer-use"], r["codex"]
+
+def test_mcp_dict_value_is_error(ext_child):
+    """F2: a dict mcp is rejected cleanly (not a TypeError crash)."""
+    from codex_server import codex_run_v2, AppServerManager
+    m = AppServerManager(bin=ext_child)
+    r = codex_run_v2({"prompt": "hi", "mcp": {"x": 1}}, manager=m,
+                     cc_write_fn=lambda f: None, cc_read_fn=lambda timeout=10: None)
+    assert "error" in r and "invalid mcp" in r["error"].lower()
+
+def test_failed_turn_carries_metadata(ext_child):
+    """F11: a terminal turn failure still returns usage/codex/timing/status (token cost
+    visibility on failure)."""
+    ext_child.script_turn_variant("failed")
+    r = call_codex_run(ext_child, prompt="hi", mcp="isolated")
+    assert "error" in r and "turn failed" in r["error"]
+    assert r["status"] == "failed"
+    assert r["codex"]["mcp_mode"] == "isolated"
+    assert "timing" in r and "usage" in r
+
+
+# ---------------------------------------------------------------------------
+# Task 7: first-class control knobs (#204 2b)
+# ---------------------------------------------------------------------------
+
+def test_approvals_reviewer_and_service_tier_reach_thread_start():
+    p = _started_params(approvals_reviewer="auto_review", service_tier="flex")
+    assert p["approvalsReviewer"] == "auto_review"
+    assert p["serviceTier"] == "flex"
+
+def test_control_knobs_omitted_when_none():
+    p = _started_params()
+    assert "approvalsReviewer" not in p
+    assert "serviceTier" not in p
+
+def test_verbosity_is_config_passthrough():
+    # R1-F5 demote: verbosity is NOT first-class; it rides the existing config passthrough.
+    p = _started_params(config={"model_verbosity": "low"})
+    assert p["config"]["model_verbosity"] == "low"   # benign key, not scrubbed by _CONFIG_DENY
+
+def test_codex_run_v2_forwards_control_knobs(ext_child):
+    # F5a: exactly ONE run on a fresh ext_child so received("thread/start") returns THIS
+    # call's thread/start, not a stale earlier one (the prior version's spurious first
+    # call_codex_run made `received` return the wrong, knob-less thread/start → false pass).
+    from codex_server import codex_run_v2, AppServerManager
+    m = AppServerManager(bin=ext_child)
+    codex_run_v2({"prompt": "hi", "mcp": "isolated", "approvals_reviewer": "auto_review",
+                  "service_tier": "flex", "config": {"model_verbosity": "high"}},
+                 manager=m, cc_write_fn=lambda f: None, cc_read_fn=lambda timeout=10: None)
+    p = ext_child.received("thread/start")["params"]
+    assert p["approvalsReviewer"] == "auto_review"
+    assert p["serviceTier"] == "flex"
+    assert p["config"]["model_verbosity"] == "high"   # via config passthrough
+
+def test_control_knobs_on_resume_fail_loud(ext_child):
+    """F4: thread-level knobs are set at thread/start; on resume there is no thread/start,
+    so they must fail loud (not silently no-op)."""
+    from codex_server import codex_run_v2, AppServerManager
+    m = AppServerManager(bin=ext_child)
+    r = codex_run_v2({"prompt": "hi", "mcp": "isolated", "thread_id": "T1",
+                      "service_tier": "flex"},
+                     manager=m, cc_write_fn=lambda f: None, cc_read_fn=lambda timeout=10: None)
+    assert "error" in r
+    assert "resum" in r["error"].lower() or "new thread" in r["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Task 8: no self-imposed turn cap; opt-in timeout
+# ---------------------------------------------------------------------------
+
+def test_default_has_no_work_duration_deadline(ext_child):
+    """With no timeout arg, codex_run_v2 must not impose a work-duration deadline
+    (the loop condition is unbounded; the turn ends on turn/completed).
+    F5 (#215 review): the old check only matched the literal '120.0' — a DIFFERENT hardcoded
+    cap (e.g. 180.0) would have slipped through. Guard against ANY hardcoded numeric
+    work-duration deadline, and assert the deadline is opt-in (derived from the timeout arg)."""
+    import inspect, re, codex_server as cs
+    src = inspect.getsource(cs.codex_run_v2)
+    assert not re.search(r"deadline\s*=\s*time\.time\(\)\s*\+\s*\d", src), \
+        "no HARDCODED numeric work-duration cap may exist — the cap must be opt-in (timeout arg)"
+    # the work-duration deadline must be derived from the opt-in timeout (None when unset):
+    assert "turn_timeout" in src and "deadline is None" in src, \
+        "deadline must be opt-in (turn_timeout) and unbounded (None) by default"
+    # behavioral: a normal turn still completes fine with no timeout arg:
+    r = call_codex_run(ext_child, prompt="hi", mode="implement", mcp="isolated")
+    assert "error" not in r and r.get("result") is not None
+
+def test_opt_in_timeout_fires_when_set():
+    """A turn that never completes + a tiny timeout → clean timeout error (no hang)."""
+    from codex_server import codex_run_v2, AppServerManager
+
+    class _NeverCompletes(ExtendedFakeChild):
+        def _dispatch(self, msg):
+            method = msg.get("method"); mid = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "turn/start":
+                self.turn_start_params = params
+                # ACK the turn but NEVER send turn/completed
+                self._write_msg({"id": mid, "result": {"turn": {"id": "T", "items": [], "status": "inProgress"}}})
+                return
+            super()._dispatch(msg)
+
+    fc = _NeverCompletes()
+    try:
+        m = AppServerManager(bin=fc)
+        r = codex_run_v2({"prompt": "hi", "mcp": "isolated", "timeout": 0.3},
+                         manager=m, cc_write_fn=lambda f: None, cc_read_fn=lambda timeout=10: None)
+        assert "error" in r and "timed out" in r["error"]
+    finally:
+        fc.kill()
+
+
+class _PreAckApprovalChild(ExtendedFakeChild):
+    """Emits an approval REQUEST before the TurnStartResponse (pre-ACK), then waits for the
+    bridge's decision reply before ACKing — exercises F6 (the human approval wait must be
+    credited to ack_deadline, not counted as a setup stall)."""
+    def __init__(self):
+        super().__init__()
+        self._reply_event = _threading.Event()
+
+    def _dispatch(self, msg):
+        # a decision reply (id + result, no method) unblocks the pending pre-ACK approval
+        if msg.get("id") is not None and "method" not in msg and ("result" in msg or "error" in msg):
+            self._reply_event.set()
+            return
+        if msg.get("method") == "turn/start":
+            params = msg.get("params") or {}
+            self.turn_start_params = params
+            tid = params.get("threadId", "T1")
+            turn_mid = msg.get("id")
+            def _flow():
+                self._write_msg({"id": "PREACK-1",
+                                 "method": "item/commandExecution/requestApproval",
+                                 "params": {"threadId": tid, "turnId": "TURN1", "itemId": "I1",
+                                            "command": "echo hi", "cwd": "/tmp",
+                                            "availableDecisions": ["accept", "cancel"]}})
+                self._reply_event.wait(timeout=5.0)   # block until the bridge replies (human time)
+                self._write_msg({"id": turn_mid, "result": {"turn": {"id": "TURN1", "items": [], "status": "inProgress"}}})
+                self._write_msg({"method": "item/agentMessage/delta",
+                                 "params": {"delta": "ok", "threadId": tid, "turnId": "TURN1", "itemId": "I1"}})
+                self._write_msg({"method": "turn/completed",
+                                 "params": {"threadId": tid, "turn": {"id": "TURN1", "status": "completed",
+                                                                       "error": None, "durationMs": 1}}})
+            _threading.Thread(target=_flow, daemon=True).start()
+            return
+        super()._dispatch(msg)
+
+
+def test_pre_ack_approval_does_not_trip_ack_deadline(monkeypatch):
+    """F6: an approval arriving BEFORE the turn/start ACK, with a human reply slower than the
+    ACK window, must NOT cause an ACK timeout — the wait is credited to ack_deadline."""
+    import codex_server as cs
+    monkeypatch.setattr(cs, "_ACK_TIMEOUT", 0.3)   # shrink the setup window
+    fc = _PreAckApprovalChild()
+    try:
+        m = cs.AppServerManager(bin=fc)
+        written = []
+        def cc_write(msg): written.append(msg)
+        def cc_read(timeout=10.0):
+            import time as _t; _t.sleep(0.5)        # human takes longer than _ACK_TIMEOUT
+            eid = written[-1]["id"] if written else 1
+            return {"id": eid, "result": {"action": "accept", "content": {"label": "Allow once"}}}
+        r = cs.codex_run_v2({"prompt": "hi", "mcp": "isolated", "mode": "implement"},
+                            manager=m, cc_write_fn=cc_write, cc_read_fn=cc_read)
+        assert "error" not in r, f"pre-ACK approval tripped a timeout: {r}"
+        assert r.get("result") == "ok"
+    finally:
+        fc.kill()
+
+
+# ---------------------------------------------------------------------------
+# Task 9: schema-generated notification allowlist (#204 3b)
+# ---------------------------------------------------------------------------
+
+def test_known_notifications_loaded_from_fixture_excludes_error_warning():
+    import json, os
+    import codex_server as cs
+    # F7: fixture lives in mcp/ (sibling of codex_server.py), NOT tests/fixtures/, so
+    # it ships in the plugin cache. Read it from MCP_DIR — the SAME path the runtime uses.
+    fixture_path = os.path.join(MCP_DIR, "codex-notifications.json")
+    assert os.path.isfile(fixture_path), (
+        "fixture must live in mcp/ so it ships in the plugin cache (F7)")
+    fp = json.load(open(fixture_path))
+    fixture = set(fp["server_notifications"])
+    # Tight range catches generator pollution: the buggy whole-doc walk yields 162 (it also
+    # swept ClientRequest/ServerRequest method names); the correct ServerNotification-only
+    # walk yields 66 in codex 0.141. `> 30` passed vacuously for BOTH — too loose.
+    assert 60 <= len(fixture) <= 100, (
+        f"fixture has {len(fixture)} methods — expected ~66 (codex 0.141 ServerNotification set). "
+        "Far from 66 => re-run gen_notifications.py; the walk must be restricted to the "
+        "ServerNotification union only (not whole-doc).")
+    # runtime constant == fixture minus error/warning (NOT the 14-name fallback)
+    assert cs._KNOWN_NOTIFICATIONS == frozenset(fixture - {"error", "warning"})
+    assert cs._KNOWN_NOTIFICATIONS != cs._NOTIFICATION_FALLBACK, (
+        "must load the generated fixture, not the stdlib fallback (F7 prod-fallback guard)")
+    assert "error" not in cs._KNOWN_NOTIFICATIONS
+    assert "warning" not in cs._KNOWN_NOTIFICATIONS
+    # the previously-spurious ones are now known
+    assert "turn/plan/updated" in cs._KNOWN_NOTIFICATIONS
+
+def test_missing_notification_fixture_warns_and_falls_back(tmp_path, monkeypatch):
+    """F7: a missing fixture (prod cache miss) must LOG NOTIFICATION_FIXTURE_MISSING and
+    degrade to the fallback — not silently regress without a trace."""
+    import codex_server as cs
+    logf = tmp_path / "d.log"
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logf))
+    result = cs._load_known_notifications(path=str(tmp_path / "nope.json"))
+    assert result == cs._NOTIFICATION_FALLBACK
+    assert "NOTIFICATION_FIXTURE_MISSING" in logf.read_text()
+
+@pytest.mark.parametrize("bad", [
+    '["a","b"]',                         # top-level list, not dict → data.get would AttributeError
+    '{"server_notifications": "abc"}',   # string, not list → set("abc") char-soup
+    '{"server_notifications": []}',      # empty list
+    '{"server_notifications": [1, 2]}',  # non-string entries
+    'not json at all {',                 # decode error
+])
+def test_malformed_notification_fixture_warns_and_falls_back(bad, tmp_path, monkeypatch):
+    """F7: a valid-JSON-but-wrong-shape (or undecodable) fixture must warn+fallback, never
+    crash at import or load a bogus allowlist."""
+    import codex_server as cs
+    logf = tmp_path / "d.log"; monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logf))
+    fx = tmp_path / "codex-notifications.json"; fx.write_text(bad)
+    result = cs._load_known_notifications(path=str(fx))   # must not raise
+    assert result == cs._NOTIFICATION_FALLBACK
+    assert "NOTIFICATION_FIXTURE_MISSING" in logf.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Task 10: fake fidelity — real availableDecisions shape + param keys (#204 3c)
+# ---------------------------------------------------------------------------
+
+def test_fake_appserver_approval_uses_real_available_decisions():
+    """The fake's approval request must match real codex: string + amendment dict + cancel."""
+    import json, subprocess, sys, os, time
+    fake = os.path.join(FIXTURES_DIR, "fake_appserver.py")
+    env = os.environ.copy(); env["FAKE_SCRIPT"] = "with_approval"
+    proc = subprocess.Popen([sys.executable, fake], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    try:
+        for m in ({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "t"}}},
+                  {"id": 2, "method": "thread/start", "params": {"cwd": "/tmp"}},
+                  {"id": 3, "method": "turn/start",
+                   "params": {"threadId": "T1", "input": [{"type": "text", "text": "hi", "text_elements": []}]}}):
+            proc.stdin.write((json.dumps(m) + "\n").encode()); proc.stdin.flush()
+        deadline = time.time() + 10
+        approval = None
+        buf = b""
+        while time.time() < deadline and approval is None:
+            import select
+            r, _, _ = select.select([proc.stdout], [], [], 0.5)
+            if not r:
+                continue
+            buf += os.read(proc.stdout.fileno(), 65536)
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                f = json.loads(line)
+                if f.get("method") == "item/commandExecution/requestApproval":
+                    approval = f
+                    # reply so the fake can finish
+                    proc.stdin.write((json.dumps({"id": f["id"], "result": {"decision": "cancel"}}) + "\n").encode())
+                    proc.stdin.flush()
+        assert approval is not None
+        params = approval["params"]
+        avail = params["availableDecisions"]
+        assert "accept" in avail and "cancel" in avail
+        assert any(isinstance(x, dict) and "acceptWithExecpolicyAmendment" in x for x in avail)
+        # F8 / spec 3c: phantom approvalId gone; real param keys present
+        assert "approvalId" not in params, "phantom approvalId must be removed (spec 3c)"
+        assert "commandActions" in params, "real codex sends commandActions (spec 3c)"
+        assert "proposedExecpolicyAmendment" in params, "real codex sends proposedExecpolicyAmendment (spec 3c)"
+    finally:
+        proc.stdin.close(); proc.terminate(); proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# Task 11: live-codex invariants (#204) — tools-count isolation, env, auth
+# ---------------------------------------------------------------------------
+
+@skip_if_no_codex
+@pytest.mark.slow
+def test_e2e_env_secret_does_not_leak_to_codex_shell(monkeypatch):
+    """A secret in CC's env must NOT be visible to codex's shell (env allowlist).
+    F3 (#215 review): use an EXPLICIT FRESH manager so the child is spawned AFTER the canary
+    setenv. Otherwise, in the full `-m slow` suite, the module singleton (already spawned by an
+    earlier slow test, BEFORE the canary existed) is warm-reused → the canary was never in the
+    child env regardless of whether the allowlist works → the test passes VACUOUSLY."""
+    import codex_server as cs
+    from codex_server import codex_run_v2, AppServerManager
+    monkeypatch.setenv("CANARY_SECRET_204", "leak-me-if-you-can")
+    m = AppServerManager(bin=cs.CODEX)   # fresh child spawns NOW, after the canary setenv
+    try:
+        r = codex_run_v2({
+            "prompt": "Run the shell command `printenv CANARY_SECRET_204 || echo ABSENT` "
+                      "and report exactly what it printed, verbatim.",
+            "mode": "implement", "mcp": "isolated", "sandbox": "workspace-write",
+            "approval_policy": "never", "cwd": "/tmp",
+        }, manager=m)
+        assert "error" not in r, f"turn errored: {r.get('error')}"
+        out = r.get("result") or ""
+        # prove the command ACTUALLY RAN (else the secret-absence below is vacuously true).
+        assert "ABSENT" in out, f"printenv did not run / report — env test is vacuous: {out!r}"
+        assert "leak-me-if-you-can" not in out, "secret leaked into codex shell"
+    finally:
+        try:
+            if m._child is not None:
+                m._child.kill()
+        except Exception:
+            pass
+
+@skip_if_no_codex
+@pytest.mark.slow
+def test_e2e_auth_files_untouched_by_a_run():
+    """A run must not write ~/.codex/auth.json or config.toml (no relocation/mutation)."""
+    import os
+    from codex_server import codex_run_v2
+    home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    def _snap(p):
+        try: return os.stat(p).st_mtime_ns
+        except OSError: return None
+    before = {f: _snap(os.path.join(home, f)) for f in ("auth.json", "config.toml")}
+    r = codex_run_v2({"prompt": "Say OK.", "mode": "implement", "mcp": "isolated"})
+    # R2-F2: prove a REAL run happened — else unchanged mtimes are a vacuous pass.
+    assert "error" not in r and r.get("thread_id"), f"run did not really execute: {r}"
+    after = {f: _snap(os.path.join(home, f)) for f in ("auth.json", "config.toml")}
+    assert before == after, f"auth/config mtimes changed: {before} → {after}"
+
+
+def _server_tool_counts(manager) -> dict:
+    """name → tool count via connection-level mcpServerStatus/list (no thread/start).
+
+    codex 0.141 shape: {"data": [{"name": str, "tools": {<toolName>: Tool}, ...}]}.
+    `tools` is a MAP (object), so its tool count is len(dict); the list lives under `data`.
+    """
+    import codex_server as cs
+    mid = manager._next_id()
+    manager._write({"id": mid, "method": "mcpServerStatus/list", "params": {}})
+    resp = manager._pump_until(
+        lambda f: cs.classify(f) == "response" and f.get("id") == mid, timeout=60.0)
+    assert resp is not None, "mcpServerStatus/list timed out"
+    assert "error" not in resp, f"mcpServerStatus/list errored: {resp.get('error')}"
+    # codex 0.141 ListMcpServerStatusResponse: {"data": [McpServerStatus...]}. FAIL LOUD on a
+    # shape change rather than silently returning {} (a tolerant `.get("servers")`/`toolCount`
+    # fallback would make the F9 isolation test pass vacuously). `name` is required;
+    # McpServerStatus.tools is an object MAP (len = tool count).
+    raw = resp.get("result") or {}
+    servers = raw.get("data") if isinstance(raw, dict) else None
+    assert isinstance(servers, list), f"mcpServerStatus/list result.data missing/not-a-list: {raw}"
+    counts = {}
+    for s in servers:
+        name = s.get("name")
+        assert name, f"McpServerStatus entry missing required 'name': {s}"
+        tools = s.get("tools")
+        counts[name] = len(tools) if isinstance(tools, (dict, list)) else 0
+    return counts
+
+@skip_if_no_codex
+@pytest.mark.slow
+def test_e2e_isolated_disables_user_servers_by_tools_count():
+    """F9: mcp='isolated' → every user config.toml server reports tools==0. Verify by
+    TOOLS-COUNT, NOT name-absence (a disabled server stays in the list)."""
+    import codex_server as cs
+    config_servers = cs._enumerate_config_mcp_servers()
+    if not config_servers:
+        pytest.skip("no user MCP servers configured to disable")
+    m = cs.AppServerManager(bin=cs.CODEX)
+    m.ensure(cs._build_isolation_argv("isolated", config_servers))
+    counts = _server_tool_counts(m)
+    for name in config_servers:
+        # F9: verify by TOOLS-COUNT, not name-absence — a disabled server STAYS in the list.
+        # A missing entry is a parse/response failure, NOT "disabled" → must fail, not pass.
+        assert name in counts, f"{name} absent from mcpServerStatus/list (parse failure?) — not proof of disable"
+        assert counts[name] == 0, f"{name} not disabled: tools={counts[name]} (isolated)"
+
+@skip_if_no_codex
+@pytest.mark.slow
+def test_e2e_all_loads_user_servers_by_tools_count():
+    """F9 counterpart: mcp='all' → at least one user server loads tools (>0), proving the
+    isolated test's tools:0 is real disabling, not servers that never had tools."""
+    import codex_server as cs
+    config_servers = cs._enumerate_config_mcp_servers()
+    if not config_servers:
+        pytest.skip("no user MCP servers configured")
+    m = cs.AppServerManager(bin=cs.CODEX)
+    m.ensure(cs._build_isolation_argv("all", config_servers))
+    counts = _server_tool_counts(m)
+    assert any(counts.get(n, 0) > 0 for n in config_servers), (
+        f"no user server loaded tools under 'all' — tools-count test would be vacuous: {counts}")

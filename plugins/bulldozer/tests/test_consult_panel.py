@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import sqlite3
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 from conftest import PLUGIN_ROOT
@@ -761,6 +765,269 @@ def test_run_panel_informed_resolves_symlinked_repo(tmp_path):
         assert c["cwd"] == str(real.resolve())  # resolved target, NOT the symlink path
 
 
+# ── #192 grok per-session cleanup (session_search.sqlite + transcript + prompt_history) ──
+#
+# The grok leg leaks the consult prompt into ~/.grok/sessions/session_search.sqlite (a
+# searchable FTS index `grok sessions search` reads), a per-session transcript subdir, and
+# per-cwd prompt_history.jsonl — despite --no-memory (verified live, #192). Parity with the
+# agy cleanup: after the run, delete EXACTLY this run's session by the sessionId grok prints
+# in its JSON output — never a CONCURRENT user grok session in the same cwd. `grok sessions
+# delete` is NOT usable (it round-trips to the network and cleans nothing local on failure),
+# so the cleanup is direct + local. _GROK_STATE_DIR is monkeypatched off the real ~/.grok.
+
+# grok session ids are UUIDs (verified live: 019ee888-780c-7d71-bee7-59fac7fa34ab)
+_GROK_OUR_SID = "019ee888-780c-7d71-bee7-59fac7fa34ab"
+_GROK_OTHER_SID = "019ee886-9c7b-7172-a720-6ebd469c60b4"
+
+# Verbatim subset of the real session_search.sqlite schema (session_docs + external-content
+# FTS5 + the AFTER DELETE trigger) so the trigger-cascades-into-FTS behavior is exercised.
+_GROK_DB_SCHEMA = """
+CREATE TABLE session_docs (
+    session_id TEXT PRIMARY KEY, cwd TEXT NOT NULL, updated_at INTEGER NOT NULL,
+    title TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL,
+    last_indexed_offset INTEGER NOT NULL DEFAULT 0);
+CREATE VIRTUAL TABLE session_docs_fts USING fts5(
+    title, content, content='session_docs', content_rowid='rowid');
+CREATE TRIGGER session_docs_ai AFTER INSERT ON session_docs BEGIN
+    INSERT INTO session_docs_fts(rowid, title, content) VALUES (new.rowid, new.title, new.content);
+END;
+CREATE TRIGGER session_docs_ad AFTER DELETE ON session_docs BEGIN
+    INSERT INTO session_docs_fts(session_docs_fts, rowid, title, content)
+    VALUES ('delete', old.rowid, old.title, old.content);
+END;
+"""
+
+
+def _grok_db(state):
+    return state / "sessions" / "session_search.sqlite"
+
+
+def _mk_grok_state(tmp_path):
+    state = tmp_path / "grok"
+    (state / "sessions").mkdir(parents=True)
+    conn = sqlite3.connect(str(_grok_db(state)))
+    conn.executescript(_GROK_DB_SCHEMA)
+    conn.close()
+    return state
+
+
+def _grok_insert_row(state, sid, cwd, content):
+    conn = sqlite3.connect(str(_grok_db(state)))
+    conn.execute(
+        "INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash)"
+        " VALUES (?, ?, 0, '', ?, 'h')",
+        (sid, cwd, content),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _grok_fts_matches(state, term):
+    conn = sqlite3.connect(str(_grok_db(state)))
+    n = conn.execute(
+        "SELECT count(*) FROM session_docs_fts WHERE session_docs_fts MATCH ?", (term,)
+    ).fetchone()[0]
+    conn.close()
+    return n
+
+
+def _grok_row_ids(state):
+    conn = sqlite3.connect(str(_grok_db(state)))
+    ids = {r[0] for r in conn.execute("SELECT session_id FROM session_docs")}
+    conn.close()
+    return ids
+
+
+def test_grok_session_id_extracts_from_json():
+    """The cleanup keys off the sessionId grok prints in --output-format json (verified key)."""
+    out = json.dumps({"text": "answer", "stopReason": "EndTurn", "sessionId": _GROK_OUR_SID})
+    assert panel._grok_session_id(out) == _GROK_OUR_SID
+
+
+def test_grok_session_id_absent_is_none():
+    assert panel._grok_session_id(json.dumps({"text": "x"})) is None
+    assert panel._grok_session_id("not json at all") is None
+
+
+def test_grok_clean_session_drops_only_our_row_and_fts(tmp_path, monkeypatch):
+    """The searchable-index leak (#192): our session_docs row is deleted and its FTS entry
+    cascades away via the AFTER DELETE trigger — a CONCURRENT user session's row + FTS entry
+    in the same db survive."""
+    state = _mk_grok_state(tmp_path)
+    monkeypatch.setattr(panel, "_GROK_STATE_DIR", state)
+    _grok_insert_row(state, _GROK_OUR_SID, "/private/tmp/run", "ourSecretZQX design question")
+    _grok_insert_row(state, _GROK_OTHER_SID, "/home/user/repo", "unrelatedYWV user session")
+    assert _grok_fts_matches(state, "ourSecretZQX") == 1
+
+    panel._grok_clean_session(_GROK_OUR_SID, "/private/tmp/run", False)
+
+    assert _grok_row_ids(state) == {_GROK_OTHER_SID}            # only ours dropped
+    assert _grok_fts_matches(state, "ourSecretZQX") == 0        # FTS leak gone (trigger fired)
+    assert _grok_fts_matches(state, "unrelatedYWV") == 1        # concurrent session preserved
+
+
+def test_grok_clean_session_informed_removes_only_our_subdir(tmp_path, monkeypatch):
+    """Informed mode (owned=False, cwd = the SHARED user repo): remove ONLY our session's
+    transcript subdir (scoped by exact id) — a CONCURRENT session's subdir in the same
+    cwd-encoded dir survives, and the SHARED prompt_history.jsonl is left UNTOUCHED. Rewriting
+    that file would race a concurrent append and could drop a concurrent user's line
+    (codex_review P2); the row + transcript removal already kills the searchable leak."""
+    import urllib.parse
+    state = _mk_grok_state(tmp_path)
+    monkeypatch.setattr(panel, "_GROK_STATE_DIR", state)
+    cwd = str(tmp_path / "repo")
+    (tmp_path / "repo").mkdir()
+    cwd_dir = state / "sessions" / urllib.parse.quote(os.path.realpath(cwd), safe="")
+    (cwd_dir / _GROK_OUR_SID).mkdir(parents=True)
+    (cwd_dir / _GROK_OUR_SID / "chat_history.jsonl").write_text("our prompt+response")
+    (cwd_dir / _GROK_OTHER_SID).mkdir()                          # concurrent session, same repo
+    (cwd_dir / _GROK_OTHER_SID / "chat_history.jsonl").write_text("their conversation")
+    ph = cwd_dir / "prompt_history.jsonl"
+    ph_text = (json.dumps({"session_id": _GROK_OUR_SID, "prompt": "our secret"}) + "\n"
+               + json.dumps({"session_id": _GROK_OTHER_SID, "prompt": "their prompt"}) + "\n")
+    ph.write_text(ph_text)
+
+    panel._grok_clean_session(_GROK_OUR_SID, cwd, False)
+
+    assert not (cwd_dir / _GROK_OUR_SID).exists()               # our transcript gone
+    assert (cwd_dir / _GROK_OTHER_SID).exists()                 # concurrent session preserved
+    assert ph.read_text() == ph_text                            # shared file untouched (no race)
+
+
+def test_grok_clean_session_isolated_removes_whole_cwd_dir(tmp_path, monkeypatch):
+    """Isolated mode (owned=True, cwd = OUR throwaway tempdir): the cwd-encoded grok dir is
+    exclusively ours, so it is removed WHOLESALE — transcript subdir + prompt_history together,
+    no read-filter-write race (the prompt is gone, not just descoped)."""
+    import urllib.parse
+    state = _mk_grok_state(tmp_path)
+    monkeypatch.setattr(panel, "_GROK_STATE_DIR", state)
+    cwd = str(tmp_path / "throwaway")
+    (tmp_path / "throwaway").mkdir()
+    cwd_dir = state / "sessions" / urllib.parse.quote(os.path.realpath(cwd), safe="")
+    (cwd_dir / _GROK_OUR_SID).mkdir(parents=True)
+    (cwd_dir / _GROK_OUR_SID / "chat_history.jsonl").write_text("our prompt+response")
+    (cwd_dir / "prompt_history.jsonl").write_text(
+        json.dumps({"session_id": _GROK_OUR_SID, "prompt": "our secret"}) + "\n")
+
+    panel._grok_clean_session(_GROK_OUR_SID, cwd, True)
+
+    assert not cwd_dir.exists()                                 # the whole isolated dir is gone
+
+
+def test_grok_clean_session_ignores_non_uuid_id(tmp_path, monkeypatch):
+    """Defensive: a non-UUID id (empty, path-like, short label) is ignored — never touch the
+    db and never rmtree a parent (parity with _agy_clean_conversation)."""
+    state = _mk_grok_state(tmp_path)
+    monkeypatch.setattr(panel, "_GROK_STATE_DIR", state)
+    _grok_insert_row(state, _GROK_OUR_SID, "/x", "keepme content")
+    for bad in ("", "   ", "..", "../sessions", "a/b", "OURID", _GROK_OUR_SID + "X", _GROK_OUR_SID[:-1]):
+        panel._grok_clean_session(bad, "/x", False)             # must not raise, must delete nothing
+        panel._grok_clean_session(bad, "/x", True)              # ...in either ownership mode
+    assert _grok_row_ids(state) == {_GROK_OUR_SID}
+
+
+def test_grok_clean_session_never_raises_without_db(tmp_path, monkeypatch):
+    """Best-effort: a missing db / sessions dir must not raise (runs after the leg)."""
+    monkeypatch.setattr(panel, "_GROK_STATE_DIR", tmp_path / "nonexistent-grok")
+    panel._grok_clean_session(_GROK_OUR_SID, "/private/tmp/run", False)  # no raise
+    panel._grok_clean_session(_GROK_OUR_SID, "/private/tmp/run", True)   # no raise (wholesale path)
+
+
+def test_grok_post_run_clean_noops_on_failed_or_idless(tmp_path, monkeypatch):
+    """No sessionId (a failed leg → output None, or unparseable output) → nothing to clean,
+    and the helper never raises."""
+    state = _mk_grok_state(tmp_path)
+    monkeypatch.setattr(panel, "_GROK_STATE_DIR", state)
+    _grok_insert_row(state, _GROK_OUR_SID, "/x", "still here")
+    panel._grok_post_run_clean(panel.ModelResult(False, None, "timeout"), "/x", False)
+    panel._grok_post_run_clean(panel.ModelResult(True, "no json, no id", None), "/x", True)
+    assert _grok_row_ids(state) == {_GROK_OUR_SID}              # untouched
+
+
+def test_model_specs_session_clean_only_grok():
+    """Only grok has a post-run session cleanup; codex/agy do not (agy cleans via its own
+    nonce path inside the readonly_hook branch)."""
+    assert panel._MODEL_SPECS["grok"].session_clean is not None
+    assert panel._MODEL_SPECS["codex"].session_clean is None
+    assert panel._MODEL_SPECS["agy"].session_clean is None
+
+
+def test_run_one_grok_cleans_its_session(tmp_path, monkeypatch):
+    """Integration: the grok leg's output carries a sessionId; _run_one cleans EXACTLY that
+    session (row + FTS) afterward, leaving a concurrent user session untouched (#192)."""
+    state = _mk_grok_state(tmp_path)
+    monkeypatch.setattr(panel, "_GROK_STATE_DIR", state)
+    _grok_insert_row(state, _GROK_OTHER_SID, "/home/user/repo", "concurrentXYZ user session")
+
+    def runner(cmd, env, cwd, timeout):
+        # fake grok: index OUR session into the db (as real grok would), return its JSON
+        _grok_insert_row(state, _GROK_OUR_SID, cwd, "ourPromptQZX find-holes question")
+        return panel.ModelResult(True, json.dumps({"text": "holes", "sessionId": _GROK_OUR_SID}), None)
+
+    panel._run_one("grok", "W", None, 10, runner)               # isolated mode
+
+    assert _grok_row_ids(state) == {_GROK_OTHER_SID}            # our session cleaned, concurrent kept
+    assert _grok_fts_matches(state, "ourPromptQZX") == 0
+    assert _grok_fts_matches(state, "concurrentXYZ") == 1
+
+
+# ── #193 run_model reaps a hung process TREE on timeout; the kill is group-scoped ──
+
+
+def test_run_model_timeout_reaps_whole_process_tree_and_spares_decoy(tmp_path):
+    """A hung model (agy was observed hanging as a multi-process tree, #193) is reaped WHOLE
+    on timeout: run_model's start_new_session=True makes the child a group leader, so killpg
+    SIGKILLs its forked children too — no orphans. AND a DECOY process in its OWN group
+    survives, proving the kill is scoped to run_model's own group and cannot reap a
+    user-spawned agy (the safety property behind not touching unrelated processes)."""
+    pidsdir = tmp_path / "pids"
+    pidsdir.mkdir()
+    # The "hung model": records its pid + forks two children (same process group), all sleep.
+    prog = (
+        "import os, sys, time\n"
+        "d = sys.argv[1]\n"
+        "for _ in range(2):\n"
+        "    if os.fork() == 0:\n"
+        "        open(os.path.join(d, 'child_%d' % os.getpid()), 'w').close()\n"
+        "        time.sleep(60); os._exit(0)\n"
+        "open(os.path.join(d, 'parent_%d' % os.getpid()), 'w').close()\n"
+        "time.sleep(60)\n"
+    )
+    # A DECOY in its OWN session/group (like a user-spawned agy) — must NOT be killed.
+    decoy = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True
+    )
+    try:
+        r = panel.run_model([sys.executable, "-c", prog, str(pidsdir)], {}, cwd=str(tmp_path), timeout=2)
+        assert r.ok is False and "timeout" in (r.reason or "").lower()
+
+        pids = [int(p.name.split("_")[1]) for p in pidsdir.iterdir()]
+        assert len(pids) == 3, f"expected parent + 2 children recorded, got {pids}"
+
+        # poll until every process in run_model's group is gone (SIGKILL + reap is near-instant)
+        deadline = time.time() + 5
+        while time.time() < deadline and any(_alive(pid) for pid in pids):
+            time.sleep(0.05)
+        survivors = [pid for pid in pids if _alive(pid)]
+        assert not survivors, f"orphaned hung-model processes survived the kill: {survivors}"
+
+        assert decoy.poll() is None, "decoy in its own group must survive — kill is group-scoped"
+    finally:
+        decoy.kill()
+        decoy.wait(timeout=5)
+
+
+def _alive(pid):
+    """True iff pid is a live (non-reaped) process. A reaped/never-existed pid → False."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but not ours (shouldn't happen here) — treat as alive
+
+
 def test_run_panel_isolated_does_not_use_repo_cwd(tmp_path):
     calls = []
     panel.run_panel("Q", runner=_make_fake_runner(calls))  # no repo
@@ -1092,12 +1359,16 @@ def test_skill_md_uses_anchored_verdict_classifier():
     assert "tokens used$/{/^tokens used" not in _SKILL_MD  # old sed extraction gone
 
 
-def test_skill_md_invokes_scripts_via_plugin_root():
-    """P0 (code-review): invocations must use $CLAUDE_PLUGIN_ROOT — a bare
-    relative `python3 skills/consult/scripts/...` does not resolve from the
-    consumer-project cwd the Bash tool runs in."""
-    assert "CLAUDE_PLUGIN_ROOT" in _SKILL_MD
-    assert "python3 skills/consult/scripts" not in _SKILL_MD
+def test_skill_md_resolves_scripts_without_requiring_plugin_root_env():
+    """#221: $CLAUDE_PLUGIN_ROOT is NOT exported to the Bash tool (empty → KeyError), so the
+    SKILL.md snippets must SELF-RESOLVE the scripts dir — honoring the var if set, but never
+    hard-requiring it. Guards against reverting to the unguarded bracket form (the #221 bug),
+    and a bare relative path still doesn't resolve from the consumer-project cwd."""
+    assert "plugins/cache/*/bulldozer/*/skills/consult/scripts" in _SKILL_MD   # self-resolving fallback
+    assert 'os.environ.get("CLAUDE_PLUGIN_ROOT")' in _SKILL_MD                  # guarded honor-if-set
+    # the OLD unguarded form that raises KeyError when the var is unset must be gone:
+    assert "sys.path.insert(0, os.path.join(os.environ[" not in _SKILL_MD
+    assert "python3 skills/consult/scripts" not in _SKILL_MD                    # not a bare relative path
     assert 'sys.path.insert(0, "skills/consult/scripts")' not in _SKILL_MD
 
 

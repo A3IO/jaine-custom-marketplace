@@ -115,7 +115,7 @@
   <section>
     <p class="h">Архитектура</p>
     <div class="arch" id="arch">
-      <div class="node" id="n-cc"><div class="ic">🧠</div><b>Claude Code</b><small>мозг · зовёт tool<br>analyze_video / analyze_audio</small></div>
+      <div class="node" id="n-cc"><div class="ic">🧠</div><b>Claude Code</b><small>мозг · зовёт tool<br>analyze_media (видео+аудио)</small></div>
       <div class="arrow" id="a1">→</div>
       <div class="node" id="n-mcp"><div class="ic">🔌</div><b>MCP-сервер</b><small>Python · bundled<br>sha256→fileUri кэш на диске</small></div>
       <div class="arrow gem" id="a2">→</div>
@@ -137,7 +137,7 @@
           <span class="lbl">Режим multi-turn</span>
           <div class="seg">
             <button class="sel" id="m-less" onclick="setMode('stateless')">stateless re-query</button>
-            <button id="m-full" onclick="setMode('stateful')">stateful chat</button>
+            <button id="m-full" onclick="setMode('stateful')">multi-turn (history)</button>
           </div>
         </div>
         <div class="row" style="margin-bottom:6px"><span class="lbl">Вопросы (жми по порядку)</span></div>
@@ -184,10 +184,10 @@
         </ul>
       </div>
       <div class="card good">
-        <h4>✓ bundled-local (uv, frozen+offline)</h4>
+        <h4>✓ bundled-local (uv run --frozen, self-sync venv)</h4>
         <ul>
-          <li>депы ставятся <b>один раз</b> в <code>${CLAUDE_PLUGIN_DATA}/.venv</code> (SessionStart-hook, diff по lock)</li>
-          <li>запуск: <code>uv run --frozen --offline</code> → ноль сети, ноль дрейфа</li>
+          <li>депы живут в <code>${CLAUDE_PLUGIN_DATA}/.venv</code>, наполняются на первом старте (uv сверяет lock↔venv локально — #217, НЕ SessionStart-hook)</li>
+          <li>запуск: <code>uv run --frozen server.py</code> → self-sync из committed lock, ноль дрейфа</li>
           <li>reuse проверенного <code>gemini_files.py</code> из goat (TDD+bulldozer+E2E)</li>
           <li>video-сервер idle-дёшев: нет upstream-соединения (в отличие от channel-плагина)</li>
         </ul>
@@ -240,7 +240,7 @@ function setMode(m){ if(busy)return; mode=m;
   document.getElementById('m-full').classList.toggle('sel',m==='stateful');
   document.getElementById('modeNote').innerHTML = m==='stateless'
     ? '<b>stateless re-query:</b> каждый вопрос независим. Переиспользуется только <i>загруженный файл</i> (fileUri) — Gemini заново смотрит, но не помнит прошлые вопросы. Дёшево, по умолчанию.'
-    : '<b>stateful chat:</b> Gemini держит <i>историю диалога</i> о файле — помнит, что уже спросили и ответили, можно ссылаться на прошлое. Тот же fileUri-кэш, но тащим историю реплик. Дороже (контекст растёт).';
+    : '<b>multi-turn (history):</b> <i>вызывающий</i> (Claude) держит историю реплик и шлёт её в каждом запросе — Gemini stateless server-side, просто реплеит её (#206). Можно подмешать ДРУГОЕ видео по ходу и сравнить с прежними. Тот же fileUri-кэш; контекст растёт → дороже.';
 }
 function renderQ(){
   const list=QA[cur], box=document.getElementById('qbox'); box.innerHTML='';
@@ -292,7 +292,7 @@ async function ask(i){
   const F=FILES[cur], item=QA[cur][i];
   addMsg('u','ты → Claude', item.q);
   clearTrace(); lights(true,false,false);
-  await addStep('','Claude зовёт <b>'+(F.kind==='video'?'analyze_video':'analyze_audio')+'</b>('+F.name+', "'+item.q.slice(0,24)+'…")',150);
+  await addStep('','Claude зовёт <b>analyze_media</b>('+F.name+', "'+item.q.slice(0,24)+'…")',150);
   lights(false,true,false);
   await addStep('','MCP-сервер: sha256('+F.name+') = <b>'+F.sha+'</b>',500);
 

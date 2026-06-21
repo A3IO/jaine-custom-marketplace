@@ -1,6 +1,6 @@
 {
   "name": "jaine-media",
-  "version": "2026.06.20",
+  "version": "2026.06.21.1",
   "description": "Media understanding for Claude Code via Gemini — see video, hear audio, extract frames",
   "author": { "name": "JAINE", "email": "jaine@local" },
   "keywords": ["gemini", "video", "audio", "media", "mcp", "ffmpeg", "frame", "transcribe"]

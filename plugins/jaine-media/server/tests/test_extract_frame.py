@@ -43,3 +43,18 @@ async def test_extract_frame_rejects_dos_step_before_ffmpeg(tmp_path, monkeypatc
     d = json.loads(await server.extract_frame(_VIDEO, 3.5, window=5.0, step=0.001))
     assert d["success"] is False
     assert "frame" in d["error"].lower() or "step" in d["error"].lower()
+
+
+async def test_extract_frame_never_crashes_on_hash_oserror(tmp_path, monkeypatch):
+    # backfill (#1/#11): an OSError during hashing/workspace (read-only or full data-fs)
+    # must be caught — {success:false}, never propagated to FastMCP.
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    f = tmp_path / "clip.mp4"
+    f.write_bytes(b"x")
+
+    async def _boom(_p):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(server.gemini_files, "compute_file_hash", _boom)
+    d = json.loads(await server.extract_frame(str(f), 3.5))
+    assert d["success"] is False

@@ -151,7 +151,10 @@ a stray `CHROME_APP_NAME` pollutes later cdp.py calls — `launch.sh` deliberate
 honors env-provided values, hermeticity is the caller's job):
 
 ```bash
-PLUGIN="<plugin root>"                    # e.g. $CLAUDE_PLUGIN_ROOT
+# $CLAUDE_PLUGIN_ROOT is NOT exported to the Bash tool (#221) — resolve the plugin dir from
+# the cache (honor the var if set). PLUGIN feeds the launch.sh + cdp.py calls below.
+PLUGIN=$( { [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT/skills/look" ] \
+  && printf '%s\n' "$CLAUDE_PLUGIN_ROOT"; } || ls -dt ~/.claude/plugins/cache/*/bulldozer/*/ 2>/dev/null | head -1 )
 # 1. Launch ONCE, capturing stdout — the contract arrives on it.
 out=$(env -u LOOK_PROFILE_DIR -u LOOK_INSECURE -u LOOK_DRY_RUN -u CHROME_BIN \
           -u LOOK_AUTOMATION -u CHROME_APP_NAME -u LOOK_CERT_SPKI \

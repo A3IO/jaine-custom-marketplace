@@ -119,3 +119,16 @@ class TestDelegationSection:
         # The grader grades the highest COMPLETE cycle (PR2 fix) — the doc must not
         # promise the old "highest-K" rule that false-failed on an empty trailing dir.
         assert "highest-K **complete** cycle" in skill_text
+
+
+def test_skill_md_resolves_plugin_without_requiring_plugin_root_env():
+    """#236 (sibling of #221): the subagent-delegation block set PLUGIN to a "<plugin root>"
+    placeholder hinting `$CLAUDE_PLUGIN_ROOT` — which is NOT exported to the Bash tool (empty),
+    so `$PLUGIN/skills/look/scripts/launch.sh` would resolve to /skills/... and break. PLUGIN
+    must SELF-RESOLVE from the cache (honor the var if set). Mirrors the consult fix (PR #235)."""
+    text = _text()
+    assert "ls -dt ~/.claude/plugins/cache/*/bulldozer/*/" in text
+    assert '[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]' in text                # guarded honor-if-set
+    # the placeholder that resolved to an empty PLUGIN must be gone:
+    assert 'PLUGIN="<plugin root>"' not in text
+    assert "# e.g. $CLAUDE_PLUGIN_ROOT" not in text

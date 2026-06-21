@@ -2,11 +2,12 @@
 
 Claude can't watch video or hear audio; this routes a local file to Gemini (which
 does both) and returns the answer. Uploads are content-hash cached on disk (~48h),
-so re-asking about the same file is cheap. Tool: analyze_media (extract_frame,
-prepare_media, fetch_media to follow). Launched bundled via `uv run --frozen
---offline` (no npx). stdout is JSON-RPC only — all logs go to stderr.
+so re-asking about the same file is cheap. Tools: analyze_media, extract_frame,
+prepare_media, fetch_media, list_models. Launched bundled via `uv run --frozen`
+(self-syncs the venv on launch; no npx). stdout is JSON-RPC only — logs go to stderr.
 """
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -61,6 +62,19 @@ def _effective_max_tokens(detail: str = _DEFAULT_DETAIL, max_tokens: int | None 
     return _DETAIL_TOKENS.get(detail, _DETAIL_TOKENS[_DEFAULT_DETAIL])
 
 
+# detail → visible-answer char cap. Separate from maxOutputTokens (which also feeds the
+# thinking pool, python-genai #2062); this frames ONLY the text returned to Claude Code,
+# enforced client-side in _frame_answer — the full text is dropped to a workspace file.
+_DETAIL_CHARS = {"brief": 2000, "normal": 8000, "full": 32000}
+
+
+def _answer_char_limit(detail: str = _DEFAULT_DETAIL, answer_chars: int | None = None) -> int:
+    """Visible-answer char cap. Override wins, else map the detail level (unknown → normal)."""
+    if answer_chars is not None:
+        return answer_chars
+    return _DETAIL_CHARS.get(detail, _DETAIL_CHARS[_DEFAULT_DETAIL])
+
+
 def _language_instruction(language: str | None) -> str:
     """Soft language steer. The default follows the question's language; an explicit
     `language` forces it. Both protect verbatim transcripts/quotes from being
@@ -107,7 +121,11 @@ def _build_request_body(refs: list, question: str, *, max_tokens: int,
             continue            # skip a content-less turn — Gemini rejects empty parts (HTTP 400) (#6)
         contents.append({"role": turn["role"], "parts": parts})
     new_parts = [_media_part(r, fps) for r in refs]
-    new_parts.append({"text": f"{question}\n\n{_language_instruction(language)}"})
+    # NO length steer: the model answers freely so the full text dropped to disk is genuinely
+    # full; the visible cap is applied ONLY client-side in _frame_answer (#223 — a soft steer
+    # measurably shortened Gemini's output, defeating "think freely, frame the answer").
+    qtext = f"{question}\n\n{_language_instruction(language)}"
+    new_parts.append({"text": qtext})
     contents.append({"role": "user", "parts": new_parts})
     return {
         "contents": contents,
@@ -194,12 +212,26 @@ def _parse_response(d: dict) -> tuple[str, int, str]:
     return "", audio, (f"BLOCKED:{block}".upper() if block else "EMPTY")
 
 
-def _finish_note(finish: str) -> str | None:
+def _usage_tokens(d: dict) -> tuple[int, int]:
+    """(thinking, visible-answer) token counts from usageMetadata — the split that exposes
+    when thinking starved the shared output pool (Grok's observability point). Both 0 when
+    absent (2.5-family without a thinkingConfig omits thoughtsTokenCount)."""
+    u = d.get("usageMetadata", {})
+    return int(u.get("thoughtsTokenCount", 0) or 0), int(u.get("candidatesTokenCount", 0) or 0)
+
+
+def _finish_note(finish: str, thought: int = 0, cand: int = 0) -> str | None:
     """Human hint when an answer didn't finish cleanly (finish_reason != STOP), so a
-    truncated/blocked/empty reply is never reported as a clean success."""
+    truncated/blocked/empty reply is never reported as a clean success. thought/cand are
+    the thinking vs visible-answer token counts (usageMetadata) — they let us name the
+    real cause: thinking and output share ONE maxOutputTokens pool (probe + python-genai
+    #2062), so a thinking model can starve its own answer."""
     if finish == "STOP":
         return None
     if finish == "MAX_TOKENS":
+        if thought > cand:          # thinking consumed the shared pool, not a long answer
+            return ("answer truncated — the model's thinking consumed the output budget; "
+                    "raise max_tokens, or switch to a non-thinking model")
         return "answer truncated — Gemini hit the output limit; raise max_tokens or use detail='full'"
     if finish.startswith("BLOCKED") or finish == "SAFETY":
         return f"Gemini blocked the response ({finish}) — the content may be restricted"
@@ -207,6 +239,22 @@ def _finish_note(finish: str) -> str | None:
         return ("empty response — the model returned no text; a thinking model may have spent its "
                 "output budget on reasoning, so raise max_tokens / use detail='full'")
     return f"incomplete response (finish_reason={finish})"
+
+
+def _frame_answer(text: str, limit: int, saved: bool = True) -> tuple[str, bool]:
+    """Cap the VISIBLE answer at `limit` chars so the reply reaching Claude Code's context
+    stays bounded (Chris: think freely, frame the answer). Gemini gives no separate visible-
+    output limit — thinking shares the maxOutputTokens pool (python-genai #2062) — so a
+    client-side cut is the only hard guarantee; the caller drops the FULL text to a workspace
+    file so nothing is lost. The marker is HONEST: it points at full_answer_file only when the
+    caller actually persisted it (`saved`) — a follow-up with no anchor, or a data-fs write
+    failure, leaves `saved=False` so we don't promise a file that isn't there. Returns
+    (framed_text, truncated)."""
+    if len(text) <= limit:
+        return text, False
+    tail = "полный ответ в full_answer_file" if saved else "полный ответ сохранить не удалось"
+    marker = f"\n\n[… обрезано jaine-media до {limit} симв.; {tail}]"
+    return text[:limit].rstrip() + marker, True
 
 
 _MIME = {
@@ -254,12 +302,15 @@ async def _generate(key: str, refs: list, question: str, *, model: str,
         if r.status_code // 100 != 2:
             raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:200]}")
         d = r.json()
-    return _parse_response(d)
+    text, audio, finish = _parse_response(d)
+    thought, cand = _usage_tokens(d)
+    return text, audio, finish, thought, cand
 
 
 @mcp.tool()
 async def analyze_media(path: str = "", question: str = "", detail: str = "normal",
-                        max_tokens: int | None = None, model: str | None = None,
+                        max_tokens: int | None = None, answer_chars: int | None = None,
+                        model: str | None = None,
                         language: str | None = None, fps: int | None = None,
                         session_id: str | None = None, paths: list[str] | None = None,
                         history: list | None = None) -> str:
@@ -282,8 +333,14 @@ async def analyze_media(path: str = "", question: str = "", detail: str = "norma
       path / paths: one file, or several files to compare in one request (paths wins).
       history:    prior turns [{role: 'user'|'model', text, paths: [files] (user turns)}].
                   The server re-uploads any expired files by content-hash. Caller-owned.
-      detail:     'brief' | 'normal' | 'full' → output length (512 / 2048 / 8192 tokens).
-      max_tokens: hard override for the output cap (wins over `detail`).
+      detail:     'brief' | 'normal' | 'full' → both the model output cap (512 / 2048 /
+                  8192 tokens) AND the VISIBLE-answer char frame (2000 / 8000 / 32000) that
+                  bounds what reaches Claude Code's context. The model thinks/answers freely;
+                  an over-long reply is cut client-side and the FULL text dropped to
+                  workspace/<sha>/answer-<n>.md (Gemini has no separate visible-output limit
+                  — thinking shares the token pool, python-genai #2062).
+      max_tokens: hard override for the model output cap (wins over `detail`).
+      answer_chars: hard override for the visible-answer char frame (wins over `detail`).
       model:      override the model (default JAINE_MEDIA_MODEL → gemini-2.5-flash).
       language:   force the answer language (e.g. 'ru'); default follows the question.
       fps:        sample video at this many frames/sec — raises timecode accuracy.
@@ -307,17 +364,21 @@ async def analyze_media(path: str = "", question: str = "", detail: str = "norma
 
     chosen_model = _model_for("analyze", model)
     eff_tokens = _effective_max_tokens(detail, max_tokens)
+    char_limit = _answer_char_limit(detail, answer_chars)
     anchor = None                              # set once hashing succeeds; None-safe in except
     try:
-        digests = [await gemini_files.compute_file_hash(p) for p in targets]
+        # hash inputs concurrently (local IO) — uploads below STAY sequential (free-tier burst, grab #6)
+        digests = await asyncio.gather(*(gemini_files.compute_file_hash(p) for p in targets))
         anchor = digests[0] if digests else None   # follow-up has no new file to key on
         resolved_history = await _resolve_history(key, history) if history else None
         refs = [await gemini_files.get_or_upload(key, BASE, str(p), _mime_for(p), file_hash=d)
                 for p, d in zip(targets, digests)]
         cached_before = all(r.cached for r in refs) if refs else None   # post ACTIVE-verify (#15)
-        answer, audio_tokens, finish = await _generate(key, refs, question, model=chosen_model,
-                                                       max_tokens=eff_tokens, fps=fps,
-                                                       language=language, history=resolved_history)
+        gen = await _generate(key, refs, question, model=chosen_model,
+                              max_tokens=eff_tokens, fps=fps,
+                              language=language, history=resolved_history)
+        answer, audio_tokens, finish = gen[0], gen[1], gen[2]
+        thought_tok, cand_tok = (tuple(gen[3:]) + (0, 0))[:2]   # 0 for a legacy 3-tuple shape
     except Exception as e:
         # Contract: never crash, always return a structured error. Besides the expected
         # RuntimeError (HTTP 404/429/503, upload errors), this also covers OSError (a file
@@ -334,6 +395,37 @@ async def analyze_media(path: str = "", question: str = "", detail: str = "norma
                 pass
         return json.dumps(err, ensure_ascii=False)
 
+    # Persist + frame (Chris: the model thinks/answers freely, but only `char_limit` chars
+    # reach Claude Code's context; the FULL text is preserved on disk so nothing is lost).
+    # A workspace is made for the source symlink (anchor only, cosmetic) AND/OR to hold an
+    # over-long answer. The full answer is written whenever the visible reply overflows —
+    # EVEN on a follow-up with no media anchor (keyed on the question hash) — so the marker
+    # never promises a full_answer_file we didn't write. Best-effort: this runs AFTER a
+    # successful (paid) Gemini call, so a data-fs OSError (full / read-only / perm-denied)
+    # must NOT sink the answer or escape to FastMCP — the marker then honestly says it
+    # couldn't save (never-crash; unlike extract_frame/prepare_media the dir is non-essential).
+    over = len(answer) > char_limit
+    workspace_path = None
+    full_answer_file = None
+    if anchor or over:
+        # key on the question AND the conversation (history), so two different follow-up
+        # conversations asking the same question text don't overwrite each other's file (#223).
+        hist_key = "".join(f"{t.get('role', '')}\x1f{t.get('text', '')}\x1f" for t in (history or []))
+        qhash = hashlib.sha256(f"{question}\x1e{hist_key}".encode()).hexdigest()[:8]
+        try:
+            if anchor:
+                ws = await asyncio.to_thread(workspace.prepare, anchor, targets[0])
+            else:                                # follow-up: no media to symlink, key on the question
+                ws = await asyncio.to_thread(agent_paths.workspace_dir, qhash)
+            workspace_path = str(ws)
+            if over:                             # preserve the full (pre-frame) answer on disk
+                full_file = ws / f"answer-{qhash}.md"
+                await asyncio.to_thread(full_file.write_text, answer, encoding="utf-8")
+                full_answer_file = str(full_file)
+        except Exception:
+            pass
+
+    framed, truncated = _frame_answer(answer, char_limit, saved=full_answer_file is not None)
     result = {
         "success": True,
         "model": chosen_model, "detail": detail, "max_tokens": eff_tokens,
@@ -341,10 +433,19 @@ async def analyze_media(path: str = "", question: str = "", detail: str = "norma
         # raw AUDIO-modality token count — model-dependent telemetry, NOT a deafness
         # signal (3.x fold audio into VIDEO → 0 even when they hear); see _parse_response
         "audio_tokens": audio_tokens,
+        # thinking vs visible-answer token split (shared maxOutputTokens pool) — diagnoses a
+        # thinking model that starved its own answer (probe + python-genai #2062)
+        "thinking_tokens": thought_tok, "answer_tokens": cand_tok,
         # finish_reason != STOP ⇒ answer is partial/blocked/empty, not a clean success
         "finish_reason": finish, "complete": finish == "STOP",
-        "analysis": answer,
+        "analysis": framed,
     }
+    if truncated:
+        result["truncated"] = True
+    if workspace_path:
+        result["workspace"] = workspace_path
+    if full_answer_file:
+        result["full_answer_file"] = full_answer_file
     if len(targets) == 1:                    # back-compat single-file shape
         result["file"] = str(targets[0])
         result["mime"] = _mime_for(targets[0])
@@ -356,22 +457,9 @@ async def analyze_media(path: str = "", question: str = "", detail: str = "norma
         result["continued"] = True           # follow-up turn — the media was in history
     if history:
         result["history_turns"] = len(history)
-    note = _finish_note(finish)
+    note = _finish_note(finish, thought_tok, cand_tok)
     if note:
         result["note"] = note
-
-    # Source symlink in the (anchor) workspace ONLY when there's a new file + one line
-    # in the central tool log (best-effort). workspace.prepare both makes the dir and
-    # symlinks the source, so use its return rather than agent_paths.workspace_dir alone.
-    # Best-effort: this runs AFTER a successful (paid) Gemini call, so a workspace_dir().mkdir
-    # OSError (full / read-only / perm-denied data-fs) must NOT sink the answer or escape to
-    # FastMCP — unlike extract_frame/prepare_media, the symlink here is cosmetic (never-crash).
-    if anchor:
-        try:
-            ws = await asyncio.to_thread(workspace.prepare, anchor, targets[0])
-            result["workspace"] = str(ws)
-        except Exception:
-            pass
     tool_log.log_tool("analyze_media", True, digest=anchor, model=chosen_model,
                       detail=detail, max_tokens=eff_tokens, cached_before=cached_before,
                       audio_tokens=audio_tokens, finish_reason=finish, n_inputs=len(targets),
@@ -566,10 +654,16 @@ async def fetch_media(url: str, max_height: int = 720, prepare: bool = True) -> 
             return json.dumps({"success": False, "error": "yt-dlp download failed"})
         digest = await gemini_files.compute_file_hash(dl)
         final = agent_paths.workspace_dir(digest) / f"source{dl.suffix.lower()}"
-        if final.exists():
-            final.unlink()                          # replace a partial/corrupt leftover from an
-                                                    # interrupted prior fetch — never reuse it (#14)
-        await asyncio.to_thread(shutil.move, str(dl), str(final))   # temp → workspace, off loop (#12)
+        # Stage into a sibling temp in the DEST dir, then atomic os.replace onto `final`. A
+        # cross-device/ENOSPC failure on the (copying) move leaves `final` untouched, so a prior
+        # valid file is never orphaned (#214.1); os.replace also overwrites any stale leftover (#14).
+        staged = final.with_name(final.name + ".incoming")
+        await asyncio.to_thread(shutil.move, str(dl), str(staged))   # temp → dest dir, off loop (#12)
+        try:
+            await asyncio.to_thread(os.replace, str(staged), str(final))  # atomic same-fs rename
+        except Exception:
+            staged.unlink(missing_ok=True)   # don't orphan the .incoming on a replace failure (#223)
+            raise
 
         verdict = media.fits(final)
         result = {"success": True, "url": url, "file": str(final),

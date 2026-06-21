@@ -396,6 +396,7 @@ async def get_or_upload(
     digest = file_hash or await compute_file_hash(path)
 
     # 1) fast path — cached, comfortably-unexpired, still ACTIVE server-side
+    processing_ref: Optional[FileRef] = None
     cached = _cache_get(digest)
     if cached is not None and _is_reusable(cached):
         try:
@@ -405,19 +406,15 @@ async def get_or_upload(
                 cached.cached = True
                 return cached
             if state == "PROCESSING":
-                # still uploading server-side — WAIT for it, don't re-upload the same
-                # bytes and orphan the in-flight file until 48h expiry (review #7).
-                active = await wait_active(api_key, base_url, cached.name)
-                cached.state = "ACTIVE"
-                new_exp = _expires_at_epoch(active)
-                if new_exp:
-                    cached.expires_at = new_exp
-                cached.cached = True
-                return cached
+                # still uploading server-side — WAIT for it (don't re-upload the same bytes and
+                # orphan the in-flight file until 48h expiry, review #7). The wait runs under the
+                # single-flight below so concurrent same-loop callers share ONE poll (#214.3).
+                processing_ref = cached
             # any other state (FAILED) → fall through to evict + re-upload
         except GeminiFilesError:
-            pass  # 403 / 404 / gone / wait-timeout → fall through to re-upload
-        _cache_evict(digest)
+            pass  # get_file 403 / 404 / gone → fall through to evict + re-upload
+        if processing_ref is None:
+            _cache_evict(digest)
 
     # 2) single-flight, scoped to THIS loop (a Future can't be awaited cross-loop)
     loop = asyncio.get_running_loop()
@@ -432,20 +429,36 @@ async def get_or_upload(
         return await existing  # another coroutine on this loop is already uploading
 
     try:
-        ref = await upload_video(api_key, base_url, path, mime)
-        if ref.state != "ACTIVE":
-            active = await wait_active(api_key, base_url, ref.name)
-            ref.state = "ACTIVE"
-            # Refresh expiry from the ACTIVE resource — the PROCESSING-state
-            # upload response may omit expirationTime (→ 0.0), which would make
-            # _is_reusable trust the entry forever (review #6).
+        if processing_ref is not None:
+            # leader waits out the server-side ingest of the cached file; concurrent same-loop
+            # callers await this ONE Future instead of each polling get_file too (#214.3).
+            active = await wait_active(api_key, base_url, processing_ref.name)
+            processing_ref.state = "ACTIVE"
             new_exp = _expires_at_epoch(active)
             if new_exp:
-                ref.expires_at = new_exp
+                processing_ref.expires_at = new_exp
+            processing_ref.cached = True
+            ref = processing_ref
+        else:
+            ref = await upload_video(api_key, base_url, path, mime)
+            if ref.state != "ACTIVE":
+                active = await wait_active(api_key, base_url, ref.name)
+                ref.state = "ACTIVE"
+                # Refresh expiry from the ACTIVE resource — the PROCESSING-state
+                # upload response may omit expirationTime (→ 0.0), which would make
+                # _is_reusable trust the entry forever (review #6).
+                new_exp = _expires_at_epoch(active)
+                if new_exp:
+                    ref.expires_at = new_exp
         _cache_put(digest, ref)
         own_future.set_result(ref)
         return ref
     except Exception as exc:
+        # A PROCESSING-cached entry whose wait_active failed (timeout/FAILED) must be evicted so
+        # the next call re-uploads instead of re-polling the same stuck file for the 48h TTL
+        # (#223 review). A fresh-upload failure has nothing cached to evict.
+        if processing_ref is not None:
+            _cache_evict(digest)
         own_future.set_exception(exc)
         raise
     finally:

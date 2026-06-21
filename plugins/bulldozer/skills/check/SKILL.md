@@ -222,7 +222,12 @@ For Round N continuation prompts, embed the current review-ledger.yml as APPENDI
 **3. Run the round** — one call composes codex → parser → log-round → trajectory → pivot signal:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/skills/check/scripts/bulldozer-round.sh" \
+# $CLAUDE_PLUGIN_ROOT is NOT exported to the Bash tool (#221) — resolve the plugin dir from
+# the cache (honor the var if it IS set). Shell state doesn't persist across Bash calls, so
+# re-run this resolver in every Bash call that invokes the wrapper.
+BULLDOZER_DIR=$( { [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT/skills/check" ] \
+  && printf '%s\n' "$CLAUDE_PLUGIN_ROOT"; } || ls -dt ~/.claude/plugins/cache/*/bulldozer/*/ 2>/dev/null | head -1 )
+"$BULLDOZER_DIR/skills/check/scripts/bulldozer-round.sh" \
   --round "$ROUND" \
   --review-dir "$REVIEW_DIR" \
   --artifact "$ARTIFACT" \
@@ -319,7 +324,10 @@ docs: artifact-name vN+1 (Mth review, K findings fixed)
 If you want the next round's `log-round` line + `state.json` totals to record per-round fixed/false-positive counts (instead of the default 0/0), set the env vars BEFORE the next Step 3 wrapper invocation:
 
 ```bash
-BULLDOZER_FIXED=K BULLDOZER_FP=M "${CLAUDE_PLUGIN_ROOT}/skills/check/scripts/bulldozer-round.sh" \
+# Re-resolve BULLDOZER_DIR (shell state doesn't persist across Bash calls — see Step 3):
+BULLDOZER_DIR=$( { [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT/skills/check" ] \
+  && printf '%s\n' "$CLAUDE_PLUGIN_ROOT"; } || ls -dt ~/.claude/plugins/cache/*/bulldozer/*/ 2>/dev/null | head -1 )
+BULLDOZER_FIXED=K BULLDOZER_FP=M "$BULLDOZER_DIR/skills/check/scripts/bulldozer-round.sh" \
   --round "$((ROUND + 1))" ...
 ```
 
@@ -635,7 +643,7 @@ gh issue create --repo A3IO/jaine-plugins \
 {what was done instead, or "none — blocked"}
 
 ## Environment
-- Plugin version: $(jq -r .version "$CLAUDE_PLUGIN_ROOT/.claude-plugin/plugin.json")
+- Plugin version: $(jq -r .version "$(ls -dt ~/.claude/plugins/cache/*/bulldozer/*/.claude-plugin/plugin.json 2>/dev/null | head -1)" 2>/dev/null || echo unknown)
 - Skill: check
 - Project: $(pwd)
 ISSUE

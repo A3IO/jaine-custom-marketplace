@@ -129,6 +129,50 @@ async def test_truncated_answer_flagged_not_silent(local_video, monkeypatch):
     assert "truncat" in d["note"].lower()  # actionable hint surfaced
 
 
+async def test_result_carries_thinking_and_answer_token_split(local_video, monkeypatch):
+    # Grok's observability point + structured diag: expose thinking vs visible-answer
+    # tokens so a starved answer is diagnosable, and the note names thinking as the cause.
+    async def _gen(*_a, **_k):
+        return ("partial", 0, "MAX_TOKENS", 460, 5)   # text, audio, finish, thought, cand
+
+    monkeypatch.setattr(server, "_generate", _gen)
+    d = json.loads(await server.analyze_media(str(local_video), "q"))
+
+    assert d["thinking_tokens"] == 460
+    assert d["answer_tokens"] == 5
+    assert "thinking" in d["note"].lower()  # thought >> cand → blame thinking, not a long answer
+
+
+async def test_long_answer_framed_and_full_dropped_to_file(local_video, monkeypatch):
+    # Chris: the model may think/answer freely, but the VISIBLE reply must stay framed so
+    # it can't blow Claude Code's context. The full text is preserved in a workspace file.
+    from pathlib import Path
+
+    long = "ответ. " * 1000                    # ~7000 chars, well over brief's 2000-char cap
+    async def _gen(*_a, **_k):
+        return (long, 0, "STOP", 50, 1500)
+
+    monkeypatch.setattr(server, "_generate", _gen)
+    d = json.loads(await server.analyze_media(str(local_video), "q", detail="brief"))
+
+    assert d["truncated"] is True
+    assert len(d["analysis"]) < len(long)      # visible answer is capped
+    assert "full_answer_file" in d
+    assert Path(d["full_answer_file"]).read_text() == long   # nothing lost — full text on disk
+
+
+async def test_short_answer_not_framed_no_file(local_video, monkeypatch):
+    async def _gen(*_a, **_k):
+        return ("краткий ответ", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server, "_generate", _gen)
+    d = json.loads(await server.analyze_media(str(local_video), "q", detail="brief"))
+
+    assert d["analysis"] == "краткий ответ"     # whole answer, untouched
+    assert "truncated" not in d
+    assert "full_answer_file" not in d
+
+
 async def test_clean_answer_has_no_warning_note(local_video, monkeypatch):
     async def _ok(*_a, **_k):
         return ("a full clean answer", 1440, "STOP")
@@ -285,3 +329,147 @@ async def test_no_file_and_no_history_is_error(monkeypatch):
     d = json.loads(await server.analyze_media(question="q"))
     assert d["success"] is False
     assert "history" in d["error"].lower() or "path" in d["error"].lower()
+
+
+async def test_analyze_does_not_steer_gemini_answer_length(local_video, monkeypatch):
+    # review #223 finding: the soft "aim for at most N characters" steer actually shortens
+    # Gemini's output (confirmed live), so the full answer dropped to disk is itself truncated
+    # — defeating "think freely, frame client-side". The Gemini request must carry NO length
+    # steer; the cap is applied ONLY client-side in _frame_answer.
+    import httpx
+
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": "ok"}]},
+                                    "finishReason": "STOP"}]}
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, _url, **kw):
+            captured["body"] = kw.get("json")
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    await server.analyze_media(str(local_video), "транскрибируй дословно", answer_chars=500)
+
+    sent = captured["body"]["contents"][-1]["parts"][-1]["text"].lower()
+    assert "concise" not in sent           # no conciseness steer
+    assert "characters" not in sent        # no "aim for at most N characters" steer
+
+
+async def test_followup_truncated_drops_full_answer_file(local_video, monkeypatch):
+    # sister-review edge: a follow-up via history has NO media anchor (targets=[]), yet a long
+    # answer is still framed and the marker promises full_answer_file. The file MUST be written
+    # (keyed on the question hash) — otherwise the marker lies AND the full answer is lost.
+    from pathlib import Path
+
+    long = "ответ. " * 1000
+    async def _gen(_key, _refs, _q, *, history=None, **_k):
+        return (long, 0, "STOP", 50, 1500)
+
+    monkeypatch.setattr(server, "_generate", _gen)
+    hist = [{"role": "user", "text": "опиши", "paths": [str(local_video)]},
+            {"role": "model", "text": "кот"}]
+    d = json.loads(await server.analyze_media(question="подробнее?", history=hist, detail="brief"))
+
+    assert d["success"] is True
+    assert d["truncated"] is True
+    assert "full_answer_file" in d                          # follow-up still preserves the full text
+    assert Path(d["full_answer_file"]).read_text() == long  # nothing lost
+
+
+async def test_truncated_with_failed_save_has_honest_marker(local_video, monkeypatch):
+    # sister-review edge path 2: truncated, but the workspace write fails (data-fs OSError).
+    # The marker must NOT promise a full_answer_file that was never written — and must not crash.
+    long = "ответ. " * 1000
+    async def _gen(*_a, **_k):
+        return (long, 0, "STOP", 50, 1500)
+
+    def _boom(*_a, **_k):
+        raise OSError("Read-only file system")
+
+    monkeypatch.setattr(server, "_generate", _gen)
+    monkeypatch.setattr(server.workspace, "prepare", _boom)
+    monkeypatch.setattr(server.agent_paths, "workspace_dir", _boom)
+    d = json.loads(await server.analyze_media(str(local_video), "q", detail="brief"))
+
+    assert d["success"] is True                       # the (paid) analysis still stands
+    assert d["truncated"] is True                      # we DID frame the visible answer
+    assert "full_answer_file" not in d                 # nothing written
+    assert "full_answer_file" not in d["analysis"]     # marker must not promise the missing file
+
+
+async def test_full_answer_file_written_as_utf8(local_video, monkeypatch):
+    # review #223: full_file.write_text(answer) used the platform default encoding — on a
+    # non-UTF-8 locale (minimal Linux/Docker) a Cyrillic answer raises UnicodeEncodeError,
+    # swallowed → the full answer is lost. The write MUST pin encoding='utf-8'.
+    import pathlib
+
+    calls = []
+    real = pathlib.Path.write_text
+
+    def spy(self, data, *a, **k):
+        calls.append(k)
+        return real(self, data, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", spy)
+    long = "ответ. " * 1000
+    async def _gen(*_a, **_k):
+        return (long, 0, "STOP", 50, 1500)
+
+    monkeypatch.setattr(server, "_generate", _gen)
+    await server.analyze_media(str(local_video), "q", detail="brief")
+
+    assert any(c.get("encoding") == "utf-8" for c in calls)   # the full-answer write pins utf-8
+
+
+async def test_followup_full_answer_file_distinct_per_conversation(local_video, monkeypatch):
+    # review #223: a follow-up's full_answer_file was keyed ONLY on the question text, so two
+    # different conversations asking the same question ("подробнее?") overwrote each other.
+    # The key must include the conversation (history) so they don't collide.
+    long = "ответ. " * 1000
+    async def _gen(_key, _refs, _q, **_k):
+        return (long, 0, "STOP", 50, 1500)
+
+    monkeypatch.setattr(server, "_generate", _gen)
+    histA = [{"role": "user", "text": "видео A", "paths": [str(local_video)]},
+             {"role": "model", "text": "A"}]
+    histB = [{"role": "user", "text": "видео B", "paths": [str(local_video)]},
+             {"role": "model", "text": "B"}]
+    a = json.loads(await server.analyze_media(question="подробнее?", history=histA, detail="brief"))
+    b = json.loads(await server.analyze_media(question="подробнее?", history=histB, detail="brief"))
+
+    assert a["full_answer_file"] != b["full_answer_file"]   # distinct conversations don't collide
+
+
+async def test_fetch_media_replace_failure_cleans_staged(tmp_path, monkeypatch):
+    # review #223: if shutil.move stages the .incoming file but os.replace then fails (fs went
+    # read-only mid-op), the staged file was orphaned in the workspace. It must be cleaned up.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.fetch, "validate_url", lambda u: None)
+    monkeypatch.setattr(server.media, "has_tool", lambda n: True)
+    dl = tmp_path / "dl.mp4"
+    dl.write_bytes(b"x")
+    monkeypatch.setattr(server.fetch, "download", lambda *a, **k: dl)
+
+    async def _hash(*_a, **_k):
+        return "deadbeefdeadbeef"
+
+    monkeypatch.setattr(server.gemini_files, "compute_file_hash", _hash)
+
+    def _replace_boom(*_a, **_k):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(server.os, "replace", _replace_boom)
+    d = json.loads(await server.fetch_media("https://example.com/v.mp4"))
+
+    assert d["success"] is False
+    ws = server.agent_paths.workspace_dir("deadbeef")
+    assert list(ws.glob("*.incoming")) == []      # no orphaned .incoming left behind

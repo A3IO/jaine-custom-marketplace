@@ -215,3 +215,30 @@ async def test_fetch_media_downloads_into_workspace(tmp_path, monkeypatch):
     assert Path(d["file"]).exists()
     assert "workspace" in d["file"]   # landed on the unified content-hash path
     assert "fits" in d                # fit-check ran
+
+
+async def test_fetch_media_preserves_prior_file_when_move_fails(tmp_path, monkeypatch):
+    # #214.1: final.unlink()-then-shutil.move destroyed BOTH a prior valid file and the fresh
+    # download when the cross-device move raised (ENOSPC). Staged-then-os.replace keeps the
+    # prior file untouched, since `final` is never unlinked before the atomic rename.
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.media, "has_tool", lambda _n: True)
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+
+    def fake_download(_url, dest, **_kw):
+        f = Path(dest) / "dl.mp4"
+        shutil.copy(_VIDEO, f)
+        return f
+
+    monkeypatch.setattr(server.fetch, "download", fake_download)
+    d1 = json.loads(await server.fetch_media("https://8.8.8.8/v.mp4"))   # lands a valid file
+    final = Path(d1["file"])
+    prior = final.read_bytes()
+
+    def boom_move(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(server.shutil, "move", boom_move)
+    d2 = json.loads(await server.fetch_media("https://8.8.8.8/v.mp4"))
+    assert d2["success"] is False
+    assert final.read_bytes() == prior   # prior valid file NOT orphaned

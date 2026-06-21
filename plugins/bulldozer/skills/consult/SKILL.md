@@ -1,6 +1,6 @@
 ---
 name: consult
-description: "Lightweight conversational design consultation via external AI reviewer(s) — for abstract design questions, architectural tradeoffs, and 'should I X or Y?' decisions before any artifact exists. Single-codex by default; add --panel for a 3-model (codex+grok+agy) parallel find-holes panel, or --panel --repo for informed multi-model review of a real codebase. Triggers on 'help me choose between', 'compare options', 'talk through this architecture', 'what tradeoffs am I missing', 'what am I overlooking', 'find the holes', 'sanity check', 'ask all three models', 'Помоги выбрать', 'обсудим архитектурное решение', 'какие тут компромиссы', 'спроси codex', 'спроси все три модели'. Do NOT use single-consult when the question references files/code on disk — use bulldozer:check, or --panel --repo for a multi-model read of real code."
+description: "Lightweight conversational design consultation via external AI reviewer(s) — for abstract design questions, architectural tradeoffs, and 'should I X or Y?' decisions before any artifact exists. Single-codex by default; add --panel for a 3-model (codex+grok+agy) parallel find-holes panel, or --panel --repo for informed multi-model review of a real codebase. Triggers on 'help me choose between', 'compare options', 'talk through this architecture', 'what tradeoffs am I missing', 'what am I overlooking', 'find the holes', 'sanity check', 'ask all three models', 'Помоги выбрать', 'обсудим архитектурное решение', 'какие тут компромиссы', 'спроси codex', 'спроси все три модели'. Do NOT use single-consult to review a file/diff on disk as the target — use bulldozer:check, or --panel --repo for a multi-model read of real code (a question that merely names a file as context is fine)."
 argument-hint: "[design question] — or: --panel [--repo PATH] [--verdict] <question>"
 allowed-tools: ["Bash", "Read", "AskUserQuestion"]
 ---
@@ -20,7 +20,7 @@ This skill is the lightweight sibling of `/bulldozer:check`. `check` is for arti
 - "Talk through this design with me" — second opinion on an idea
 
 **Do NOT use for:**
-- Anything referencing files, paths, diffs, code, or artifacts on disk → use `/bulldozer:check`
+- Reviewing a file/diff/artifact on disk *as the review target* → use `/bulldozer:check` (a question that merely *names* a file as context is fine — see Step 2, Case B)
 - Quick factual questions with deterministic answers → ask directly without codex
 - Code review where tests exist → run the tests
 - Implementation details (variable naming, exact syntax) → consult is design-level
@@ -37,9 +37,9 @@ Same flow as `/bulldozer:check`. Read saved preference from `.bulldozer/config.m
 
 Save choice → use as `-m <model>` argument to codex.
 
-## Step 2: Pre-flight Artifact Detection (CRITICAL)
+## Step 2: Artifact Reference Notice (soft warn, NOT a hard stop)
 
-Before invoking codex, scan the user's question for artifact references. If found, **STOP and recommend `/bulldozer:check` instead** — do not proceed with consult.
+Before invoking codex, scan the user's question for artifact references. If found, **classify intent — do not blanket-block.** The old hard-stop never once fired in 209 production launches (#107); the real hallucination guard is the Step 3 prompt directive + Step 4 isolation, not this step.
 
 **Artifact patterns to detect** (case-insensitive):
 
@@ -51,11 +51,15 @@ Before invoking codex, scan the user's question for artifact references. If foun
 | Artifact pointers | "attached", "this spec", "this code", "the diff", "the file", "@file" |
 | Code identifiers | function names with parens, `class.method`, fenced code blocks with language tags |
 
-**If detected**: tell the user:
+**On a match, classify by INTENT:**
 
-> Я заметил, что вопрос ссылается на конкретный артефакт (`<excerpt>`). `consult` работает только с inline-текстом без чтения файлов. Запусти `/bulldozer:check <path>` для file-based ревью, или переформулируй вопрос как абстрактный design tradeoff.
+- **Case A — artifact as review TARGET** ("review `foo.py`", "what's wrong with this code", "check this diff"): **STOP**, recommend `/bulldozer:check <path>`. consult can't read files, so a review *of a file* belongs in `check` (or `--panel --repo` for a multi-model read).
+  > Вопрос просит ревью самого артефакта (`<excerpt>`). `consult` не читает файлы — запусти `/bulldozer:check <path>` для file-based ревью (или `--panel --repo <path>` для multi-model чтения кода).
+- **Case B — artifact as decisional CONTEXT** ("should we refactor `foo.py` because X?", "we have N call-sites in `bar.py` — pattern A or B?"): show a one-line notice, then **PROCEED**. The question is an abstract design tradeoff that merely *names* a file; codex answers from the supplied context and discloses its basis (verified: a clean verdict with `"Basis: from the supplied context only; I did not inspect files"`, zero file hallucination).
+  > Вопрос упоминает артефакт (`<excerpt>`) как контекст, не как цель ревью — продолжаю consult (codex отвечает по тексту, файлы не читает). Нужно ревью файла → `/bulldozer:check <path>`.
+- **Ambiguous** (can't tell target from context): ask the user with AskUserQuestion (rare path).
 
-Then exit without invoking codex. Why this matters: consult runs codex in a fully isolated tmpdir with no project access by design (see Step 4). If we let it through, codex will reason about something it can't see and return confident hallucination.
+Why this is a soft warn, not a stop: consult runs codex in a fully isolated tmpdir with no project access (Step 4), and the Step 3 prompt directive ("Do not inspect files") already prevents grounded hallucination. The pre-flight is a routing aid for Case A, not a gate that blocks Case B.
 
 ## Step 3: Wrap the User Prompt
 
@@ -138,15 +142,26 @@ Run the classifier directly rather than matching by hand:
 
 ```bash
 VERDICT=$(python3 - "$OUT" <<'PY'
-import os, sys
-sys.path.insert(0, os.path.join(os.environ["CLAUDE_PLUGIN_ROOT"], "skills/consult/scripts"))
+import os, sys, glob
+# Resolve the consult scripts dir WITHOUT relying on $CLAUDE_PLUGIN_ROOT — it is NOT exported
+# to the Bash tool's environment (empirically empty, CC 2.1.185 — #221). Prefer it if set
+# (future-proof), else the newest installed plugin-cache copy.
+cands = ([os.path.join(os.environ["CLAUDE_PLUGIN_ROOT"], "skills/consult/scripts")]
+         if os.environ.get("CLAUDE_PLUGIN_ROOT") else [])
+cands += sorted(glob.glob(os.path.expanduser(
+    "~/.claude/plugins/cache/*/bulldozer/*/skills/consult/scripts")),
+    key=os.path.getmtime, reverse=True)
+scripts = next((d for d in cands if os.path.isdir(d)), None)
+if not scripts:
+    sys.exit("consult scripts dir not found (#221 resolver)")
+sys.path.insert(0, scripts)
 from consult_panel import classify_verdict
 print(classify_verdict(open(sys.argv[1]).read()))
 PY
 )
 ```
 
-The `$CLAUDE_PLUGIN_ROOT` env var (set by Claude Code) is the **only** reliable path — the plugin code lives in `~/.claude/plugins/cache/…`, and the Bash tool's cwd is the consumer project, not the plugin root. A bare relative `skills/consult/scripts` would not resolve. (Same convention `/bulldozer:check` uses for its scripts.)
+**Do NOT use `os.environ["CLAUDE_PLUGIN_ROOT"]` here** — that var is resolved only in plugin manifests / markdown substitution, **NOT exported to the Bash tool's shell** (empirically empty in CC 2.1.185, `KeyError` — #221). The plugin code lives in `~/.claude/plugins/cache/…` and the Bash tool's cwd is the consumer project, so the snippet self-resolves the scripts dir: it honors `$CLAUDE_PLUGIN_ROOT` if ever set, else falls back to the newest plugin-cache copy (the abs path the skill header also prints as "Base directory for this skill"). A bare relative `skills/consult/scripts` would not resolve.
 
 Why fail-closed: a missing/malformed verdict signals codex didn't follow instructions — silent GO would let bad advice through. **INCONCLUSIVE** is the middle path so a substantive prose answer that merely lacks the token is no longer a false NO-GO. Capture codex to `$OUT` with **split streams** (`> "$OUT" 2>"$OUT.err"`) so a chatty error on stderr can't be misread as a substantive prose answer — a real failure leaves `$OUT` empty/banner-only → fail-closed NO-GO.
 
@@ -201,7 +216,11 @@ Opt-in: run **three models** (codex + grok + agy) in parallel instead of one cod
 **Invocation:**
 
 ```bash
-PANEL="${CLAUDE_PLUGIN_ROOT}/skills/consult/scripts/consult_panel.py"  # plugin cache, not cwd
+# Resolve the plugin dir WITHOUT $CLAUDE_PLUGIN_ROOT (NOT exported to the Bash tool — #221):
+# honor it if set, else the newest plugin-cache copy.
+BULLDOZER_DIR=$( { [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT/skills/consult" ] \
+  && printf '%s\n' "$CLAUDE_PLUGIN_ROOT"; } || ls -dt ~/.claude/plugins/cache/*/bulldozer/*/ 2>/dev/null | head -1 )
+PANEL="$BULLDOZER_DIR/skills/consult/scripts/consult_panel.py"
 
 # isolated find-holes (abstract question, no file access) — panel default
 python3 "$PANEL" "<question>"
@@ -213,7 +232,7 @@ python3 "$PANEL" --repo <path> "<question>"
 python3 "$PANEL" [--repo <path>] --verdict "<question>"
 ```
 
-`$CLAUDE_PLUGIN_ROOT` is mandatory — the script lives in the plugin cache (`~/.claude/plugins/cache/…`), not the consumer project the Bash tool runs from.
+The `BULLDOZER_DIR` resolver above is required because `$CLAUDE_PLUGIN_ROOT` is **not exported to the Bash tool** (#221) and the script lives in the plugin cache (`~/.claude/plugins/cache/…`), not the consumer project the Bash tool runs from.
 
 Output: a merged `## SHARED` / `## UNIQUE` synthesis (find-holes) or a per-model verdict line (verdict), with raw per-model blocks below. Exits non-zero iff **every** model failed; one model failing degrades to a `[<model>: failed — …]` block and the panel continues with survivors.
 
@@ -225,11 +244,24 @@ Output: a merged `## SHARED` / `## UNIQUE` synthesis (find-holes) or a per-model
 
 ## Logging
 
-Append one line per invocation to `~/.claude/hooks/bulldozer-consult.log`:
+Append **one line per COMPLETED invocation** to `~/.claude/hooks/bulldozer-consult.log` — log at completion (when the verdict is known), NOT at start. (A survey found 903/912 lines were start-only stubs with `verdict=` / `tokens=0` and no completion data — log once, after Step 5 — #107.)
+
+**Strict schema** — these 8 fields, this order, `key=value` separated by ` | `:
 
 ```
+<ISO8601-ts> | session=<S> | round=<N> | verdict=<V> | tokens=<T> | time=<X>s | model=<M> | project=<P>
 2026-05-25T03:15:00+03:00 | session=f7186873 | round=1 | verdict=GO | tokens=4500 | time=4.3s | model=gpt-5.5 | project=/path/to/repo
 ```
+
+| Field | Value — and the ONLY accepted "no data" form |
+|-------|---------|
+| `session` | `${CLAUDE_CODE_SESSION_ID:0:8}`; `NA` if unset — **never the project name** |
+| `round` | integer ≥ 1 |
+| `verdict` | exactly one of `GO` / `NO-GO` / `MINOR-FIXES` / `INCONCLUSIVE` — **never `TBD` or empty** |
+| `tokens` | integer; `NA` if codex didn't report it — **one sentinel, not `N/A`/`na`/`-`/`~`/``/`0`** |
+| `time` | seconds, one decimal, `s` suffix (e.g. `4.3s`) |
+| `model` | the `-m` model id |
+| `project` | `git rev-parse --show-toplevel 2>/dev/null \|\| pwd` |
 
 **What we do NOT log:** the prompt content, the verdict body, any user-supplied text. Only metadata. This is a deliberate privacy property — see "What we don't do".
 
@@ -245,7 +277,7 @@ These are not oversights — they are validated design choices:
 | File reading / project access | Process-level isolation (empty tmpdir + `--ignore-user-config --ignore-rules`) is the security boundary. Prompt-level "SKIP SKILLS." alone is theatrical. |
 | Counting blockers in verdict prose | Empirically unparseable from short codex output (≤200 words). We use round count + NO-GO repetition instead — simple string match, reliable. |
 | Custom config file in `.bulldozer/consult.md` | YAGNI. Model preference is shared with `check` via `.bulldozer/config.md` (single key: `reviewer_model`). Adding consult-specific config drifts both. |
-| Scripts in `skills/consult/scripts/` | The bash flow above fits inline. Adding a wrapper script adds maintenance cost without benefit (no shared state, no complex logic). |
+| A wrapper script for the SINGLE-codex flow | The single-consult bash flow fits inline (no shared state, no complex logic). The `--panel` mode is the deliberate exception — it DOES ship `scripts/consult_panel.py` because 3 parallel models + per-model isolation + merge is genuinely complex logic that does not fit inline. |
 
 ## Common Mistakes
 
@@ -254,7 +286,7 @@ These are not oversights — they are validated design choices:
 | Running codex from project root (`-C $PROJECT_ROOT`) | Use empty tmpdir cwd — codex with project access reads files and hallucinates with false grounding |
 | Skipping `--ignore-user-config` because `--ephemeral` was set | `--ephemeral` blocks rollout, NOT skill loading. Codex will still load user skills if the prompt mentions skill design. Use both. |
 | Trusting "SKIP SKILLS." prefix alone | Empirically observed: codex loaded skill-creator anyway when prompt mentioned "skill design". Always combine prompt-level + process-level. |
-| Letting user prompts with file paths through | Pre-flight detection (Step 2) is the routing primitive. Without it, consult becomes a worse check. |
+| Hard-blocking every file-path mention | Step 2 is a soft warn: route Case A (artifact = review target) to `check`; PROCEED on Case B (artifact named as context). Blanket blocks are false positives — the hard-stop never fired in 209 prod launches (#107). |
 | Treating missing verdict as silent success | Fail-closed: no anchored `VERDICT:` line AND no substantive prose → NO-GO. Substantive prose without the token → **INCONCLUSIVE** (re-ask), not a false NO-GO. |
 | Parsing `full output` for verdict by hand | Use `classify_verdict` (§3.7): anchored `VERDICT:` line only, final one wins, banner stripped. The old `codex`↔`tokens used` sed misfired on prose like "a go-to pattern". |
 | Running multi-round in background | FOREGROUND ONLY. User explicitly invokes each round. No automation, no cron. |
@@ -294,16 +326,27 @@ mkdir -p "$TMPDIR_RUN"
 EXIT=$?
 
 # 5. Parse verdict (fail-closed) — §3.7 classifier, not sed/loose-regex
+#    (self-resolves the scripts dir — $CLAUDE_PLUGIN_ROOT is NOT in the Bash env, #221)
 VERDICT=$(python3 - "$TMPDIR_RUN/verdict.txt" <<'PY'
-import os, sys
-sys.path.insert(0, os.path.join(os.environ["CLAUDE_PLUGIN_ROOT"], "skills/consult/scripts"))
+import os, sys, glob
+cands = ([os.path.join(os.environ["CLAUDE_PLUGIN_ROOT"], "skills/consult/scripts")]
+         if os.environ.get("CLAUDE_PLUGIN_ROOT") else [])
+cands += sorted(glob.glob(os.path.expanduser(
+    "~/.claude/plugins/cache/*/bulldozer/*/skills/consult/scripts")),
+    key=os.path.getmtime, reverse=True)
+scripts = next((d for d in cands if os.path.isdir(d)), None)
+if not scripts:
+    sys.exit("consult scripts dir not found (#221 resolver)")
+sys.path.insert(0, scripts)
 from consult_panel import classify_verdict
 print(classify_verdict(open(sys.argv[1]).read()))
 PY
 )
 
 # 6. Log metadata, cleanup
-echo "$(date -Iseconds) | session=${CLAUDE_CODE_SESSION_ID:0:8} | round=$ROUND | verdict=$VERDICT | tokens=$TOKENS | time=${ELAPSED}s | model=$MODEL | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)" >> ~/.claude/hooks/bulldozer-consult.log
+S="${CLAUDE_CODE_SESSION_ID:0:8}"; S="${S:-NA}"   # session id, never the project name (#107 schema)
+T="${TOKENS:-NA}"; [ "$T" = "0" ] && T="NA"        # 0 is the no-data stub the schema forbids, not a count (#107)
+echo "$(date -Iseconds) | session=$S | round=$ROUND | verdict=$VERDICT | tokens=$T | time=${ELAPSED}s | model=$MODEL | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)" >> ~/.claude/hooks/bulldozer-consult.log
 rm -rf "$TMPDIR_RUN"
 ```
 
@@ -315,7 +358,7 @@ Each design choice traces back to a measured failure mode. Dogfooded against cod
 |----------|-------------|
 | Process-level isolation vs prompt-level | Without `--ignore-user-config`: 43s, 51K tokens, 1900 lines of skill-loading noise. With all 5 flags: **4s, 4.5K tokens, 0 noise**. ~10× faster, ~12× cheaper. |
 | Stateless only | 3 of 4 cross-framing dogfood runs (neutral A2 + adversarial A3 + adversarial dogfood-2) independently voted REMOVE persistent. |
-| Artifact pre-flight | Two independent runs (signal-pick B1 + collision-find C2) converged on "artifact reference is the kill-switch — route to check, not consult". |
+| Artifact pre-flight | Soft routing aid, NOT a kill-switch (#107): the hard-stop framing never fired in 209 prod launches — Case A (review target) routes to `check`, Case B (context ref) proceeds. The real hallucination guard is the Step 3 directive + Step 4 isolation. |
 | Fail-closed verdict parsing | Empirical: codex output noise can suppress `GO` matches; silent default to NO-GO forces user re-prompt rather than acting on absent advice. |
 | Escalation rule (round≥3 + 2× NO-GO) | Alternative rule "count blockers ≥ 5" empirically unparseable from short prose (verified directly via B2). |
 
@@ -359,7 +402,7 @@ gh issue create --repo A3IO/jaine-plugins \
 {what was done instead, or "none — blocked"}
 
 ## Environment
-- Plugin version: $(jq -r .version "$CLAUDE_PLUGIN_ROOT/.claude-plugin/plugin.json")
+- Plugin version: $(jq -r .version "$(ls -dt ~/.claude/plugins/cache/*/bulldozer/*/.claude-plugin/plugin.json 2>/dev/null | head -1)" 2>/dev/null || echo unknown)
 - Skill: consult
 - Project: $(pwd)
 ISSUE

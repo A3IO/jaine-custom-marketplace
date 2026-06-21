@@ -6,12 +6,10 @@
         "run",
         "--directory", "${CLAUDE_PLUGIN_ROOT}/server",
         "--frozen",
-        "--offline",
         "server.py"
       ],
       "env": {
         "UV_PROJECT_ENVIRONMENT": "${CLAUDE_PLUGIN_DATA}/.venv",
-        "UV_NO_SYNC": "1",
         "GEMINI_API_KEY": "${GEMINI_API_KEY}"
       }
     }

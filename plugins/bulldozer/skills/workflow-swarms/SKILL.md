@@ -211,7 +211,7 @@ $(tail -n 12 "${WORKFLOW_HOOK_LOG:-$HOME/.claude/hooks/require-workflow-skill.lo
 {escape comment / env pin / manual routing, or "none — blocked"}
 
 ## Environment
-- Plugin version: $(jq -r .version "$CLAUDE_PLUGIN_ROOT/.claude-plugin/plugin.json" 2>/dev/null)
+- Plugin version: $(jq -r .version "$(ls -dt ~/.claude/plugins/cache/*/bulldozer/*/.claude-plugin/plugin.json 2>/dev/null | head -1)" 2>/dev/null || echo unknown)
 - Enforce mode: ${BULLDOZER_ENFORCE_WORKFLOW_ROUTING:-unset}
 - Skill: workflow-swarms
 - Project: $(pwd)
