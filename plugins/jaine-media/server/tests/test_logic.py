@@ -64,6 +64,76 @@ def test_body_uses_high_media_resolution():
     assert body["generationConfig"]["mediaResolution"] == "MEDIA_RESOLUTION_HIGH"
 
 
+def test_media_resolution_high_for_2_5_family():
+    # #232: on the 2.5 family HIGH == default (same token cost) — keep HIGH, it's free.
+    assert server._media_resolution_for("gemini-2.5-flash") == "MEDIA_RESOLUTION_HIGH"
+    assert server._media_resolution_for("gemini-2.5-pro") == "MEDIA_RESOLUTION_HIGH"
+
+
+def test_media_resolution_medium_for_3x_family():
+    # #232: on 3.x, HIGH is ~3.4x their cheap default for zero benefit (OCR-only). Default MEDIUM.
+    assert server._media_resolution_for("gemini-3.5-flash") == "MEDIA_RESOLUTION_MEDIUM"
+    assert server._media_resolution_for("gemini-3.1-pro-preview") == "MEDIA_RESOLUTION_MEDIUM"
+
+
+def test_media_resolution_unknown_family_keeps_high():
+    # unknown/future model → preserve current behavior (HIGH), never silently downgrade quality.
+    assert server._media_resolution_for("gemini-9-ultra") == "MEDIA_RESOLUTION_HIGH"
+
+
+def test_body_respects_media_resolution_override():
+    # an explicit media_resolution wins over the default, so OCR-on-3.x stays reachable.
+    body = server._build_request_body([_ref()], "q", max_tokens=512,
+                                      media_resolution="MEDIA_RESOLUTION_LOW")
+    assert body["generationConfig"]["mediaResolution"] == "MEDIA_RESOLUTION_LOW"
+
+
+# --- native YouTube passthrough (#229): the URL IS the fileUri, no upload ---
+
+def test_native_ref_points_at_the_url():
+    ref = server._native_ref("https://youtu.be/abc")
+    assert ref.uri == "https://youtu.be/abc"
+    assert ref.state == "ACTIVE"            # no PROCESSING wait — Gemini ingests it server-side
+
+
+def test_media_part_native_url_omits_mimetype():
+    # #229: a native part is {fileData:{fileUri:url}} with NO mimeType — Gemini ingests the
+    # YouTube URL itself; an mimeType on a URL part is wrong.
+    part = server._media_part(server._native_ref("https://youtu.be/abc"), None)
+    assert part["fileData"]["fileUri"] == "https://youtu.be/abc"
+    assert "mimeType" not in part["fileData"]
+
+
+def test_media_part_uploaded_ref_keeps_mimetype():
+    # regression: an UPLOADED file part still carries its mimeType (only native URLs omit it).
+    part = server._media_part(_ref(), None)
+    assert part["fileData"]["mimeType"] == "video/mp4"
+
+
+# --- _is_native routing decision (#229): native only for a one-shot single YouTube URL ---
+
+def test_is_native_for_single_youtube_no_history():
+    assert server._is_native(["https://youtu.be/abc"], None) is True
+
+
+def test_is_native_false_with_history():
+    # multi-turn re-pulls the native URL every turn → download+reuse instead.
+    assert server._is_native(["https://youtu.be/abc"], [{"role": "user", "text": "x"}]) is False
+
+
+def test_is_native_false_for_non_youtube_url():
+    assert server._is_native(["https://vimeo.com/1"], None) is False
+
+
+def test_is_native_false_for_local_path():
+    assert server._is_native(["/x/clip.mp4"], None) is False
+
+
+def test_is_native_false_for_multiple_inputs():
+    # native supports at most ONE YouTube link per request.
+    assert server._is_native(["https://youtu.be/a", "https://youtu.be/b"], None) is False
+
+
 def test_body_omits_fps_by_default():
     part = server._build_request_body([_ref()], "q", max_tokens=512)["contents"][0]["parts"][0]
     assert "videoMetadata" not in part
@@ -225,6 +295,23 @@ def test_filter_sorts_by_id():
     assert ids == sorted(ids)
 
 
+def test_filter_drops_learned_dead_models():
+    # #233 learn-from-404: a catalog entry recorded as dead (404'd on use) is hidden, even
+    # though models.list still advertises it (no retired-signal — that's the whole problem).
+    raw = [{"name": "models/gemini-3-pro-preview", "supportedGenerationMethods": ["generateContent"]},
+           {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]}]
+    ids = [m["id"] for m in server._filter_models(raw, dead={"gemini-3-pro-preview"})]
+    assert "gemini-3-pro-preview" not in ids
+    assert "gemini-2.5-flash" in ids
+
+
+def test_filter_default_dead_is_empty():
+    # back-compat: _filter_models(raw) without `dead` keeps everything it used to.
+    raw = [{"name": "models/gemini-3-pro-preview", "supportedGenerationMethods": ["generateContent"]}]
+    ids = [m["id"] for m in server._filter_models(raw)]
+    assert "gemini-3-pro-preview" in ids
+
+
 # --- _parse_response (candidates text + AUDIO prompt tokens + finishReason) ---
 
 def test_parse_extracts_text_audio_and_finish_reason():
@@ -269,6 +356,33 @@ def test_parse_handles_empty_response():
     assert text == ""
     assert audio == 0
     assert finish == "EMPTY"            # no candidate, no block reason
+
+
+def test_parse_flags_empty_text_with_stop_as_empty():
+    # #231 dogfood: a thinking model (2.5-pro) returned a candidate with finishReason=STOP but
+    # NO text — thinking ate the output budget. A bare STOP reports complete success with an empty
+    # analysis (the deceptive case). A present-but-textless STOP candidate must read EMPTY so the
+    # caller flags it (complete=False + note), never a silent empty success.
+    d = {"candidates": [{"finishReason": "STOP", "content": {"parts": []}}]}
+    text, _, finish = server._parse_response(d)
+    assert text == ""
+    assert finish == "EMPTY"
+
+
+def test_parse_flags_whitespace_only_stop_as_empty():
+    # whitespace-only parts strip to "" — same deceptive STOP, must surface as EMPTY.
+    d = {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "  \n "}]}}]}
+    text, _, finish = server._parse_response(d)
+    assert text == ""
+    assert finish == "EMPTY"
+
+
+def test_parse_keeps_max_tokens_when_text_empty():
+    # guard: ONLY STOP+empty is the deceptive case. MAX_TOKENS already signals incompleteness and
+    # carries a more specific note — an empty MAX_TOKENS must NOT be flattened to EMPTY.
+    d = {"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": []}}]}
+    _, _, finish = server._parse_response(d)
+    assert finish == "MAX_TOKENS"
 
 
 # --- _finish_note (structured cause diagnostics — B1/B2, panel-validated) ---

@@ -62,19 +62,226 @@ class TestRoundNRecheckInvariantPreserved:
 
     PR1b (#102) consolidated the LEDGER_PATCH directive into a shared
     Protocol section, but Round-N still carries its own dual-content
-    requirement: LEDGER_PATCH must cover BOTH the recheck of prior-round
-    findings AND any new findings (Round-1 templates don't have prior
-    findings to recheck). This clause cannot move into the shared Protocol
-    section because it's Round-N-specific.
+    requirement: it rechecks prior-round findings (Round-1 templates don't
+    have prior findings to recheck).
+
+    #271 REFINED the contract: the LEDGER_PATCH findings list no longer
+    carries terminal rechecks (they crash the parser AND inflate
+    findings_count). The Round-N section must still tell the reviewer to
+    recheck prior findings AND route them — terminal statuses to prose,
+    still_open re-emitted as full findings in the block.
     """
 
     def test_round_n_continuation_preserves_recheck_invariant(self):
         section = _extract_section(SKILL_MD.read_text(encoding="utf-8"), ROUND_N_HEADER)
-        assert "recheck results" in section.lower(), (
-            "Round-N continuation prompt missing 'recheck results' wording — the "
-            "Round-N-specific dual-content invariant ('LEDGER_PATCH covers both "
-            "recheck results and new findings') has regressed. Restore the clause "
-            "or update this test if the contract intentionally changed."
+        low = section.lower()
+        assert "recheck" in low, (
+            "Round-N continuation prompt no longer mentions rechecking prior "
+            "findings — the Round-N-specific recheck invariant has regressed."
+        )
+        # #271: the section must surface the prose-vs-block routing split, not
+        # the old undifferentiated 'covering both recheck results and new
+        # findings' wording that told reviewers to put terminal rechecks
+        # (id+status+note) into the parsed findings list (exit 3).
+        assert "still_open" in low and "prose" in low, (
+            "Round-N section must route rechecks by status (#271): terminal "
+            "rechecks to PROSE, still_open re-emitted as a full finding in the "
+            "block. Missing the 'still_open' / 'prose' routing language."
+        )
+        assert "covering both recheck results and new findings" not in low, (
+            "Round-N still carries the #271 bug wording 'covering both recheck "
+            "results and new findings' — that directive tells the reviewer to "
+            "put terminal rechecks (id+status+note) inside LEDGER_PATCH.findings, "
+            "which the parser rejects (exit 3)."
+        )
+
+
+# Terminal recheck statuses: a status update with no natural severity/title.
+# They must NEVER appear inside LEDGER_PATCH.findings — the parser requires
+# severity+title (exit 3 otherwise) AND findings_count = len(findings) would
+# count a RESOLVED item as still-open, corrupting trajectory + B6 pivot +
+# verdict inference. (#271)
+TERMINAL_STATUSES = ("verified", "false_positive", "wontfix")
+
+
+class TestRoundNRecheckRouting:
+    """#271: the LEDGER_PATCH Protocol (single source) must specify how Round-N
+    rechecks are routed so a faithful reviewer never triggers exit 3 and the
+    per-round findings_count stays equal to the number of CURRENTLY-OPEN
+    findings (still_open + new).
+
+    Data-flow rationale these tests lock in:
+      - parse-ledger-patch.py requires id+severity+title on every findings entry.
+      - bulldozer-round.sh computes findings_count = len(parsed.findings) and
+        feeds it to emit-pivot.py (B6 avg-last-3 >= 3.0), the trajectory, and
+        the verdict inference (go if not findings else no_go).
+    """
+
+    def _protocol(self) -> str:
+        return _extract_section(SKILL_MD.read_text(encoding="utf-8"), LEDGER_PATCH_PROTOCOL_HEADER)
+
+    def test_protocol_routes_terminal_rechecks_to_prose(self):
+        section = self._protocol().lower()
+        assert "prose" in section, (
+            "Protocol must route terminal rechecks to PROSE (#271)."
+        )
+        for status in TERMINAL_STATUSES:
+            assert status in section, (
+                f"Protocol routing rule must name terminal status {status!r} "
+                f"(#271) — these go in prose, never in the findings list."
+            )
+
+    def test_protocol_keeps_terminal_rechecks_out_of_findings_list(self):
+        section = self._protocol().lower()
+        # The count-inflation rationale must be present so the rule reads as
+        # load-bearing, not arbitrary — terminal rechecks would be counted.
+        assert "findings_count" in section or "count" in section, (
+            "Protocol must explain WHY terminal rechecks stay out of the "
+            "findings list (they inflate findings_count → corrupt pivot/verdict)."
+        )
+
+    def test_protocol_requires_still_open_as_full_finding(self):
+        section = self._protocol()
+        low = section.lower()
+        assert "still_open" in low, (
+            "Protocol must document the still_open recheck path (#271)."
+        )
+        # still_open IS open → must be re-emitted with full fields (severity)
+        # so it is parsed AND counted.
+        assert "re-emit" in low or "re-emitted" in low, (
+            "Protocol must say still_open rechecks are RE-EMITTED as full "
+            "findings (severity+title+files) inside the block (#271)."
+        )
+        assert "severity" in low
+
+    def test_protocol_go_requires_empty_findings(self):
+        # GO must not coexist with a non-empty findings list (a re-emitted
+        # still_open makes the list non-empty → not a GO round).
+        section = self._protocol()
+        assert "findings: []" in section, (
+            "Protocol GO shape (`verdict: go` + `findings: []`) must remain — "
+            "GO requires zero open findings (no still_open, no new) (#271)."
+        )
+
+
+class TestStillOpenRecheckCommandsProvenance:
+    """codex_review P2 (round 2, #271): a still_open re-emit may omit
+    required_recheck/original_verdict_excerpt (the parser accepts the short
+    shape and the finding's recheck commands already persist in the ledger).
+    But Step 4 runs required_recheck.commands from parsed-rN.json, so a
+    still_open-only round would have no per-finding commands there. Step 4 must
+    direct the caller to the EXISTING ledger entry for a still_open re-emit's
+    recheck commands.
+    """
+
+    def _step4(self) -> str:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        start = text.index("**4. Verify each finding")
+        end = text.index("**5. Apply findings", start)
+        return text[start:end]
+
+    def test_step4_still_open_recheck_commands_from_ledger(self):
+        s = self._step4().lower()
+        assert "still_open" in s and "ledger" in s, (
+            "Step 4 must direct the caller to take a still_open re-emit's "
+            "required_recheck.commands from the existing ledger entry when they "
+            "are absent from parsed-rN.json (codex_review P2 round 2, #271)."
+        )
+
+
+class TestStep5LedgerUpsert:
+    """#271: a re-emitted still_open recheck carries its ORIGINAL id (e.g.
+    R1-F1). Step 5 must UPDATE the existing ledger entry, not blindly append a
+    duplicate — the parser only rejects duplicate ids WITHIN a single block
+    (parse-ledger-patch.py), so cross-round repeated ids reach Step 5 and would
+    duplicate the ledger if Step 5 still says 'append each finding'.
+    """
+
+    def _step5(self) -> str:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        start = text.index("**5. Apply findings to the ledger")
+        end = text.index("**6.", start)
+        return text[start:end]
+
+    def test_step5_updates_existing_ledger_entry_by_id(self):
+        s = self._step5().lower()
+        assert "update" in s or "upsert" in s, (
+            "Step 5 must UPDATE an existing ledger entry when a finding's id "
+            "already exists (re-emitted still_open), not blindly append (#271)."
+        )
+        assert "already" in s or "existing" in s, (
+            "Step 5 must condition the update on the id ALREADY existing in the "
+            "ledger (#271)."
+        )
+
+    def test_step5_reads_terminal_rechecks_from_prose(self):
+        s = self._step5().lower()
+        # Terminal rechecks are NOT in parsed-rN.json (they live in prose) — Step
+        # 5 must tell Claude to read them from the verdict prose and apply the
+        # terminal status to the matching ledger entry.
+        assert "prose" in s, (
+            "Step 5 must note that terminal rechecks come from the verdict PROSE "
+            "(not parsed-rN.json) and are applied to the matching ledger entry (#271)."
+        )
+
+    def test_step5_verifies_terminal_rechecks_before_closing(self):
+        # codex_review P2 (#271): routing terminal rechecks to prose moved them
+        # OUT of parsed-rN.json, so Step 4's "verify every finding" loop no longer
+        # covers them. A reviewer's prose recheck is a CLAIM, not proof — Step 5
+        # must re-verify (re-run the ledger entry's required_recheck.commands)
+        # before closing the entry, or a hallucinated "verified" silently closes a
+        # still-open finding.
+        s = self._step5().lower()
+        assert "required_recheck" in s, (
+            "Step 5 must require re-running the ledger entry's required_recheck "
+            "before applying a terminal prose recheck — never close a finding on "
+            "the reviewer's word alone (codex_review P2, #271)."
+        )
+
+
+class TestExit11ManualExtractionMirrorsRouting:
+    """#271 (caught by self-review R1-F1): the exit-11 manual-extraction fallback
+    (Step 7, when a Round-N reviewer omits the LEDGER_PATCH block entirely) must
+    mirror the same routing as the normal Step 5 path. Otherwise a still_open
+    prose recheck for R1-F1 gets blindly appended as a fresh R2-F1 (duplicate),
+    terminal prose rechecks are counted in K, and the cumulative-ledger identity
+    breaks on the documented manual path.
+    """
+
+    def _exit11_branch(self) -> str:
+        text = SKILL_MD.read_text(encoding="utf-8")
+        start = text.index("Wrapper exited 11 (manual-extraction branch)")
+        end = text.index("Why this protocol exists", start)
+        return text[start:end]
+
+    def test_exit11_still_open_keeps_original_id_via_upsert(self):
+        branch = self._exit11_branch().lower()
+        assert "still_open" in branch, (
+            "exit-11 branch must mirror #271 routing: a still_open recheck in "
+            "prose keeps its ORIGINAL id, not a fresh R{N}-F{M}."
+        )
+        assert "upsert" in branch or "original id" in branch, (
+            "exit-11 branch must upsert still_open prose rechecks under the "
+            "original id (not blind-append a duplicate) — mirror Step 5 (#271)."
+        )
+
+    def test_exit11_K_excludes_terminal_rechecks(self):
+        branch = self._exit11_branch().lower()
+        # K (replace-extraction) must be the OPEN count (still_open + new), not
+        # inflated by terminal rechecks narrated in the same prose.
+        assert "still_open + new" in branch, (
+            "exit-11 branch must define K as still_open + new (terminal rechecks "
+            "are not open findings and must not inflate K) (#271)."
+        )
+
+    def test_exit11_verifies_terminal_rechecks_before_closing(self):
+        # codex_review P2 mirror: the manual path also closes ledger entries from
+        # prose rechecks, so it must re-verify (run required_recheck) before
+        # applying a terminal status — same discipline as Step 5.
+        branch = self._exit11_branch().lower()
+        assert "required_recheck" in branch, (
+            "exit-11 branch must re-verify a terminal prose recheck (run the "
+            "ledger entry's required_recheck) before closing it (codex_review P2, #271)."
         )
 
 

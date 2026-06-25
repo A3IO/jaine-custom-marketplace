@@ -2140,3 +2140,75 @@ class TestCanonicalVerdict:
         assert result.returncode == 0, result.stderr
         payload = load_payload(result)
         assert payload["verdict"] == "go"
+
+
+class TestIssue271RecheckRoutingContract:
+    """#271 contract lock: the parser is INTENTIONALLY unchanged — the fix routes
+    rechecks in the Round-N prompt (SKILL.md) so the LEDGER_PATCH findings list
+    holds exactly the currently-open findings (still_open re-emitted full + new).
+    These tests pin the parser behavior that routing relies on, so a future
+    'relax the parser to accept terminal rechecks' change (rejected Option 2)
+    can't silently land without tripping the count/exit-3 invariants here.
+
+    Why these guard the fix:
+      - bulldozer-round.sh: findings_count = len(parsed.findings) → feeds the B6
+        pivot + trajectory + verdict inference. So every entry in the list is
+        counted as OPEN; terminal rechecks must therefore stay OUT of the list.
+    """
+
+    # The shape the Round-N template now MANDATES: terminal recheck lives in the
+    # prose above (not parsed here); the block carries one re-emitted still_open
+    # finding (original id, full fields) + one new finding.
+    _ROUTED_BLOCK = (
+        "LEDGER_PATCH:\n"
+        "  findings:\n"
+        "    - id: R1-F1\n"                       # still_open re-emit — ORIGINAL id
+        "      severity: high\n"
+        "      status: still_open\n"
+        '      title: "side effect before permission check"\n'
+        '      files: [{path: "src/a.py", lines: "120-148"}]\n'
+        "    - id: R3-F1\n"                       # new finding this round
+        "      severity: medium\n"
+        "      status: open\n"
+        '      title: "missing timeout on fetch"\n'
+        '      files: [{path: "src/b.py", lines: "20-22"}]\n'
+    )
+
+    # The bug shape #271 fixes: a terminal recheck emitted INSIDE the block as a
+    # bare id+status+note (no severity/title). The routing rule sends this to
+    # prose precisely BECAUSE the parser rejects it.
+    _TERMINAL_IN_BLOCK = (
+        "LEDGER_PATCH:\n"
+        "  verdict: no-go\n"
+        "  findings:\n"
+        "    - id: R1-F1\n"
+        "      status: verified\n"
+        '      note: "fix confirmed"\n'
+    )
+
+    def test_routed_block_parses_clean(self):
+        result = run_parser(stdin_text=self._ROUTED_BLOCK)
+        assert result.returncode == 0, result.stderr
+
+    def test_open_count_equals_still_open_plus_new(self):
+        """findings_count (len) must equal the OPEN findings — still_open + new = 2.
+        Terminal rechecks are not here (prose), so they don't inflate the count."""
+        payload = load_payload(run_parser(stdin_text=self._ROUTED_BLOCK))
+        assert len(payload["findings"]) == 2
+        by_id = {f["id"]: f for f in payload["findings"]}
+        assert by_id["R1-F1"]["status"] == "still_open"
+        assert by_id["R1-F1"]["severity"] == "high"   # original metadata preserved
+        assert by_id["R3-F1"]["status"] == "open"
+        # non-empty findings → NO-GO inference (an open still_open is not a GO).
+        assert payload["verdict"] == "no_go"
+
+    def test_terminal_recheck_inside_block_is_rejected_exit_3(self):
+        """The exact bug from #271: a terminal recheck (id+status+note, no
+        severity/title) inside findings → exit 3. This is WHY the template routes
+        terminal rechecks to prose; the parser stays strict on purpose."""
+        result = run_parser(stdin_text=self._TERMINAL_IN_BLOCK)
+        assert result.returncode == 3, (
+            f"expected exit 3 for a bare terminal recheck in the block, got "
+            f"{result.returncode}\nstderr:\n{result.stderr}"
+        )
+        assert "severity" in result.stderr.lower()

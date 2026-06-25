@@ -21,14 +21,18 @@ V2 ARCHITECTURE (replaces v1 "wrap codex exec"):
 
 Wire protocol (CC-facing): line-delimited JSON-RPC 2.0 over stdio. stdout =
 JSON-RPC 2.0 frames ONLY; all logging to stderr. During a tools/call, the
-dispatcher holds stdin exclusively for cc_read_fn; MUST use sys.stdin.readline()
-consistently in the loop (NOT `for line in sys.stdin`) to allow cc_read_fn to
-read mid-turn elicitation responses without buffering corruption.
+dispatcher holds stdin exclusively for cc_read_fn; #264: every CC read MUST route
+through the shared CCStream (os.read + JsonRpcStream), NEVER sys.stdin.readline()
+on the CC fd. main(), cc_read_fn, and Reactor.pump(watch_cc) all drain one module
+singleton (_cc_stream) so a burst of frames in one CC write can't strand a 2nd
+frame in the TextIOWrapper buffer, and os.read/readline never mix on the same fd.
 
 See docs/superpowers/specs/2026-06-18-codex-mcp-v2-app-server-bridge.md.
 """
 import atexit
+import collections
 import datetime
+import functools
 import json
 import os
 import re
@@ -39,7 +43,28 @@ import sys
 import tempfile
 import threading
 import time
+
+
+def _python_version_error(version_info=None):
+    """Return a clear error string if the interpreter is too old for tomllib (3.11+), else None.
+
+    `.mcp.json` launches a bare `python3`; on py<3.11 the unconditional `import tomllib` below
+    would otherwise die with a cryptic `ModuleNotFoundError: tomllib` at import (#256).
+    """
+    vi = sys.version_info if version_info is None else version_info
+    if tuple(vi[:2]) < (3, 11):
+        return (f"bulldozer-codex MCP server requires Python 3.11+ (uses tomllib); "
+                f"got {vi[0]}.{vi[1]}. Relaunch with a 3.11+ interpreter (e.g. via uv).")
+    return None
+
+
+_pyver_err = _python_version_error()
+if _pyver_err:
+    sys.stderr.write(_pyver_err + "\n")
+    raise SystemExit(1)
+
 import tomllib
+import urllib.request
 
 _CODEX_FALLBACK = "/opt/homebrew/bin/codex"
 
@@ -284,6 +309,9 @@ def _stamp_drift(result: dict, acc) -> dict:
     return result
 
 
+_CC_EOF = object()   # #218: cc_read_fn EOF sentinel (distinct from None = transient/timeout)
+
+
 def reply(mid, result=None, error=None):
     """Write a standard JSON-RPC 2.0 frame to CC (stdout)."""
     msg = {"jsonrpc": "2.0", "id": mid}
@@ -292,10 +320,35 @@ def reply(mid, result=None, error=None):
     sys.stdout.flush()
 
 
+SERVER_INSTRUCTIONS = (
+    "External codex agent (separate from the check/consult skills, which shell out to "
+    "`codex exec`). Routing:\n"
+    "- Adversarial review of a git diff → `codex_review` (target `uncommitted` | `branch:<name>` "
+    "| `commit:<sha>` | `custom:<instructions>`).\n"
+    "- Autonomous coding/research task in isolation → `codex_run` (mode `review` | `implement`).\n"
+    "- Check codex availability / models / config / auth / usage → `codex_info` (no cold start).\n"
+    "Pass `mcp:'isolated'` unless cross-server tools are needed."
+)
+
+
+def _initialize_result(params: dict) -> dict:
+    """Build the MCP initialize reply. Carries an `instructions` routing manifest — CC injects
+    InitializeResult.instructions into the model's context on connect, giving it a server-level
+    map to discover/choose codex_review / codex_run / codex_info (#256)."""
+    return {
+        "protocolVersion": params.get("protocolVersion", PROTO),
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "bulldozer-codex", "version": _plugin_version()},
+        "instructions": SERVER_INSTRUCTIONS,
+    }
+
+
 def main():
-    """V2 MCP dispatcher: reads CC requests via sys.stdin.readline() (NOT the
-    iterator) so cc_read_fn can safely call readline() mid-turn without
-    buffering corruption."""
+    """V2 MCP dispatcher: every CC read routes through the shared CCStream (#264) — os.read +
+    JsonRpcStream, NEVER sys.stdin.readline() — so a burst of frames in one CC write can't
+    strand a 2nd frame in the TextIOWrapper buffer, and main()/cc_read_fn/pump never mix
+    os.read with readline on the same fd. main() is the first and only stdin reader."""
+    _reset_cc_stream()   # fresh CC buffer; nothing has read stdin before this
 
     def cc_write_fn(frame: dict):
         """Forward a CC-facing JSON-RPC 2.0 frame to stdout (elicitation/create etc.)."""
@@ -303,50 +356,38 @@ def main():
         sys.stdout.flush()
 
     def cc_read_fn(timeout: float = 10.0):
-        """Read the next CC elicitation response from stdin.
+        """Read the next CC elicitation response via the shared CCStream (#264).
 
-        Returns the parsed dict or None on timeout / EOF.
+        Returns the parsed dict, None on timeout / blank / bad JSON, or _CC_EOF on EOF.
         bridge_approval expects: {"jsonrpc":"2.0","id":N,"result":{"action":...,"content":...}}
         """
-        ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        if not ready:
-            return None
-        line = sys.stdin.readline()
-        if not line:
-            return None
-        line = line.strip()
-        if not line:
-            return None
-        try:
-            return json.loads(line)
-        except json.JSONDecodeError:
-            return None
+        kind, frame = _cc_stream.next_frame(timeout)
+        if kind == "eof":
+            return _CC_EOF       # #218: EOF is distinct from None (transient) so the approval wait tears down
+        if kind == "frame":
+            return frame
+        return None              # 'none' — timeout / blank / bad JSON (JsonRpcStream dropped it)
 
     while True:
-        line = sys.stdin.readline()
-        if not line:
-            break  # EOF
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+        kind, req = _cc_stream.next_frame(None)   # block between turns
+        if kind == "eof":
+            break  # CC stdin closed
+        if req is None:
+            continue  # 'none' — partial frame buffered; keep waiting (bad-JSON/blank dropped by CCStream)
         method, mid, params = req.get("method"), req.get("id"), req.get("params", {}) or {}
 
         if method == "initialize":
-            reply(mid, {
-                "protocolVersion": params.get("protocolVersion", PROTO),
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "bulldozer-codex", "version": _plugin_version()},
-            })
+            reply(mid, _initialize_result(params))
         elif method == "notifications/initialized":
             pass  # notification — no reply
         elif method == "tools/list":
             reply(mid, {"tools": TOOLS})
         elif method == "tools/call":
             try:
+                # Keep ALL params access inside the try: `req.get("params",{}) or {}` only
+                # coerces FALSY non-dicts, so a truthy non-object params (list/str) reaches
+                # here as-is and .get() would raise — one malformed frame must NOT crash the
+                # long-lived dispatcher (it returns the guarded error reply below).
                 args = params.get("arguments") or {}  # `arguments: null` → {} (not None)
                 args["_cc_id"] = mid  # inject for busy/eof framing
                 tool_name = params.get("name")
@@ -401,6 +442,76 @@ class JsonRpcStream:
             except json.JSONDecodeError:
                 pass  # logged by caller
         return out
+
+
+class CCStream:
+    """Single owner of CC stdin (fd 0) (#264). All CC-side reads route here so a burst of
+    frames in one OS write is fully drained (os.read) and parsed (JsonRpcStream) into a queue
+    — no TextIOWrapper-buffer stranding (where select can't see a 2nd buffered line). os.read
+    and TextIOWrapper.readline must NEVER both read this fd: every CC read goes through CCStream,
+    none through readline (the no-mixing invariant). main(), cc_read_fn, and Reactor.pump
+    (watch_cc=True) all drain the SAME module singleton (_cc_stream)."""
+
+    def __init__(self):
+        self._stream = JsonRpcStream()      # reuse the proven child-side byte buffer
+        self._queue = collections.deque()   # complete parsed frames awaiting delivery
+        self._eof = False
+
+    def _fd(self):
+        # Resolve LAZILY each call so a test that monkeypatches sys.stdin (os.fdopen(pipe))
+        # is honored. Production fd is 0; never cached.
+        return sys.stdin.fileno()
+
+    def has_queued(self) -> bool:
+        """True iff a parsed frame is already buffered (delivery needs no select). Lets pump
+        force a 0 child-select timeout so a queued CC frame is delivered promptly — without
+        leaking the deque."""
+        return bool(self._queue)
+
+    def _drain_ready(self, timeout):
+        """select once; if the fd is ready, os.read the whole chunk and feed it to the
+        JsonRpcStream, extending the queue. A 0-byte read => EOF (sticky)."""
+        if self._eof:
+            return
+        ready, _, _ = select.select([self._fd()], [], [], timeout)
+        if not ready:
+            return
+        try:
+            chunk = os.read(self._fd(), 65536)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            self._eof = True
+            return
+        self._queue.extend(self._stream.feed(chunk))
+
+    def next_frame(self, timeout):
+        """Return (kind, value):
+          ('frame', dict) — a parsed frame. Queue checked FIRST: a prior burst's 2nd frame is
+                            delivered WITHOUT re-selecting (the F4 fix — readline stranded it).
+          ('none',  None) — timeout / only a partial frame this call (retry within deadline).
+          ('eof',   None) — fd closed AND queue fully drained (real bytes always precede the
+                            0-byte read on a pipe, so queued frames surface before EOF).
+        """
+        if self._queue:
+            return ("frame", self._queue.popleft())
+        self._drain_ready(timeout)
+        if self._queue:
+            return ("frame", self._queue.popleft())
+        if self._eof:
+            return ("eof", None)
+        return ("none", None)
+
+
+_cc_stream = CCStream()   # module singleton — like _v2_manager / _v2_state_machine
+
+
+def _reset_cc_stream():
+    """Install a fresh CCStream (clears queue / _buf / _eof). Called at main() startup
+    (harmless in prod) and by an autouse test fixture so same-process tests never inherit
+    queued frames, a partial buffer, or a sticky EOF from a prior test."""
+    global _cc_stream
+    _cc_stream = CCStream()
 
 
 def classify(msg: dict) -> str:
@@ -463,28 +574,54 @@ class Reactor:
                     if not chunk:
                         break
                     self.stderr_file.write(chunk)
-            except OSError:
+            except (OSError, ValueError):
+                # OSError: fd closed/child gone. ValueError: a teardown closed stderr_file
+                # (_close_reactor_stderr) while this daemon was mid-write (#227b F3) — swallow
+                # so the drain thread exits quietly instead of an unhandled-exception traceback.
                 pass
 
         t = threading.Thread(target=_drain, daemon=True)
         t.start()
 
-    def pump(self, timeout: float = 0.1) -> list:
+    def pump(self, timeout: float = 0.1, watch_cc: bool = False) -> list:
         """Return complete JSON-RPC frames received from the child.
 
-        Uses select() so it never blocks longer than `timeout` seconds even
-        if the child sends a partial frame.
-        """
-        ready, _, _ = select.select([self._child_out_fd], [], [], timeout)
-        if not ready:
-            return []
-        try:
-            chunk = os.read(self._child_out_fd, 65536)
-        except OSError:
-            return []
-        if not chunk:
-            return []
-        return self._stream.feed(chunk)
+        watch_cc=False (default): child-only select — byte-identical to the
+        original; never blocks longer than `timeout` even on a partial frame.
+        watch_cc=True: ALSO drain the shared CCStream (#264). A CC frame read this
+        call is appended tagged {"__cc__": <parsed>} ({"__cc__": {"__eof__": True}}
+        on EOF) so the caller can route it (#218). Child frames are never tagged; at
+        most one CC frame per call. The child select uses a 0 timeout when CCStream
+        already has a queued frame (deliver it now) — else it also watches the CC fd
+        so a fresh CC frame wakes the select.
+
+        #264: the CC side reads via CCStream (os.read + JsonRpcStream), NOT
+        sys.stdin.readline(), so a burst of frames in one CC write is fully drained
+        into the queue and a 2nd frame (e.g. a cancel after a ping) is delivered to
+        the NEXT pump from the queue instead of stranding in the TextIOWrapper
+        buffer (the F4 hole select couldn't see). A blank/bad-JSON CC line is dropped
+        by JsonRpcStream (no {"__cc__": None} tag — was a no-op route anyway)."""
+        cc_queued = watch_cc and _cc_stream.has_queued()
+        watch = [self._child_out_fd]
+        if watch_cc and not cc_queued:
+            watch.append(_cc_stream._fd())
+        ready, _, _ = select.select(watch, [], [], 0 if cc_queued else timeout)
+        out = []
+        if self._child_out_fd in ready:
+            try:
+                chunk = os.read(self._child_out_fd, 65536)
+            except OSError:
+                chunk = b""
+            if chunk:
+                out.extend(self._stream.feed(chunk))
+        if watch_cc:
+            kind, frame = _cc_stream.next_frame(0)
+            if kind == "eof":                         # CC stdin closed (e.g. CC tool-call timeout)
+                out.append({"__cc__": {"__eof__": True}})
+            elif kind == "frame":
+                out.append({"__cc__": frame})
+            # 'none' → no CC frame this call
+        return out
 
 
 # ── v2 app-server manager ─────────────────────────────────────────────────
@@ -744,25 +881,31 @@ class AppServerManager:
             self._next_id_val += 1
         return mid
 
-    def _write(self, msg: dict):
-        """Write a single JSON-RPC frame to the child's stdin."""
+    def _write(self, msg: dict, child=None):
+        """Write a single JSON-RPC frame to a child's stdin. Default: the live self._child;
+        an explicit `child` lets the transactional respawn write to a temp child (#227b)."""
+        c = child if child is not None else self._child
         data = (json.dumps(msg) + "\n").encode()
-        self._child.stdin.write(data)
-        self._child.stdin.flush()
+        c.stdin.write(data)
+        c.stdin.flush()
 
-    def _pump_until(self, predicate, timeout: float = 5.0) -> dict | None:
-        """Pump the reactor until predicate(frame) is True or timeout expires."""
+    def _pump_until(self, predicate, timeout: float = 5.0, reactor=None) -> dict | None:
+        """Pump a reactor until predicate(frame) is True or timeout expires. Default: the live
+        self._reactor; an explicit `reactor` lets the transactional respawn pump a temp (#227b)."""
+        r = reactor if reactor is not None else self._reactor
         deadline = time.time() + timeout
         while time.time() < deadline:
             remaining = max(0.0, deadline - time.time())
-            frames = self._reactor.pump(timeout=min(remaining, 0.2))
+            frames = r.pump(timeout=min(remaining, 0.2))
             for frame in frames:
                 if predicate(frame):
                     return frame
         return None
 
-    def _do_initialize(self):
-        """Run the initialize → initialized handshake with the child."""
+    def _do_initialize(self, child=None, reactor=None):
+        """Run the initialize → initialized handshake. Default: the live self._child/_reactor;
+        explicit (child, reactor) let the transactional respawn initialize a temp pair BEFORE
+        committing it onto self (#227b)."""
         mid = self._next_id()
         version = _plugin_version()
         self._write({
@@ -779,7 +922,7 @@ class AppServerManager:
                     "requestAttestation": False,
                 },
             },
-        })
+        }, child=child)
         # Wait for the initialize response.
         # _pump_until is safe here: any frames in the same chunk after the initialize
         # response are post-handshake notifications — dropping them is acceptable
@@ -787,6 +930,7 @@ class AppServerManager:
         resp = self._pump_until(
             lambda f: classify(f) == "response" and f.get("id") == mid,
             timeout=10.0,
+            reactor=reactor,
         )
         if resp is None:
             raise RuntimeError("AppServerManager: initialize response timed out")
@@ -796,73 +940,82 @@ class AppServerManager:
             _drift_warn(None, "VERSION_MISMATCH",
                         f"last-verified {LAST_VERIFIED_CODEX_VERSION}, live {ua!r}")
         # Send the initialized notification
-        self._write({"method": "initialized"})
+        self._write({"method": "initialized"}, child=child)
 
-    def _adopt(self, child) -> object:
-        """Wire up a new child: create Reactor, start stderr drain."""
-        # On respawn, close the previous reactor's stderr drain file so we don't leak
-        # a TemporaryFile (+ its drain-thread reference) across crash-respawns.
-        old = getattr(self, "_reactor", None)
-        if old is not None and getattr(old, "stderr_file", None) is not None:
-            try:
-                old.stderr_file.close()
-            except Exception:
-                pass
-        self._child = child
-        self._reactor = Reactor(
+    def _make_reactor(self, child) -> "Reactor":
+        """Build a Reactor for `child` and start its stderr drain. PURE: does NOT mutate self
+        or close any existing reactor — the transactional respawn builds a temp reactor and
+        commits it onto self only after initialize succeeds (#227b)."""
+        r = Reactor(
             child_out_fd=child.stdout.fileno(),
             child_in_fd=child.stdin.fileno(),
         )
-        self._reactor._start_stderr_drain(child.stderr.fileno())
-        return child
+        r._start_stderr_drain(child.stderr.fileno())
+        return r
+
+    @staticmethod
+    def _close_reactor_stderr(reactor) -> None:
+        """Best-effort close of a reactor's stderr-drain TemporaryFile (+ its drain-thread ref)
+        so a discarded reactor — the temp on failure, or the old one on commit — does not leak."""
+        if reactor is not None and getattr(reactor, "stderr_file", None) is not None:
+            try:
+                reactor.stderr_file.close()
+            except Exception:
+                pass
 
     def ensure(self, isolation_argv: list | None = None) -> object:
         """Return the live child, spawning (and initializing) if necessary.
 
-        Warm reuse iff the child is alive AND its isolation signature matches the
-        request. A changed signature (different `mcp` selection) kills the old child
-        and respawns with the new spawn argv — re-paying codex's one-time cold start.
-        Crash (dead child) also respawns. Idempotent for the same signature.
+        Warm reuse iff the child is alive AND its isolation signature matches the request.
+        A changed signature (different `mcp` selection) or a crashed child triggers a
+        TRANSACTIONAL respawn: a fresh (child, reactor) is spawned AND initialized FIRST, and
+        only on success is the old child killed and the new pair committed onto self. Any
+        spawn/init failure tears down only the temp and leaves the existing warm child +
+        signature intact (#227b) — the old kill-then-spawn destroyed a still-usable child
+        whenever the new spawn or its initialize failed. Idempotent for the same signature.
         """
         sig = tuple(isolation_argv or [])
-        alive = _is_child_alive(self._child)
-        if alive and self._isolation_sig == sig:
+        if _is_child_alive(self._child) and self._isolation_sig == sig:
             return self._child
-        if alive:                          # signature changed → kill the old child
-            try:
-                self._child.kill()
-            except Exception:
-                pass
 
         # Spawn a new child. _bin is None (lazy: resolve the codex binary from the CURRENT
         # env per spawn — #227 item 1c), a fixed path string, or a pre-built child object.
         codex_bin = _resolve_codex_bin() if self._bin is None else self._bin
         if isinstance(codex_bin, str):
-            child = _spawn_appserver(codex_bin, list(isolation_argv or []))
+            new_child = _spawn_appserver(codex_bin, list(isolation_argv or []))
         elif self._child is None:
-            # First call: use the provided bin object directly (FakeChild in tests)
-            child = self._bin
+            new_child = self._bin              # first call: provided object (FakeChild in tests)
         else:
-            # Respawn (crash or signature change): fresh instance via the same class
-            child = self._bin.__class__()
+            new_child = self._bin.__class__()  # respawn: fresh instance via the same class
 
-        self._isolation_sig = sig
-        self._adopt(child)
+        # Build + initialize the TEMP pair before touching self. On any failure — including a
+        # _make_reactor that raises AFTER the child is spawned (#227b F1) — tear down only the
+        # temp (kill the spawned child + close its reactor) so the warm child + _isolation_sig
+        # stay intact (transactional respawn).
+        new_reactor = None
         try:
-            self._do_initialize()
+            new_reactor = self._make_reactor(new_child)
+            self._do_initialize(child=new_child, reactor=new_reactor)
         except Exception:
-            # initialize failed (e.g. cold-start timeout) — tear down so the next
-            # ensure() does NOT warm-reuse an alive-but-uninitialised child (which would
-            # hang start_thread on a server with no session). Commit (sig, child) only
-            # when BOTH spawn AND initialize succeed; else clear both.
             try:
-                if self._child is not None:
-                    self._child.kill()
+                new_child.kill()
             except Exception:
                 pass
-            self._child = None
-            self._isolation_sig = None
+            self._close_reactor_stderr(new_reactor)   # None-safe
             raise
+
+        # Commit: initialize succeeded → swap onto self, then retire the old child + reactor.
+        old_child, old_reactor = self._child, self._reactor
+        self._child = new_child
+        self._reactor = new_reactor
+        self._isolation_sig = sig
+        if old_child is not None and old_child is not new_child:
+            try:
+                old_child.kill()
+            except Exception:
+                pass
+        if old_reactor is not None and old_reactor is not new_reactor:
+            self._close_reactor_stderr(old_reactor)
         return self._child
 
     def start_thread(
@@ -1137,8 +1290,447 @@ def build_command_approval_labels(params: dict, acc=None) -> list:
     return _dedupe_labels(pairs)
 
 
+def _truncate_for_display(text, max_lines: int = 12, max_chars: int = 800,
+                          tail_lines: int = 0) -> str:
+    """Cap a command / narrative preview for an approval dialog (#239).
+
+    Returns text unchanged when it fits (≤ max_lines AND ≤ max_chars). Otherwise
+    keep a bounded preview and append a '… (+N more lines, M more chars)' marker.
+
+    tail_lines > 0 ALWAYS keeps a bounded HEAD and a bounded TAIL (marker in the
+    middle) — by lines when there are middle lines to omit, otherwise by CHARS
+    (reserving ~1/3 of max_chars for the tail). So a dangerous op appended AFTER a
+    long benign heredoc — OR after one huge generated line — stays visible at
+    approval time. This is the command path (codex_review #239 security finding,
+    rounds 1+2: the real 04ad23aa incident hid `uv run pytest` after a ~230-line
+    `cat <<PY` heredoc; a char-only cap would still hide a trailing `&& rm`).
+    tail_lines == 0 → head-only (narrative / single-value context fields).
+
+    The approval DECISION still permits the FULL command — only the displayed
+    preview is capped. max_chars bounds the BODY (the marker is appended after).
+    Codepoint-safe (str slicing never splits a multi-byte char); not grapheme /
+    display-width aware (sufficient for a preview).
+    """
+    if not text:
+        return ""
+    lines = text.split("\n")
+    if len(lines) <= max_lines and len(text) <= max_chars:
+        return text
+    if tail_lines:
+        # bounded head + bounded tail. Reserve part of the char budget for the tail so
+        # an appended executable op stays visible even when truncation is char-driven.
+        tail_budget = max(1, max_chars // 3)
+        head_budget = max_chars - tail_budget
+        if len(lines) > max_lines:
+            head_text = "\n".join(lines[:max_lines - tail_lines])
+            tail_text = "\n".join(lines[len(lines) - tail_lines:])
+        else:
+            head_text, tail_text = text, ""   # too long by CHARS only → char split below
+        # Enforce char budgets: head from the START, tail from the END (where the
+        # appended op lives). Fall to a pure char split when the line tail is empty
+        # (few lines) or the line head+tail still blows the budget (a huge head line).
+        if not tail_text or len(head_text) + len(tail_text) > max_chars:
+            head_text = text[:head_budget]
+            tail_text = text[-tail_budget:]
+    else:
+        # head-only (narrative / single-value context fields)
+        head_text = "\n".join(lines[:max_lines])
+        if len(head_text) > max_chars:
+            head_text = head_text[:max_chars]
+        tail_text = ""
+    shown_lines = (head_text.count("\n") + 1) + (tail_text.count("\n") + 1 if tail_text else 0)
+    dropped_lines = max(0, len(lines) - shown_lines)
+    dropped_chars = len(text) - len(head_text) - len(tail_text)
+    parts = []
+    if dropped_lines > 0:
+        parts.append(f"{dropped_lines} more line{'s' if dropped_lines != 1 else ''}")
+    if dropped_chars > 0:
+        parts.append(f"{dropped_chars} more char{'s' if dropped_chars != 1 else ''}")
+    marker = f"… (+{', '.join(parts)})"
+    return f"{head_text}\n{marker}\n{tail_text}" if tail_text else f"{head_text}\n{marker}"
+
+
+def _summarize_command_actions(actions) -> str:
+    """One compact friendly line summarizing best-effort parsed CommandActions (#224).
+
+    codex's own TUI does not render these; they are a friendly supplement, never
+    authoritative (the raw command stays the source of truth). Defensive against
+    shape drift — non-dict items and 'unknown' actions (which add nothing over the
+    raw command) are skipped. Shapes (codex 0.141): read{name,path}, listFiles{path?},
+    search{query?,path?}, unknown{}.
+    """
+    if not isinstance(actions, list):
+        return ""
+    out = []
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        t = a.get("type")
+        if t == "read":
+            out.append(f"read {a.get('name') or a.get('path') or '?'}")
+        elif t == "listFiles":
+            out.append(f"list {a.get('path') or '.'}")
+        elif t == "search":
+            q = a.get("query")
+            out.append(f"search {q!r}" if q else f"search {a.get('path') or '?'}")
+        elif t and t != "unknown":
+            out.append(str(t))  # future variant — surface the kind verbatim
+        # 'unknown' / missing type → skip (raw command already shown)
+    return ", ".join(out)
+
+
+# ── #247: opt-in approval-dialog localization (translate codex's reason+narrative) ──
+# codex itself stays English (likely better at code/command tasks); only the dialog's
+# DYNAMIC content (reason + narrative) is translated, via the LiteLLM gateway. Static
+# labels come from _dialog_labels. Opt-in (BULLDOZER_APPROVAL_LANG, default off),
+# fail-open to English on ANY error; key/model/endpoint read FRESH per call (lazy).
+
+_DIALOG_LABELS_EN = {
+    "approval_request": "Codex approval request",
+    "command": "Command", "cwd": "CWD", "reason": "Reason", "actions": "Actions",
+    "network": "Network: codex requests {proto} access to {host}",
+    "explained": "Codex explained",
+    "filechange": "Codex file change approval",
+    "permissions": "Codex permissions approval",
+}
+_DIALOG_LABELS = {
+    "ru": {
+        "approval_request": "Запрос codex на одобрение",
+        "command": "Команда", "cwd": "CWD", "reason": "Причина", "actions": "Действия",
+        "network": "Сеть: codex запрашивает {proto}-доступ к {host}",
+        "explained": "Codex пояснил",
+        "filechange": "Codex: одобрение изменения файла",
+        "permissions": "Codex: одобрение прав",
+    },
+}
+
+
+def _dialog_labels(lang):
+    """Static dialog chrome for `lang` (English fallback for unset/unknown langs).
+
+    Normalizes to the primary subtag ('ru-RU'/'ru_RU'/'RU' → 'ru') so a region-tagged
+    language doesn't translate content yet show English chrome (mixed dialog)."""
+    code = (lang or "").strip().lower().replace("_", "-").split("-")[0]
+    return _DIALOG_LABELS.get(code, _DIALOG_LABELS_EN)
+
+
+def _approval_lang():
+    return (os.environ.get("BULLDOZER_APPROVAL_LANG") or "").strip()
+
+
+def _translate_key():
+    # read FRESH each call (lazy): the LiteLLM key isn't in the bridge env at import and
+    # may rotate; never snapshot. BULLDOZER_TRANSLATE_API_KEY wins, else LITELLM_MASTER_KEY.
+    return os.environ.get("BULLDOZER_TRANSLATE_API_KEY") or os.environ.get("LITELLM_MASTER_KEY") or ""
+
+
+def _translate_endpoint():
+    return os.environ.get("BULLDOZER_TRANSLATE_ENDPOINT") or "http://localhost:4000/v1/chat/completions"
+
+
+def _translate_model():
+    return os.environ.get("BULLDOZER_TRANSLATE_MODEL") or "grok-4.20"
+
+
+def _translate_timeout():
+    try:
+        v = float(os.environ.get("BULLDOZER_TRANSLATE_TIMEOUT") or "2.5")
+    except ValueError:
+        return 2.5
+    return max(0.5, min(v, 10.0))   # clamp: never block the dispatcher arbitrarily long
+
+
+def _translate_http(endpoint, model, key, prompt, timeout):
+    """Raw POST to an OpenAI-compatible chat endpoint (LiteLLM). Returns the content
+    string; raises on any error. Isolated so tests can monkeypatch the transport."""
+    payload = json.dumps({
+        "model": model, "temperature": 0,
+        "messages": [
+            {"role": "system", "content": "You are a precise translation engine. "
+                                          "Output only what is asked, no preamble."},
+            {"role": "user", "content": prompt},
+        ],
+    }).encode()
+    req = urllib.request.Request(
+        endpoint, data=payload, method="POST",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = json.loads(r.read().decode())
+    return body["choices"][0]["message"]["content"]
+
+
+def _extract_json_array(content):
+    """Best-effort: pull a JSON string-array out of an LLM response (tolerates ``` fences)."""
+    if not content:
+        return None
+    s = content.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[A-Za-z]*\n?", "", s)
+        s = re.sub(r"\n?```$", "", s).strip()
+    a, b = s.find("["), s.rfind("]")
+    if a == -1 or b == -1 or b <= a:
+        return None
+    try:
+        return json.loads(s[a:b + 1])
+    except Exception:
+        return None
+
+
+class _TranslateError(Exception):
+    """Internal: a translation attempt failed. RAISED (not returned) so functools.lru_cache
+    does NOT memoize the failure — a transient gateway/key error must retry, not poison the
+    string for the process lifetime (codex_review #247 P3)."""
+
+
+@functools.lru_cache(maxsize=256)
+def _translate_cached(lang, endpoint, model, texts_tuple):
+    """Cached batched translation → tuple of translations. RAISES on ANY failure (lru_cache
+    does not cache exceptions, so failures retry; only successes are memoized). The key AND
+    timeout are read FRESH here, so a cache MISS is always a fresh-key real call; hits skip the
+    call entirely. The result depends only on (lang, endpoint, model, texts) — the key and the
+    timeout are transport params, not translation determinants, so both are correctly absent
+    from the cache key (key-independent result; timeout change must not force a re-call)."""
+    key = _translate_key()
+    if not key:
+        raise _TranslateError("no key")
+    prompt = ("Translate each string in this JSON array to " + lang + ". "
+              "Keep code identifiers, file paths, shell commands, URLs and flags EXACTLY "
+              "as-is (do not translate or alter them). Return ONLY a JSON array of strings, "
+              "same length and order, nothing else.\n\n"
+              + json.dumps(list(texts_tuple), ensure_ascii=False))
+    content = _translate_http(endpoint, model, key, prompt, _translate_timeout())  # may raise → not cached
+    arr = _extract_json_array(content)
+    if (not isinstance(arr, list) or len(arr) != len(texts_tuple)
+            or not all(isinstance(x, str) and x.strip() for x in arr)):
+        raise _TranslateError("malformed / count-mismatched translation output")
+    return tuple(arr)
+
+
+def _translate_texts(texts, lang):
+    """Translate each string to `lang` via LiteLLM (opt-in, fail-open, batched).
+
+    Returns a list (same length/order). lang-off, no key, or ANY failure → originals.
+    None / blank entries pass through untouched (kept in position).
+    """
+    texts = list(texts)
+    if not lang or not _translate_key():
+        return texts
+    idxs = [i for i, t in enumerate(texts) if t and str(t).strip()]
+    if not idxs:
+        return texts
+    payload = tuple(str(texts[i])[:2000] for i in idxs)  # bound input size
+    try:
+        out = _translate_cached(lang, _translate_endpoint(), _translate_model(), payload)
+    except Exception as e:
+        # fail-open on ANY failure (TranslateError, HTTP/timeout, weird return); log best-effort
+        # so a silent English fallback is diagnosable (why localization isn't working).
+        _drift_warn(None, "TRANSLATE_FAILED", f"{type(e).__name__}: {str(e)[:120]}")
+        return texts
+    if not out or len(out) != len(idxs):
+        return texts
+    for j, i in enumerate(idxs):
+        texts[i] = out[j]
+    return texts
+
+
+def _narrative_line(narrative, label="Codex explained") -> str:
+    """Format codex's pre-approval agentMessage narrative for the dialog (#224), or ''.
+
+    This is the 'codex explains what it's about to do' content — streamed as
+    agentMessage deltas just before the approval, NOT part of the approval request
+    protocol-wise. Context only, never authoritative for the action. `narrative` is
+    already translated (if a language is configured) by the caller; `label` is localized.
+    """
+    if not narrative:
+        return ""
+    text = _truncate_for_display(str(narrative).strip(), max_lines=6, max_chars=500)
+    return f"{label}: {text}" if text else ""
+
+
+def _build_command_approval_message(params: dict, narrative=None) -> str:
+    """Compose the commandExecution approval dialog (#239 truncation + #224 context).
+
+    Order: authoritative command (head+tail truncated) + cwd first, then optional
+    context (reason / friendly actions / network host / codex narrative). EVERY
+    variable-length field is individually bounded so a huge reason / actions / cwd
+    can't reintroduce the #239 wall in spite of command truncation. When a language is
+    configured (#247) the DYNAMIC content (reason + narrative) is translated and the
+    labels localized — the command/cwd/actions/host are NEVER translated (authoritative).
+    """
+    lang = _approval_lang()
+    L = _dialog_labels(lang)
+    reason_t, narr_t = params.get("reason"), narrative
+    if lang:
+        reason_t, narr_t = _translate_texts([params.get("reason"), narrative], lang)
+    lines = [
+        L["approval_request"],
+        # head+tail: keep the executable head AND tail of a long command visible.
+        f"{L['command']}: {_truncate_for_display(params.get('command') or '(none)', tail_lines=4)}",
+        f"{L['cwd']}: {_truncate_for_display(str(params.get('cwd') or '(unknown)'), max_lines=1, max_chars=200)}",
+    ]
+    if reason_t:
+        lines.append(f"{L['reason']}: {_truncate_for_display(str(reason_t), max_lines=3, max_chars=300)}")
+    actions = _summarize_command_actions(params.get("commandActions"))
+    if actions:
+        lines.append(f"{L['actions']}: {_truncate_for_display(actions, max_lines=2, max_chars=300)}")
+    nac = params.get("networkApprovalContext")
+    if isinstance(nac, dict) and nac.get("host"):
+        proto = nac.get("protocol") or "network"
+        host = _truncate_for_display(str(nac["host"]), max_lines=1, max_chars=100)
+        lines.append(L["network"].format(proto=proto, host=host))
+    nar = _narrative_line(narr_t, L["explained"])
+    if nar:
+        lines.append(nar)
+    return "\n".join(lines)
+
+
+def _summarize_permissions(perms) -> str:
+    """Bounded, human-readable summary of a RequestPermissionProfile
+    ({fileSystem?, network?}) for the approval dialog, so the user SEES what an accept
+    will grant (#4 / codex_review P1 — pre-#4 an accept granted {}, so the payload was
+    never shown). Authoritative (real paths/hosts) → never translated. Returns '' for an
+    empty/non-dict profile (no detail line). Defensive against malformed shapes (the
+    bridge is fail-open everywhere on the approval path)."""
+    if not isinstance(perms, dict) or not perms:
+        return ""
+    fs_part = ""
+    fs = perms.get("fileSystem")
+    if isinstance(fs, dict):
+        items = []
+        entries = fs.get("entries")
+        if isinstance(entries, list):
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                access = e.get("access", "?")
+                path = e.get("path")
+                if isinstance(path, dict):
+                    val = path.get("value")
+                    p = (path.get("path") or path.get("pattern")
+                         or (val.get("kind") if isinstance(val, dict) else None) or "?")
+                else:
+                    p = str(path) if path is not None else "?"
+                items.append("{}:{}".format(access, p))
+        for k in ("read", "write"):  # legacy path-list form
+            v = fs.get(k)
+            if isinstance(v, list):
+                items += ["{}:{}".format(k, x) for x in v]
+        if items:
+            fs_part = "fileSystem " + ", ".join(items)
+    net_part = ""
+    net = perms.get("network")
+    if isinstance(net, dict) and net:
+        if net.get("enabled"):
+            net_part = "network: enabled"
+        else:
+            net_part = "network: " + ", ".join("{}={}".format(k, v) for k, v in net.items())
+    # network FIRST, one part per line (review B): the security-sensitive egress grant stays
+    # visible even when a large fileSystem list is truncated head-only — and a newline-joined
+    # summary lets the caller's head+tail char cap keep BOTH ends instead of dropping the tail.
+    return "\n".join(p for p in (net_part, fs_part) if p)
+
+
+def _build_simple_approval_message(kind: str, reason, narrative=None, details=None) -> str:
+    """fileChange / permissions dialog: localized header + bounded reason + optional
+    narrative (#224). `kind` is a label key ('filechange'/'permissions'). When a language
+    is configured (#247), reason + narrative are translated and the header localized.
+
+    `details` (optional) is an authoritative payload summary rendered right after the
+    header and NEVER translated — used by the permissions path to surface the requested
+    fileSystem/network profile the user is about to grant (#4 / codex_review P1). When
+    None (fileChange) the message shape is byte-identical to before.
+
+    Explicit append (not filter(None)) so a falsy line never silently changes the
+    message structure; reason is bounded like the command's context fields.
+    """
+    lang = _approval_lang()
+    L = _dialog_labels(lang)
+    reason_t, narr_t = reason, narrative
+    if lang:
+        reason_t, narr_t = _translate_texts([reason, narrative], lang)
+    # fail-safe header lookup: an unexpected `kind` must degrade, never KeyError into the
+    # approval path (every other path here is fail-open).
+    header = L.get(kind) or _DIALOG_LABELS_EN.get(kind) or kind
+    lines = [header]
+    if details:  # authoritative (paths/hosts) — bounded, never translated; tail_lines keeps
+        # BOTH ends so the security-sensitive network grant (rendered first) AND the fileSystem
+        # tail survive truncation of a large profile (review B).
+        lines.append(_truncate_for_display(str(details), max_lines=6, max_chars=400, tail_lines=2))
+    lines.append(
+        f"{L['reason']}: {_truncate_for_display(str(reason_t) if reason_t else '(none)', max_lines=3, max_chars=300)}",
+    )
+    nar = _narrative_line(narr_t, L["explained"])
+    if nar:
+        lines.append(nar)
+    return "\n".join(lines)
+
+
+def _approval_decision_label(decision) -> str:
+    """Coarse, greppable label for a bridge_approval decision (str or dict)."""
+    if isinstance(decision, str):
+        return decision
+    if isinstance(decision, dict):
+        # command amendment-accepts (build_command_approval_labels dict variants) ARE accepts —
+        # log the kind, not the generic 'other' (#251 mining needs it; codex_review P2).
+        if "acceptWithExecpolicyAmendment" in decision:
+            return "accept:execpolicy"
+        if "applyNetworkPolicyAmendment" in decision:
+            return "accept:network"
+        for k in ("decision", "action"):  # legacy ReviewDecision / elicitation passthrough
+            if k in decision:
+                return str(decision[k])
+        if "answers" in decision:         # tool input
+            return "input"
+        if "scope" in decision:           # permissions grant / PERM_DECLINE (value-identical)
+            return "perm:" + str(decision.get("scope"))
+    return "other"
+
+
+def _log_approval_event(method, decision, wait_ms, timed_out) -> None:
+    """Best-effort one-line record of a completed approval (#251 step-0).
+
+    Reuses the stable codex log channel (BULLDOZER_CODEX_LOG / bulldozer-codex.log).
+    NEVER raises — logging must never break an approval.
+    """
+    def _san(v):
+        # Keep the line greppable for the #251 miner: a CC-controlled value (e.g. the
+        # mcpServer/elicitation 'action' passthrough) must not inject a newline (spurious
+        # line) or the ' | ' field delimiter (split corruption).
+        return str(v).replace("\n", " ").replace("\r", " ").replace("|", "/")
+    try:
+        path = os.environ.get("BULLDOZER_CODEX_LOG") or os.path.expanduser(
+            "~/.claude/hooks/bulldozer-codex.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(
+                f"{_now_iso()} | APPROVAL | method={_san(method)} | "
+                f"decision={_san(_approval_decision_label(decision))} | "
+                f"wait_ms={wait_ms} | timed_out={'true' if timed_out else 'false'}\n")
+    except Exception:
+        pass
+
+
 def bridge_approval(method: str, params: dict, cc_write_fn, cc_read_fn,
-                    timeout: float = 300.0, acc=None):
+                    timeout: float = 300.0, acc=None, narrative=None, drain_ctx=None):
+    """Issue a CC elicitation/create, wait for the answer, return the codex decision.
+
+    Thin wrapper over _bridge_approval_dispatch: records one best-effort approval-event
+    log line (method / decision / wait_ms / timed_out, #251 step-0) at every exit, then
+    returns the dispatch decision unchanged. drain_ctx (#252) is threaded through to the wait.
+    """
+    t0 = time.time()
+    wait_state = {"timed_out": False}
+    decision = _bridge_approval_dispatch(
+        method, params, cc_write_fn, cc_read_fn, timeout, acc, narrative, wait_state,
+        drain_ctx=drain_ctx)
+    _log_approval_event(method, decision, int((time.time() - t0) * 1000),
+                        wait_state["timed_out"])
+    return decision
+
+
+def _bridge_approval_dispatch(method: str, params: dict, cc_write_fn, cc_read_fn,
+                              timeout: float = 300.0, acc=None, narrative=None,
+                              _wait_state=None, drain_ctx=None):
     """Issue a CC elicitation/create, wait for the answer, return the codex decision.
 
     CC-facing elicitation request: standard JSON-RPC 2.0 (has "jsonrpc":"2.0").
@@ -1150,19 +1742,69 @@ def bridge_approval(method: str, params: dict, cc_write_fn, cc_read_fn,
     eid = _next_bridge_id()
 
     def read_correlated(eid: int, timeout: float):
-        """Read from CC, skipping frames whose id != eid (e.g. ping/notifications)."""
+        """Wait for the CC elicitation reply (id==eid response). With drain_ctx active (#252),
+        ALSO drain the codex child each iteration so a flooding child can't deadlock, and detect
+        a mid-approval cancel / stdin EOF / terminal-child frame — each sets a `ts` flag and ends
+        the wait via the per-method `None` decline below, which the turn loop acts on after writing
+        that decline. drain_ctx=None → behavior is byte-identical to before."""
+        _reactor = drain_ctx.get("reactor") if drain_ctx else None
+        _ts = drain_ctx.get("ts") if drain_ctx else None
+        _cc_id = drain_ctx.get("cc_id") if drain_ctx else None
+        drain_active = _reactor is not None and _ts is not None
+
+        def _approval_reply(mid, result=None, error=None):
+            # #269: answer an id-bearing CC request via the approval path's writer (cc_write_fn),
+            # same JSON-RPC 2.0 envelope as the module `reply` / turn-pump path.
+            cc_write_fn({"jsonrpc": "2.0", "id": mid,
+                         ("error" if error else "result"): (error if error else result)})
+
         deadline = time.time() + timeout
         while time.time() < deadline:
+            pending_terminal = None
+            if drain_active:
+                # #252: drain child stdout (child-only, non-blocking). NOTIFICATIONS accumulate via
+                # the shared handler. A NON-notification (turn/start ACK, another server request) is
+                # BUFFERED for the turn loop to re-process — dropping it would falsely time out a
+                # pre-ACK approval (codex P1). A terminal frame is HELD so a same-iteration EOF can
+                # win (codex P2) before we surface it. Non-dict frames are skipped (reviewer F3).
+                for cf in _reactor.pump(timeout=0.0):
+                    if not isinstance(cf, dict) or "__cc__" in cf:
+                        continue
+                    if classify(cf) != "notification":
+                        _ts.setdefault("drained_frames", []).append(cf)
+                        continue
+                    _res = _handle_child_frame(cf, _ts)
+                    if _res is not None:
+                        pending_terminal = _res
             remaining = max(0.0, deadline - time.time())
-            frame = cc_read_fn(timeout=remaining)
-            if frame is None:
-                continue  # transient (blank line, JSON decode error, select timeout) — retry within the deadline, do NOT prematurely decline
-            # Shape-first: ONLY a RESPONSE whose id matches resolves the elicitation.
-            # A REQUEST whose id numerically collides with eid must NOT be mistaken
-            # for the reply (it falls through to be skipped / handled by its method).
-            if frame.get("id") == eid and classify(frame) == "response":
-                return frame
-            # Skip unrelated frame (ping, notification, id-colliding request); keep reading.
+            frame = cc_read_fn(timeout=min(remaining, 0.05) if drain_active else remaining)
+            if frame is _CC_EOF:                 # CC stdin closed (#218) → EOF wins (even over a held terminal)
+                if drain_active:
+                    _ts["eof_during_approval"] = True
+                return None
+            if pending_terminal is not None:    # terminal child this iteration = turn over (no EOF) → surface it
+                _ts["terminal_during_approval"] = pending_terminal
+                return None
+            if frame is not None:
+                # Shape-first: ONLY a RESPONSE whose id matches resolves the elicitation.
+                if frame.get("id") == eid and classify(frame) == "response":
+                    return frame
+                # A mid-approval cancel for our turn (interrupts enabled, cc_id known) → flag + decline.
+                if (drain_active and _cc_id is not None
+                        and frame.get("method") == "notifications/cancelled"
+                        and (frame.get("params") or {}).get("requestId") == _cc_id
+                        and _interrupts_enabled()):
+                    _ts["cancel_during_approval"] = True
+                    return None
+                # #269: otherwise an id-bearing CC request (ping/tools/list/tools/call) MUST be
+                # answered or CC blocks on it (the turn-pump path enforces the same contract via
+                # _route_cc_frame). It answers requests and no-ops notifications / responses /
+                # foreign-or-disabled cancels; its interrupt/teardown return is irrelevant here
+                # (our-turn cancel + EOF are handled above).
+                _route_cc_frame(frame, cc_id=_cc_id, reply_fn=_approval_reply)
+            # transient (None) / skipped frame → retry within the deadline
+        if _wait_state is not None:
+            _wait_state["timed_out"] = True
         return None  # deadline expired without a matching reply
 
     if method == "item/commandExecution/requestApproval":
@@ -1174,11 +1816,7 @@ def bridge_approval(method: str, params: dict, cc_write_fn, cc_read_fn,
             "id": eid,
             "method": "elicitation/create",
             "params": {
-                "message": (
-                    f"Codex approval request\n"
-                    f"Command: {params.get('command') or '(none)'}\n"
-                    f"CWD: {params.get('cwd') or '(unknown)'}"
-                ),
+                "message": _build_command_approval_message(params, narrative),
                 "requestedSchema": {
                     "type": "object",
                     "properties": {"label": {"type": "string", "enum": labels}},
@@ -1216,10 +1854,8 @@ def bridge_approval(method: str, params: dict, cc_write_fn, cc_read_fn,
             "id": eid,
             "method": "elicitation/create",
             "params": {
-                "message": (
-                    f"Codex file change approval\n"
-                    f"Reason: {params.get('reason') or '(none)'}"
-                ),
+                "message": _build_simple_approval_message(
+                    "filechange", params.get("reason"), narrative),
                 "requestedSchema": {
                     "type": "object",
                     "properties": {"label": {"type": "string", "enum": labels}},
@@ -1243,9 +1879,16 @@ def bridge_approval(method: str, params: dict, cc_write_fn, cc_read_fn,
         return "decline"
 
     if method == "item/permissions/requestApproval":
+        # #4: grant exactly what codex asked for (echo the requested RequestPermissionProfile).
+        # An accept that returned {} granted NOTHING (silent no-op). Request/response profiles
+        # share the {fileSystem?,network?} shape (codex 0.141 schema), so the echo is valid.
+        # A malformed truthy non-dict (review D) is NOT echoed verbatim — fail open to {}.
+        requested = params.get("permissions")
+        if not isinstance(requested, dict):
+            requested = {}
         perm_pairs = [
-            (LBL_GRANT_TURN, {"permissions": {}, "scope": "turn"}),
-            (LBL_GRANT_SESSION, {"permissions": {}, "scope": "session"}),
+            (LBL_GRANT_TURN, {"permissions": requested, "scope": "turn"}),
+            (LBL_GRANT_SESSION, {"permissions": requested, "scope": "session"}),
             (LBL_DONT_GRANT, PERM_DECLINE),
         ]
         labels = [lbl for lbl, _ in perm_pairs]
@@ -1255,10 +1898,9 @@ def bridge_approval(method: str, params: dict, cc_write_fn, cc_read_fn,
             "id": eid,
             "method": "elicitation/create",
             "params": {
-                "message": (
-                    f"Codex permissions approval\n"
-                    f"Reason: {params.get('reason') or '(none)'}"
-                ),
+                "message": _build_simple_approval_message(
+                    "permissions", params.get("reason"), narrative,
+                    details=_summarize_permissions(requested)),
                 "requestedSchema": {
                     "type": "object",
                     "properties": {"label": {"type": "string", "enum": labels}},
@@ -1271,11 +1913,15 @@ def bridge_approval(method: str, params: dict, cc_write_fn, cc_read_fn,
         result = resp.get("result", {})
         if result.get("action") == "accept":
             content = result.get("content") or {}
-            # Accept w/o dropdown = grant for this turn (the minimal grant)
+            # Bare accept (no dropdown label) = grant for this turn — CC's plain Accept, the
+            # legitimate common case. But a PRESENT-but-UNRECOGNIZED label is ambiguous on a
+            # now-load-bearing grant path (#4 made the grant real), so it fails CLOSED to decline
+            # (review C) — NOT a silent full grant. Pre-#4 this fallback granted {} (a safe no-op);
+            # this preserves that safety without reintroducing the no-op for the normal case.
             chosen = content.get("label", LBL_GRANT_TURN)
             if chosen not in perm_map:
                 _drift_warn(acc, "OUT_OF_ENUM_LABEL", str(chosen))
-            return perm_map.get(chosen, perm_map[LBL_GRANT_TURN])
+            return perm_map.get(chosen, PERM_DECLINE)
         return PERM_DECLINE
 
     if method == "item/tool/requestUserInput":
@@ -1375,6 +2021,16 @@ _BRIDGED_METHODS = frozenset({
     "applyPatchApproval",
 })
 
+# Subset of approvals whose dialog surfaces the pre-approval agentMessage narrative
+# (#224). The pump advances the narrative offset ONLY for these — a non-narrative
+# bridged request (tool input, elicitation, legacy review) must not consume narrative
+# that a following commandExecution approval should display (panel finding Grok#2).
+_NARRATIVE_APPROVAL_METHODS = frozenset({
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+})
+
 # Benign lifecycle notifications a healthy turn may emit. Sourced from the protocol's
 # ServerNotification union (generated by mcp/gen_notifications.py → the checked-in
 # fixture), so it stays complete across codex versions. "error"/"warning" are
@@ -1426,12 +2082,15 @@ _KNOWN_NOTIFICATIONS = _load_known_notifications()
 
 
 def handle_server_request(msg: dict, cc_write_fn=None, cc_read_fn=None,
-                          timeout: float = 300.0, acc=None) -> dict:
+                          timeout: float = 300.0, acc=None, narrative=None,
+                          drain_ctx=None) -> dict:
     """Route a server→client ServerRequest to the correct handler.
 
     Returns a jsonrpc_lite frame ({id, result} or {id, error}) — NO 'jsonrpc' key.
     Never returns None (spec invariant: never drop a ServerRequest).
     acc: optional list — if provided, drift breadcrumbs are appended via _drift_warn.
+    narrative: optional str — codex's pre-approval agentMessage narrative (#224),
+        surfaced in the approval dialog as context. None on the no-narrative path.
     """
     mid = msg.get("id")
     method = msg.get("method", "")
@@ -1449,27 +2108,27 @@ def handle_server_request(msg: dict, cc_write_fn=None, cc_read_fn=None,
         return _jsonrpc_lite_error(mid, -32603, "bridge not wired (no CC channel)")
 
     if method == "item/commandExecution/requestApproval":
-        decision = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc)
+        decision = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc, narrative=narrative, drain_ctx=drain_ctx)
         return {"id": mid, "result": {"decision": decision}}
 
     if method == "item/fileChange/requestApproval":
-        decision = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc)
+        decision = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc, narrative=narrative, drain_ctx=drain_ctx)
         return {"id": mid, "result": {"decision": decision}}
 
     if method == "item/permissions/requestApproval":
-        grant = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc)
+        grant = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc, narrative=narrative, drain_ctx=drain_ctx)
         return {"id": mid, "result": grant}
 
     if method == "item/tool/requestUserInput":
-        answers = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc)
+        answers = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc, narrative=narrative, drain_ctx=drain_ctx)
         return {"id": mid, "result": answers}
 
     if method == "mcpServer/elicitation/request":
-        elicit_result = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc)
+        elicit_result = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc, narrative=narrative, drain_ctx=drain_ctx)
         return {"id": mid, "result": elicit_result}
 
     if method in ("execCommandApproval", "applyPatchApproval"):
-        review = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc)
+        review = bridge_approval(method, params, cc_write_fn, cc_read_fn, timeout, acc=acc, narrative=narrative, drain_ctx=drain_ctx)
         return {"id": mid, "result": review}
 
     # Should never reach here (covered above), but be safe
@@ -1800,6 +2459,187 @@ def codex_review_v2(args: dict, manager: "AppServerManager | None" = None,
     return r
 
 
+def _build_interrupted_result(ts: dict, interrupted_by: str, thread_warm: bool = True) -> dict:
+    """Graceful, resumable result for an interrupted turn (#218 F7). Mode-shaped (so a
+    review/implement/codex_review caller still gets its keys) with interrupt metadata and NO
+    'error' key — the dispatcher marks isError iff 'error' in res, so an interrupt stays a
+    graceful partial, not a failure."""
+    partial = "".join(ts["final_message_parts"])
+    meta = _build_result_meta(ts["manager"], ts["usage_snapshot"], ts["turn_start_t"],
+                              ts["mcp_mode"], ts["mcp_servers_enabled"],
+                              ts["effort_val"], ts["model_val"], "interrupted")
+    res = _shape_result(ts["mode"], ts["thread_id"], partial, meta)
+    res["status"] = "interrupted"          # top-level status (overrides meta's status key too)
+    res["interrupted_by"] = interrupted_by
+    res["partial_text"] = partial
+    res["thread_warm"] = thread_warm
+    return res
+
+
+_INTERRUPT_COMPLETE_TIMEOUT = 10.0  # bounded wait for turn/completed after turn/interrupt (#218 F6)
+
+
+def _run_interrupt(manager, ts: dict, turn_id, interrupted_by: str) -> dict:
+    """Stop the in-flight turn cleanly and return a graceful, resumable result (#218).
+
+    Teardown invariant (R3-F1): the no-turnId and no-completion branches kill the child
+    (→ respawn next call) and return thread_warm=False. The caller clears the TurnStateMachine."""
+    ts["interrupting"] = True
+    ts["interrupted_by"] = interrupted_by
+
+    def _teardown():
+        try:
+            if manager._child is not None:
+                manager._child.kill()
+        except Exception:
+            pass
+        manager._child = None
+        return _build_interrupted_result(ts, interrupted_by, thread_warm=False)
+
+    if not turn_id:
+        return _teardown()
+    # turn/interrupt is a REQUEST (app-server replies an empty {} response), NOT a notification —
+    # it MUST carry an id (R2-F1; verified vs the app-server schema and turn_interrupt_probe.py).
+    iid = manager._next_id()
+    manager._write({"id": iid, "method": "turn/interrupt",
+                    "params": {"threadId": ts["thread_id"], "turnId": turn_id}})
+    deadline = time.time() + _INTERRUPT_COMPLETE_TIMEOUT
+    while time.time() < deadline:
+        for frame in manager._reactor.pump(timeout=0.2):
+            if "__cc__" in frame:          # ignore CC frames during the interrupt drain
+                continue
+            if frame.get("id") == iid:     # the empty {} response to turn/interrupt — consume, don't handle
+                continue
+            res = _handle_child_frame(frame, ts)
+            if res is not None:
+                return res                 # the interrupting branch → graceful result
+    return _teardown()                     # no turn/completed within the bound
+
+
+def _handle_child_frame(frame: dict, ts: dict):
+    """Process one app-server (child) frame against turn-state `ts`.
+
+    Returns None to continue the turn, or a result dict to terminate it. Shared by the turn
+    pump and the #252 approval-wait drain so a frame is handled identically wherever it is read
+    (extracted verbatim from the codex_run_v2 Phase-2 body; the only addition is the #218
+    `interrupting` routing). Only NOTIFICATION frames are acted on — a response/request frame
+    returns None (so it is safe to call on any drained child frame)."""
+    if classify(frame) != "notification":
+        return None
+    method = frame.get("method", "")
+    if method == "item/agentMessage/delta":
+        # `or ""`: a present-but-null delta returns None from .get(k, "") (#18)
+        ts["final_message_parts"].append(frame.get("params", {}).get("delta") or "")
+        return None
+    if method == "item/completed" and ts["review_target"] is not None:
+        # Native review output is delivered as a COMPLETED agentMessage item (.text), not deltas.
+        _it = frame.get("params", {}).get("item", {}) or {}
+        if _it.get("type") == "agentMessage":
+            ts["final_message_parts"].append(_it.get("text") or "")   # null-safe (#18)
+        return None
+    if method == "thread/tokenUsage/updated":
+        tu = frame.get("params", {}).get("tokenUsage")
+        if isinstance(tu, dict):
+            ts["usage_snapshot"] = tu
+        return None
+    if method == "turn/completed":
+        t = frame.get("params", {}).get("turn", {}) or {}
+        # #218: an interrupt WE initiated terminates as status="interrupted" — route it to the
+        # graceful result, bypassing the generic terminal-failure arm below.
+        if ts.get("interrupting") and t.get("status") == "interrupted" and not t.get("error"):
+            return _build_interrupted_result(ts, interrupted_by=ts.get("interrupted_by", "cancel"))
+        if t.get("status") != "completed" or t.get("error"):  # TurnStatus has no "success" (codex 0.141: completed/interrupted/failed/inProgress)
+            meta = _build_result_meta(ts["manager"], ts["usage_snapshot"], ts["turn_start_t"],
+                                      ts["mcp_mode"], ts["mcp_servers_enabled"],
+                                      ts["effort_val"], ts["model_val"], "failed")
+            return {"error": f"turn failed: status={t.get('status')!r} error={t.get('error')!r}",
+                    "thread_id": ts["thread_id"], **meta}
+        meta = _build_result_meta(ts["manager"], ts["usage_snapshot"], ts["turn_start_t"],
+                                  ts["mcp_mode"], ts["mcp_servers_enabled"],
+                                  ts["effort_val"], ts["model_val"], "completed")
+        if ts["retries"]:
+            meta["retries"] = ts["retries"]
+        return _shape_result(ts["mode"], ts["thread_id"], "".join(ts["final_message_parts"]), meta)
+    if method == "error":
+        # willRetry:true = transient stream reconnect (codex retries) → NOT terminal, NOT drift.
+        is_terminal, emsg = _classify_error_notification(frame.get("params", {}) or {})
+        if not is_terminal:
+            ts["retries"] += 1
+            return None
+        meta = _build_result_meta(ts["manager"], ts["usage_snapshot"], ts["turn_start_t"],
+                                  ts["mcp_mode"], ts["mcp_servers_enabled"],
+                                  ts["effort_val"], ts["model_val"], "failed")
+        return {"error": f"codex error: {emsg or 'unknown error'}",
+                "thread_id": ts["thread_id"], **meta}
+    if method not in _KNOWN_NOTIFICATIONS:
+        _drift_warn(ts.get("acc"), "UNKNOWN_NOTIFICATION", method)
+    # known-but-ignored (turn/started, item/completed non-review, ...) → no-op
+    return None
+
+
+def _route_cc_frame(frame, cc_id, reply_fn) -> str:
+    """Route a mid-turn CC frame (#218). Returns 'interrupt' (our cancel — CC alive),
+    'teardown' (stdin EOF — CC gone), or 'continue'. Only REQUEST-shaped id-bearing frames
+    are answered (R1-F3); a response-shaped frame mid-turn is not ours to answer → ignored.
+    Id-bearing requests get the SAME CC-facing envelopes main() writes (R3-F2)."""
+    if not isinstance(frame, dict):
+        return "continue"                       # unparseable CC line
+    if frame.get("__eof__"):                     # CC stdin closed (e.g. CC tool-call timeout)
+        return "teardown"                        # R1-F1: CC gone → teardown (cold); don't wait for ACK
+    method = frame.get("method", "")
+    if method == "notifications/cancelled":
+        if (frame.get("params") or {}).get("requestId") == cc_id:
+            return "interrupt"
+        return "continue"
+    if classify(frame) != "request":            # R1-F3: response/notification → not ours to answer
+        return "continue"
+    mid = frame.get("id")
+    # id-bearing REQUEST → MUST answer (CC would block otherwise)
+    if method == "ping":
+        reply_fn(mid, result={})
+    elif method == "tools/list":
+        reply_fn(mid, result={"tools": TOOLS})
+    elif method == "tools/call":
+        busy = _v2_state_machine.busy_error()   # {"error": "codex turn already in flight"}
+        reply_fn(mid, result={"content": [{"type": "text", "text": json.dumps(busy)}],
+                              "isError": True})
+    else:
+        reply_fn(mid, error={"code": -32601,
+                             "message": f"server busy; method {method!r} not serviced mid-turn"})
+    return "continue"
+
+
+def _interrupts_enabled() -> bool:
+    """#218: interrupts (Esc-cancel + opt-in-timeout-graceful) are default-ON; the
+    BULLDOZER_CODEX_NO_INTERRUPT kill-switch disables them. The #252 approval-wait child
+    drain is independent and stays ON regardless (see the approval bridge)."""
+    return not os.environ.get("BULLDOZER_CODEX_NO_INTERRUPT")
+
+
+def _finish_interrupt(manager, ts: dict, turn_id, interrupted_by: str, state_machine) -> dict:
+    """Run the interrupt routine, then clear the TurnStateMachine (centralized state-clear so
+    every interrupt branch leaves the bridge ready for the next call)."""
+    res = _run_interrupt(manager, ts, turn_id, interrupted_by)
+    state_machine.turn_completed()
+    return res
+
+
+def _log_kill_switch_once() -> None:
+    """Best-effort: log ONCE (per process) when the #218 interrupt kill-switch is set, to the
+    stable codex log. No-op when interrupts are enabled. Never raises (F8)."""
+    if getattr(_log_kill_switch_once, "_done", False) or _interrupts_enabled():
+        return
+    _log_kill_switch_once._done = True
+    try:
+        path = os.environ.get("BULLDOZER_CODEX_LOG") or os.path.expanduser(
+            "~/.claude/hooks/bulldozer-codex.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(f"{_now_iso()} | INTERRUPT_DISABLED | BULLDOZER_CODEX_NO_INTERRUPT set\n")
+    except Exception:
+        pass
+
+
 def codex_run_v2(
     args: dict,
     manager: "AppServerManager | None" = None,
@@ -1839,16 +2679,27 @@ def codex_run_v2(
     # and prompt-required returns, both of which precede `mode = ...`).
     acc = []
 
-    # ── Graceful no-codex (carry v1 behaviour) ─────────────────────────────
+    # ── Graceful no-codex + peek-warm (#227 part-2) ────────────────────────
+    # The codex binary is needed only to SPAWN. A child left warm by a prior codex_run can
+    # serve a SAME-isolation-signature call without it — mirrors codex_info #225 P3. Admitting
+    # the call here can never destroy the warm child: a mismatched-signature respawn fails
+    # safely either way — _spawn_appserver runs BEFORE any self mutation (a missing-binary
+    # FileNotFoundError can't touch the warm child), and design C's (#227b) transactional
+    # commit only retires the old child AFTER a fresh init succeeds (so a post-spawn init
+    # failure can't either). The signature is not known until _build_isolation_argv (below),
+    # so here we can only tell "is ANY child alive": if none is, a spawn is unavoidable →
+    # require the binary NOW. This keeps the no-codex error ahead of mcp validation
+    # (test_codex_run_no_codex_returns_error). A live-but-mismatched child falls through to
+    # ensure(), which respawns (needs the binary) and fails safely if it is gone.
     if manager is None:
-        if not _codex_bin_available():   # lazy resolve (#227): mid-session install/upgrade is seen
+        manager = _get_manager()         # construction does not spawn → needs no codex binary
+        if not _is_child_alive(manager._child) and not _codex_bin_available():
             return _stamp_drift({
                 "error": (
                     f"codex binary not found at '{_resolve_codex_bin()}'. "
                     "Install codex or set JAINE_CODEX_BIN."
                 )
             }, acc)
-        manager = _get_manager()
 
     if state_machine is None:
         state_machine = _v2_state_machine
@@ -2031,12 +2882,20 @@ def codex_run_v2(
         turn_params["outputSchema"] = REVIEW_SCHEMA
 
     # ── Turn execution loop ─────────────────────────────────────────────────
-    usage_snapshot: dict = {}
     turn_start_t = time.time()
     state_machine.turn_started(cc_id)
     reactor = manager._reactor
-    final_message_parts: list[str] = []
-    retries = 0   # transient stream reconnects (willRetry errors); surfaced if >0
+    narrative_shown = 0   # #224: char offset into the joined narrative already shown in a prior approval
+    # Shared turn-state: _handle_child_frame (+ the #218 interrupt routine / #252 approval drain)
+    # read/mutate these so a child frame is handled identically wherever it is read.
+    ts = {
+        "final_message_parts": [], "usage_snapshot": {}, "retries": 0,
+        "interrupting": False, "interrupted_by": "cancel", "acc": acc,
+        "manager": manager, "turn_start_t": turn_start_t, "mcp_mode": mcp_mode,
+        "mcp_servers_enabled": mcp_servers_enabled, "effort_val": effort_val,
+        "model_val": model_val, "mode": mode, "thread_id": thread_id,
+        "review_target": review_target,
+    }
 
     try:
         # Send turn/start; then run a unified pump loop that:
@@ -2067,10 +2926,36 @@ def codex_run_v2(
         turn_timeout = args.get("timeout")
         deadline = (time.time() + turn_timeout) if turn_timeout else None
         ack_deadline = time.time() + _ACK_TIMEOUT   # SETUP check (engine must answer turn/start)
+        # #218: watch CC stdin for a mid-turn cancel only when interrupts are enabled AND we have
+        # a cc_id to correlate it against (R5-F1: a direct unit test without _cc_id must not read
+        # global sys.stdin). turn_id is captured at the ACK; cancel_pending bridges a pre-ACK cancel.
+        _log_kill_switch_once()                  # F8: note once if the kill-switch disabled interrupts
+        watch = _interrupts_enabled() and args.get("_cc_id") is not None
+        turn_id = None
+        cancel_pending = False
 
         while deadline is None or time.time() < deadline:
-            frames = reactor.pump(timeout=0.2)
+            frames = reactor.pump(timeout=0.2, watch_cc=watch)
+            # codex P1: re-process any non-notification child frames the approval drain buffered
+            # (e.g. a turn/start ACK that arrived while an approval was pending) — prepend so they
+            # are handled before this batch (otherwise a pre-ACK approval would falsely time out).
+            if ts.get("drained_frames"):
+                frames = ts.pop("drained_frames") + frames
+            # CC stdin EOF has BATCH PRIORITY (R1-F1): a closed CC channel can't receive ANY
+            # result, so a same-batch child completion is undeliverable → force cold teardown.
+            # (isinstance guard: a child may emit a bare non-dict JSON line — reviewer F3.)
+            if any(isinstance(f, dict) and isinstance(f.get("__cc__"), dict) and f["__cc__"].get("__eof__")
+                   for f in frames):
+                return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
             for frame in frames:
+                if not isinstance(frame, dict):
+                    continue                                   # bare non-dict JSON line from the child — ignore (reviewer F3)
+                if "__cc__" in frame:                          # CC-side frame (cancel/other; EOF handled by the scan)
+                    if _route_cc_frame(frame["__cc__"], cc_id=args.get("_cc_id"), reply_fn=reply) == "interrupt":
+                        # Defer the interrupt to END-OF-BATCH so a same-batch ACK + deltas are
+                        # captured first → a real cancel returns the partial work produced so far.
+                        cancel_pending = True
+                    continue
                 kind = classify(frame)
                 method = frame.get("method", "")
 
@@ -2083,7 +2968,35 @@ def codex_run_v2(
                     # working — credit it back so a slow human approval doesn't trip the
                     # opt-in turn timeout (if set) nor the turn/start ACK setup window.
                     _t0 = time.time()
-                    manager._write(handle_server_request(frame, cc_write_fn, cc_read_fn, acc=acc))
+                    # #224: thread the narrative codex streamed SINCE the last approval into
+                    # the dialog. final_message_parts already holds the deltas flushed before
+                    # this request (same-batch frames are processed in wire order). Advance the
+                    # offset ONLY for narrative-bearing approvals (Grok#2) — a non-narrative
+                    # request must not consume narrative a following command approval should show.
+                    _new_narr = None
+                    if frame.get("method") in _NARRATIVE_APPROVAL_METHODS:
+                        _full_narr = "".join(ts["final_message_parts"])
+                        _new_narr = _full_narr[narrative_shown:]
+                        narrative_shown = len(_full_narr)
+                    manager._write(handle_server_request(
+                        frame, cc_write_fn, cc_read_fn, acc=acc, narrative=_new_narr,
+                        drain_ctx={"reactor": reactor, "ts": ts, "cc_id": args.get("_cc_id")}))
+                    # #218/#252 post-approval-write checks, in priority order. EOF first: a closed
+                    # CC channel makes any result undeliverable → cold teardown (R6-F1). Then a
+                    # terminal turn that ended during the approval. Then a cancel — phase-aware,
+                    # mirroring the turn pump (warm / cold / pre-ACK defer).
+                    if ts.pop("eof_during_approval", False):
+                        return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
+                    if ts.get("terminal_during_approval") is not None:
+                        state_machine.turn_completed()
+                        return _stamp_drift(ts.pop("terminal_during_approval"), acc)
+                    if ts.pop("cancel_during_approval", False):
+                        if turn_id:
+                            return _stamp_drift(_finish_interrupt(manager, ts, turn_id, "cancel", state_machine), acc)
+                        elif turn_acked:
+                            return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
+                        else:
+                            cancel_pending = True   # pre-ACK approval cancel → defer to the ACK branch
                     _elapsed = time.time() - _t0
                     if deadline is not None:
                         deadline += _elapsed
@@ -2097,6 +3010,10 @@ def codex_run_v2(
                             state_machine.turn_completed()
                             return _stamp_drift({"error": f"{start_method} error: {frame['error']}"}, acc)
                         turn_acked = True
+                        # turnId from the start ACK (TurnStartResponse.turn.id); may be None for a
+                        # review/start ACK without a turn id → a later interrupt routes to teardown.
+                        # A pending cancel is acted on at end-of-batch (after same-batch deltas).
+                        turn_id = ((frame.get("result") or {}).get("turn") or {}).get("id")
                     elif method == "error":
                         # A TERMINAL error can arrive BEFORE the ACK (e.g. during the
                         # cold-start setup window). Surface it instead of dropping it →
@@ -2109,76 +3026,42 @@ def codex_run_v2(
                     # Any other pre-ack frame (stray notification) is ignored.
                     continue
 
-                # Phase 2: event stream
+                # Phase 2: event stream — delegate to the shared child-frame handler
+                # (so a frame is processed identically here and in the #252 approval drain).
                 if kind == "notification":
-                    if method == "item/agentMessage/delta":
-                        # `or ""`: a present-but-null delta returns None from .get(k, "") (#18)
-                        final_message_parts.append(frame.get("params", {}).get("delta") or "")
-                    elif method == "item/completed" and review_target is not None:
-                        # Native review output is delivered as a COMPLETED agentMessage
-                        # item (.text), NOT as deltas (verified live, codex 0.141).
-                        _it = frame.get("params", {}).get("item", {}) or {}
-                        if _it.get("type") == "agentMessage":
-                            final_message_parts.append(_it.get("text") or "")   # null-safe (#18)
-                    elif method == "thread/tokenUsage/updated":
-                        # Wire: params.tokenUsage = {last, total} (NOT params.usage). See spec 2a.
-                        tu = frame.get("params", {}).get("tokenUsage")
-                        if isinstance(tu, dict):
-                            usage_snapshot = tu
-                    elif method == "turn/completed":
-                        t = frame.get("params", {}).get("turn", {}) or {}
-                        if t.get("status") != "completed" or t.get("error"):  # TurnStatus has no "success" (codex 0.141: completed/interrupted/failed/inProgress)
-                            state_machine.turn_completed()
-                            meta = _build_result_meta(manager, usage_snapshot, turn_start_t,
-                                                      mcp_mode, mcp_servers_enabled,
-                                                      effort_val, model_val, "failed")
-                            return _stamp_drift({
-                                "error": f"turn failed: status={t.get('status')!r} error={t.get('error')!r}",
-                                "thread_id": thread_id, **meta}, acc)
+                    _res = _handle_child_frame(frame, ts)
+                    if _res is not None:
                         state_machine.turn_completed()
-                        meta = _build_result_meta(manager, usage_snapshot, turn_start_t,
-                                                  mcp_mode, mcp_servers_enabled,
-                                                  effort_val, model_val, "completed")
-                        if retries:
-                            meta["retries"] = retries
-                        return _stamp_drift(
-                            _shape_result(mode, thread_id, "".join(final_message_parts), meta), acc)
-                    elif method == "error":
-                        # codex `error` notification. willRetry:true = transient stream
-                        # reconnect (codex retries on its own) → NOT drift, NOT terminal.
-                        # Otherwise → terminal failure surfaced as a structured signal
-                        # (#204 parking-lot), NOT UNKNOWN_NOTIFICATION. See spec 2026-06-21 Item 4.
-                        is_terminal, emsg = _classify_error_notification(frame.get("params", {}) or {})
-                        if not is_terminal:
-                            retries += 1
-                        else:
-                            state_machine.turn_completed()
-                            meta = _build_result_meta(manager, usage_snapshot, turn_start_t,
-                                                      mcp_mode, mcp_servers_enabled,
-                                                      effort_val, model_val, "failed")
-                            return _stamp_drift({
-                                "error": f"codex error: {emsg or 'unknown error'}",
-                                "thread_id": thread_id, **meta}, acc)
-                    elif method not in _KNOWN_NOTIFICATIONS:
-                        _drift_warn(acc, "UNKNOWN_NOTIFICATION", method)
-                    # known-but-ignored (item/completed, turn/started, ...) → no-op
+                        return _stamp_drift(_res, acc)
                     continue
 
             # EOF check AFTER draining this batch: a child that wrote turn/completed
             # then exited has its completion consumed by the pump above (→ returns
             # success). Only a child that died WITHOUT completing reaches here.
             if manager._child is not None and manager._child.poll() is not None:
+                if cancel_pending:                   # R1-F2: cancel pending + child died → graceful COLD
+                    return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
                 eof_err = state_machine.eof_error()
                 manager._child = None
                 return _stamp_drift(eof_err, acc)
 
+            # Pending cancel + turn ACKed + child alive → interrupt now (warm if turn_id known,
+            # else cold for a review/start ACK without a turn id). Runs AFTER the batch so a
+            # same-batch ACK + deltas were captured → the partial work is returned (R1-F2).
+            if cancel_pending and turn_acked:
+                return _stamp_drift(_finish_interrupt(manager, ts, turn_id, "cancel", state_machine), acc)
+
             # Phase 1 timeout check (after each pump batch)
             if not turn_acked and time.time() > ack_deadline:
+                if cancel_pending:                   # R1-F2: cancel pending, ACK never arrived → graceful COLD
+                    return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
                 state_machine.turn_completed()
                 return _stamp_drift({"error": f"{start_method} response timed out"}, acc)
 
         # Opt-in work-duration deadline exceeded (only reachable when timeout was set).
-        state_machine.turn_completed()
+        if _interrupts_enabled():                    # #218: graceful interrupt + resumable partial
+            return _stamp_drift(_finish_interrupt(manager, ts, turn_id, "timeout", state_machine), acc)
+        state_machine.turn_completed()               # kill-switch: legacy bare error
         return _stamp_drift({"error": f"turn timed out after {turn_timeout} s"}, acc)
 
     except Exception as e:

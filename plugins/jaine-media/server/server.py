@@ -17,7 +17,7 @@ from pathlib import Path
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from agent import fetch, gemini_files, media, paths as agent_paths, tool_log, workspace
+from agent import dead_models, fetch, gemini_files, media, paths as agent_paths, tool_log, workspace
 
 BASE = gemini_files.DEFAULT_GEMINI_BASE_URL
 
@@ -85,18 +85,57 @@ def _language_instruction(language: str | None) -> str:
 
 
 def _media_part(ref, fps: int | None) -> dict:
-    part: dict = {"fileData": {"mimeType": ref.mime_type, "fileUri": ref.uri}}
+    fd: dict = {"fileUri": ref.uri}
+    if ref.mime_type:                          # a native YouTube part (#229) carries NO mimeType —
+        fd["mimeType"] = ref.mime_type         # Gemini ingests the URL itself; only uploads have one
+    part: dict = {"fileData": fd}
     if fps:
         part["videoMetadata"] = {"fps": fps}
     return part
 
 
+def _native_ref(url: str):
+    """A FileRef for a native YouTube passthrough: the URL IS the fileUri, no upload and no
+    PROCESSING wait (Gemini fetches it server-side). mime_type is empty so _media_part omits
+    mimeType, and state=ACTIVE so the cache's ACTIVE-verify is a no-op (#229)."""
+    return gemini_files.FileRef(uri=url, name=url, mime_type="", expires_at=0.0, state="ACTIVE")
+
+
+def _is_native(raw_inputs: list[str], history: list | None) -> bool:
+    """Whether to use the native YouTube passthrough (#229): a SINGLE public YouTube URL with no
+    ongoing conversation. One-shot is faster end-to-end (no download/upload on our side). Multi-
+    turn (history) re-pulls the URL every turn, and native supports at most one YouTube link per
+    request — both fall back to download+upload."""
+    return len(raw_inputs) == 1 and fetch.is_youtube_url(raw_inputs[0]) and not history
+
+
+# mediaResolution per model family (reference/media-resolution-tokens.md, measured): on 2.5,
+# HIGH == default (~263 tok/frame) so it's free — keep it. On 3.x, HIGH is ~3.4x their cheap
+# default (~289 vs ~85) and only helps OCR/fine text → default to MEDIUM. Unknown family: keep
+# HIGH (don't silently downgrade a model we haven't measured). #232
+_MEDIA_RESOLUTION = {"high": "MEDIA_RESOLUTION_HIGH", "medium": "MEDIA_RESOLUTION_MEDIUM",
+                     "low": "MEDIA_RESOLUTION_LOW"}
+
+
+def _media_resolution_for(model: str) -> str:
+    """Family-aware mediaResolution default: HIGH on 2.5 (free), MEDIUM on 3.x (HIGH there is a
+    3.4x premium, OCR-only), HIGH for unknown families (conservative — never silently downgrade)."""
+    if "gemini-2.5" in model:
+        return "MEDIA_RESOLUTION_HIGH"
+    if "gemini-3" in model:
+        return "MEDIA_RESOLUTION_MEDIUM"
+    return "MEDIA_RESOLUTION_HIGH"
+
+
 def _build_request_body(refs: list, question: str, *, max_tokens: int,
                         fps: int | None = None, language: str | None = None,
-                        history: list | None = None) -> dict:
+                        history: list | None = None,
+                        media_resolution: str = "MEDIA_RESOLUTION_HIGH") -> dict:
     """Assemble the generateContent body: ONE media part per ref (several refs =
     compare them in a single request, #202 — full resolution each, unlike an
-    ffmpeg-hstack), then the question with a language steer, HIGH media resolution.
+    ffmpeg-hstack), then the question with a language steer, family-aware media
+    resolution (#232 — HIGH on 2.5 where it's free, MEDIUM on 3.x where HIGH is a
+    3.4x premium; caller resolves it, default HIGH).
     fps (timecode accuracy) applies to every video part.
 
     history (caller-passed, #206 — Gemini multi-turn is client-side/stateless): a
@@ -132,7 +171,7 @@ def _build_request_body(refs: list, question: str, *, max_tokens: int,
         "generationConfig": {
             "maxOutputTokens": max_tokens,
             "temperature": 0.2,
-            "mediaResolution": "MEDIA_RESOLUTION_HIGH",
+            "mediaResolution": media_resolution,
         },
     }
 
@@ -157,6 +196,56 @@ def _collect_targets(path: str | None, paths: list[str] | None) -> list[Path]:
     return out
 
 
+async def _prepare_for_upload(p: Path, work_dir: str) -> Path:
+    """Ensure a downloaded file fits Gemini's Files API AND is <=1080p before upload — parity
+    with fetch_media's #230 backstop (codex P2). fetch.download caps at 720p, but its /w fallback
+    can return an oversized/4K single-format/direct URL; that would time out Gemini's upload/
+    generate. Returns a downscaled copy in `work_dir` when needed, else `p` unchanged. Fail-open:
+    no ffprobe/ffmpeg → can't probe/compress → upload as-is (Gemini surfaces a structured error)."""
+    try:
+        try:
+            _, height = media.probe_dimensions(p)
+        except Exception:
+            height = 0                             # unprobeable → don't force a downscale
+        if media.fits(p)["fits"] and height <= fetch._MAX_HEIGHT:
+            return p
+        for h in (720, 480, 360, 240):
+            cand = Path(work_dir) / f"compressed_{h}p.mp4"
+            if await asyncio.to_thread(media.compress, p, cand, height=h) and media.fits(cand)["fits"]:
+                return cand
+    except Exception:
+        pass                                        # ffmpeg/ffprobe missing or compress raised →
+    return p                                         # fail-open: upload the original as-is
+
+
+async def _localize_one(t: str, dest_dir: str) -> Path:
+    """One raw input → a local Path (#229). A URL is SSRF-validated then downloaded (yt-dlp,
+    720p/size-capped) into `dest_dir` — the caller passes a UNIQUE dir, since fetch.download
+    writes a fixed dl.* name and a shared dir would collide (codex P2) — and downscaled if it
+    still escaped the caps (_prepare_for_upload). A local path is expanded and existence-checked
+    (`dest_dir` unused). Shared by current inputs AND history media."""
+    if fetch.is_url(t):
+        unsafe = fetch.validate_url(t)
+        if unsafe:
+            raise ValueError(f"unsafe URL refused: {unsafe}")
+        Path(dest_dir).mkdir(parents=True, exist_ok=True)
+        dl = await asyncio.to_thread(fetch.download, t, dest_dir)
+        if dl is None:
+            raise ValueError(f"download failed (yt-dlp): {t}")
+        return await _prepare_for_upload(dl, dest_dir)
+    p = Path(os.path.expanduser(t))
+    if not p.is_file():
+        raise ValueError(f"file not found: {t}")
+    return p
+
+
+async def _localize(raw: list[str], tmpdir: str) -> list[Path]:
+    """Current-turn inputs → local Paths for the upload pipeline (#229 download route): download
+    each URL (into its own sub-dir of `tmpdir`) / validate each local path, raising on a bad
+    input. The native YouTube fast-path is decided BEFORE this — it never reaches here."""
+    return [await _localize_one(t, str(Path(tmpdir) / f"in{i}")) for i, t in enumerate(raw)]
+
+
 # image/tts/embedding/etc are not media-understanding; 2.0/1.5/1.0 are retired (404);
 # *-latest are moving aliases; customtools is a tool-calling variant — drop all.
 _MODEL_SKIP = ("image", "tts", "embedding", "aqa", "native-audio", "dialog", "nano",
@@ -164,9 +253,11 @@ _MODEL_SKIP = ("image", "tts", "embedding", "aqa", "native-audio", "dialog", "na
                "exp-", "-latest")
 
 
-def _filter_models(raw: list) -> list:
-    """Keep flash/pro generateContent models; drop image/tts/retired/alias variants.
+def _filter_models(raw: list, dead: set[str] | None = None) -> list:
+    """Keep flash/pro generateContent models; drop image/tts/retired/alias variants AND any id
+    in `dead` (learned-from-404 skip-list, #233 — models.list still advertises retired ids).
     Each entry: id, preview flag, context limits. Sorted by id (#202 list_models)."""
+    dead = dead or set()
     out = []
     for m in raw:
         name = m.get("name", "").split("/")[-1]
@@ -174,6 +265,8 @@ def _filter_models(raw: list) -> list:
             continue
         if not any(k in name for k in ("flash", "pro")) or any(k in name for k in _MODEL_SKIP):
             continue
+        if name in dead:
+            continue                          # 404'd on use before → hide it (#233 learn-from-404)
         out.append({"id": name, "preview": "preview" in name,
                     "input_limit": m.get("inputTokenLimit"), "output_limit": m.get("outputTokenLimit")})
     return sorted(out, key=lambda x: x["id"])
@@ -181,19 +274,30 @@ def _filter_models(raw: list) -> list:
 
 async def _list_models(key: str) -> list:
     """Fetch the live flash/pro generateContent catalog (no hardcoded names → survives
-    model ships/retires)."""
+    model ships/retires), minus any id learned-dead from a prior 404 (#233)."""
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.get(f"{BASE}/models?pageSize=1000", headers={"x-goog-api-key": key})
         if r.status_code // 100 != 2:
             raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:200]}")
-        return _filter_models(r.json().get("models", []))
+        return _filter_models(r.json().get("models", []), dead=dead_models.load())
+
+
+def _model_is_dead(err: str, model: str) -> bool:
+    """A 404 that specifically names `model` as retired/absent (#233 learn-from-404). Requires
+    the model id IN the message so a 404 on a different resource (a stale fileUri / unrelated
+    request) can't poison the skip-list with a still-working model. "no longer available" is the
+    retired signature; "not found" covers a nonexistent id (harmless — not in the catalog anyway)."""
+    e = err.lower()
+    return bool(model) and model.lower() in e and ("no longer available" in e or "not found" in e)
 
 
 def _parse_response(d: dict) -> tuple[str, int, str]:
     """Pull (answer text, AUDIO prompt-token count, finish_reason) out of a
     generateContent response. finish_reason is the candidate's finishReason ('STOP'
     on a complete answer); 'BLOCKED:<reason>' when the whole prompt was refused (no
-    candidate — reason in promptFeedback.blockReason); 'EMPTY' when there's neither.
+    candidate — reason in promptFeedback.blockReason); 'EMPTY' when there's neither, or
+    a candidate came back textless (a STOP with no text — thinking spent the whole output
+    budget, #231) so an empty answer is never reported as a clean success.
     A finish_reason != 'STOP' means the answer is partial/absent (MAX_TOKENS = ran
     out of output budget; SAFETY = content blocked) — the caller surfaces it instead
     of returning a silently-truncated answer as success.
@@ -207,7 +311,10 @@ def _parse_response(d: dict) -> tuple[str, int, str]:
     if cands:
         cand = cands[0]
         text = "".join(p.get("text", "") for p in (cand.get("content") or {}).get("parts", [])).strip()
-        return text, audio, str(cand.get("finishReason") or "STOP").upper()
+        finish = str(cand.get("finishReason") or "STOP").upper()
+        if not text and finish == "STOP":   # candidate present but textless = deceptive STOP (#231)
+            finish = "EMPTY"                 # thinking ate the budget → flag it, never silent success
+        return text, audio, finish
     block = (d.get("promptFeedback") or {}).get("blockReason")
     return "", audio, (f"BLOCKED:{block}".upper() if block else "EMPTY")
 
@@ -264,25 +371,61 @@ _MIME = {
     ".ogg": "audio/ogg", ".flac": "audio/flac", ".aac": "audio/aac",
 }
 
-mcp = FastMCP("jaine-media")
+# #228: routing manifest injected into the model's context when this server connects
+# (MCP InitializeResult.instructions — Claude Code injects it; verified via issue #30135).
+# Deliberately client/backend-agnostic — MCP is client-agnostic and the backend may change,
+# so nothing here names a client or a provider, only the capability + intent→tool routing.
+# The "cannot natively inspect" negative constraint is load-bearing (consult-panel finding):
+# without it the model guesses from filenames/metadata or writes its own ffmpeg.
+INSTRUCTIONS = """\
+Tools for understanding the CONTENTS of video and audio — a language model cannot
+natively inspect media payloads. Do NOT answer media-content questions from a filename,
+metadata, or the user's description, and do NOT write your own ffmpeg/python to process
+media — delegate to these tools.
+
+Route by intent:
+- A video/audio file (.mp4/.mov/.webm/.mkv/.mp3/.wav/.m4a…) or a YouTube/web URL, and a
+  question about what's in it ("what happens", "transcribe", "describe", "at what point…")
+  → analyze_media(path=<file-or-URL>, question=...). A URL is passed directly and
+  auto-routes (native YouTube vs download). Compare clips → paths=[...]. Continue the
+  discussion or add clips mid-conversation → history=[...]. Tune with detail
+  (brief|normal|full), model, language, fps.
+- SEE exact frames at a moment → extract_frame(path, timecode, window) — returns image
+  frames the agent reads directly.
+- A URL/YouTube is large, or you want a local copy first → fetch_media(url) (SSRF-guarded,
+  quality-capped) → workspace file.
+- A file is too large/long to process → prepare_media(path) — compress or trim to fit.
+- Picking a model, or a model errored → list_models() — live catalog of usable models.
+
+Typical chain: fetch_media (if remote) → prepare_media (if oversized) → analyze_media →
+extract_frame (exact moments). For most "what's in this video/audio" tasks call
+analyze_media directly — it accepts files and URLs and fetches internally."""
+
+mcp = FastMCP("jaine-media", instructions=INSTRUCTIONS)
 
 
 def _mime_for(p: Path) -> str:
     return _MIME.get(p.suffix.lower(), "application/octet-stream")
 
 
-async def _resolve_history(key: str, history: list) -> list:
+async def _resolve_history(key: str, history: list, tmpdir: str | None = None) -> list:
     """Resolve each caller-passed history turn's `paths` into FileRefs (re-uploads
     expired ones via get_or_upload — fileUri only lives ~48h), leaving model turns
-    text-only. #206: the server is stateless; the caller owns the conversation."""
+    text-only. #206: the server is stateless; the caller owns the conversation. A history
+    path may be a URL (#229) — it's downloaded into `tmpdir` (set by the caller when any
+    input/history path is a URL) just like a current-turn URL."""
     out = []
-    for turn in history:
+    for ti, turn in enumerate(history):
         t = {"role": turn.get("role", "user"), "text": turn.get("text", "")}
         hpaths = turn.get("paths") or []
         if hpaths:
             refs = []
-            for hp in hpaths:
-                p = Path(os.path.expanduser(hp))
+            for pi, hp in enumerate(hpaths):
+                # a history media path may be a URL too (#229) — download+upload it the same way,
+                # so continuing a conversation about a YouTube video works (tmpdir is set whenever
+                # ANY input/history path is a URL; local paths ignore dest).
+                dest = str(Path(tmpdir) / f"h{ti}_{pi}") if tmpdir else ""
+                p = await _localize_one(hp, dest)
                 d = await gemini_files.compute_file_hash(p)
                 refs.append(await gemini_files.get_or_upload(key, BASE, str(p), _mime_for(p), file_hash=d))
             t["refs"] = refs
@@ -292,10 +435,11 @@ async def _resolve_history(key: str, history: list) -> list:
 
 async def _generate(key: str, refs: list, question: str, *, model: str,
                     max_tokens: int, fps: int | None, language: str | None,
-                    history: list | None = None):
+                    history: list | None = None, media_resolution: str | None = None):
     url = f"{BASE}/models/{model}:generateContent"
     body = _build_request_body(refs, question, max_tokens=max_tokens, fps=fps,
-                               language=language, history=history)
+                               language=language, history=history,
+                               media_resolution=media_resolution or _media_resolution_for(model))
     async with httpx.AsyncClient(timeout=180) as c:
         r = await c.post(url, headers={"x-goog-api-key": key,
                                        "Content-Type": "application/json"}, json=body)
@@ -312,13 +456,19 @@ async def analyze_media(path: str = "", question: str = "", detail: str = "norma
                         max_tokens: int | None = None, answer_chars: int | None = None,
                         model: str | None = None,
                         language: str | None = None, fps: int | None = None,
+                        media_resolution: str | None = None,
                         session_id: str | None = None, paths: list[str] | None = None,
                         history: list | None = None) -> str:
-    """See/hear local VIDEO or AUDIO file(s) via Gemini and answer `question`.
+    """See/hear a VIDEO or AUDIO — a local file OR a URL — via Gemini and answer `question`.
 
-    Claude itself can't watch video or hear audio — this routes the file to Gemini
+    Claude itself can't watch video or hear audio — this routes the media to Gemini
     (which can do both) and returns the answer. Asking again about the SAME file is
     cheap: the upload is content-hash cached (~48h), on disk.
+
+    URLs Just Work (#229): a public YouTube link as a one-shot (no `history`) goes STRAIGHT
+    to Gemini — no download, no upload (fastest end-to-end). Any other URL — or a YouTube URL
+    inside a multi-turn `history` — is downloaded (SSRF-guarded, 720p-capped) then uploaded so
+    the fileUri is reused. You never choose; just pass the URL or the path.
 
     Compare several clips: pass `paths=[a, b, ...]` — they go into ONE Gemini request
     at full resolution each (better than an ffmpeg side-by-side, which downscales both),
@@ -329,8 +479,9 @@ async def analyze_media(path: str = "", question: str = "", detail: str = "norma
     replays your history into the request; it does NOT keep session state. You can add
     a DIFFERENT video in a later turn and compare against earlier ones.
 
-    Params (all optional except a file + question):
-      path / paths: one file, or several files to compare in one request (paths wins).
+    Params (all optional except a file/URL + question):
+      path / paths: one local file OR a URL, or several to compare in one request (paths wins).
+                  A single public YouTube URL with no `history` uses the native fast-path (#229).
       history:    prior turns [{role: 'user'|'model', text, paths: [files] (user turns)}].
                   The server re-uploads any expired files by content-hash. Caller-owned.
       detail:     'brief' | 'normal' | 'full' → both the model output cap (512 / 2048 /
@@ -344,6 +495,9 @@ async def analyze_media(path: str = "", question: str = "", detail: str = "norma
       model:      override the model (default JAINE_MEDIA_MODEL → gemini-2.5-flash).
       language:   force the answer language (e.g. 'ru'); default follows the question.
       fps:        sample video at this many frames/sec — raises timecode accuracy.
+      media_resolution: 'high'|'medium'|'low' — per-frame detail override. Default is family-aware
+                  (#232: HIGH on 2.5 where it's free, MEDIUM on 3.x where HIGH is a 3.4x premium);
+                  force 'high' for OCR/fine text on a 3.x model.
       session_id: RESERVED — server-side sessions are an anti-pattern for MCP (#206); use `history`.
     """
     key = os.environ.get("GEMINI_API_KEY", "")
@@ -351,32 +505,56 @@ async def analyze_media(path: str = "", question: str = "", detail: str = "norma
         return json.dumps({"success": False, "error": "GEMINI_API_KEY not set in server env"})
     if not question:
         return json.dumps({"success": False, "error": "question is required"})
-    if path or paths:
-        try:
-            targets = _collect_targets(path, paths)
-        except ValueError as e:
-            return json.dumps({"success": False, "error": str(e)})
-    elif history:
-        targets = []                         # follow-up: the media lives in the history
-    else:
+    if media_resolution and media_resolution.lower() not in _MEDIA_RESOLUTION:
         return json.dumps({"success": False,
-                           "error": "give 'path'/'paths', or 'history' to continue a conversation"})
-
+                           "error": f"media_resolution must be high/medium/low, got {media_resolution!r}"})
+    raw_inputs = paths if paths else ([path] if path else [])
+    if not raw_inputs and not history:
+        return json.dumps({"success": False,
+                           "error": "give 'path'/'paths' (file or URL), or 'history' to continue a conversation"})
+    if len(raw_inputs) > _MAX_INPUTS:
+        return json.dumps({"success": False,
+                           "error": f"too many inputs ({len(raw_inputs)}); max {_MAX_INPUTS} per request"})
     chosen_model = _model_for("analyze", model)
     eff_tokens = _effective_max_tokens(detail, max_tokens)
     char_limit = _answer_char_limit(detail, answer_chars)
-    anchor = None                              # set once hashing succeeds; None-safe in except
+    mr_override = _MEDIA_RESOLUTION.get(media_resolution.lower()) if media_resolution else None
+    anchor = None                              # set once a STABLE local file is hashed; None-safe in except
+    native = had_url = False
+    targets: list = []
+    tmpdir = None
     try:
-        # hash inputs concurrently (local IO) — uploads below STAY sequential (free-tier burst, grab #6)
-        digests = await asyncio.gather(*(gemini_files.compute_file_hash(p) for p in targets))
-        anchor = digests[0] if digests else None   # follow-up has no new file to key on
-        resolved_history = await _resolve_history(key, history) if history else None
-        refs = [await gemini_files.get_or_upload(key, BASE, str(p), _mime_for(p), file_hash=d)
-                for p, d in zip(targets, digests)]
-        cached_before = all(r.cached for r in refs) if refs else None   # post ACTIVE-verify (#15)
+        # routing decisions run INSIDE the try: they call is_url/is_youtube_url over caller-owned
+        # inputs/history, which raise on a malformed (non-str / non-dict) item — keep that a
+        # structured error, never a crash (codex P2). #229
+        native = bool(raw_inputs) and _is_native(raw_inputs, history)   # one-shot YouTube → no download
+        had_url = any(fetch.is_url(r) for r in raw_inputs)
+        # a URL can also live in a history turn's paths (continuing a YouTube conversation) — needs
+        # the temp dir too, even when the current-turn inputs are local/absent.
+        hist_has_url = any(fetch.is_url(p) for turn in (history or []) for p in (turn.get("paths") or []))
+        if had_url or hist_has_url:            # any URL (current OR history) → a temp dir to download into
+            tmpdir = tempfile.mkdtemp(prefix="jaine-media-analyze-")
+        if native:
+            refs = [_native_ref(raw_inputs[0])]   # the YouTube URL IS the fileUri — no download/upload
+            cached_before = None
+        else:
+            if had_url:                           # download URLs (SSRF-guarded) to the temp dir, then upload
+                assert tmpdir is not None         # had_url ⟹ tmpdir was created above
+                targets = await _localize(raw_inputs, tmpdir)
+            elif raw_inputs:
+                targets = _collect_targets(path, paths)   # pure-local: existing validated path
+            # hash inputs concurrently (local IO) — uploads below STAY sequential (free-tier burst, grab #6)
+            digests = await asyncio.gather(*(gemini_files.compute_file_hash(p) for p in targets))
+            # only a STABLE local file anchors the workspace symlink; a downloaded temp is ephemeral (cleaned below)
+            anchor = digests[0] if (digests and not had_url) else None
+            refs = [await gemini_files.get_or_upload(key, BASE, str(p), _mime_for(p), file_hash=d)
+                    for p, d in zip(targets, digests)]
+            cached_before = all(r.cached for r in refs) if refs else None   # post ACTIVE-verify (#15)
+        resolved_history = await _resolve_history(key, history, tmpdir) if history else None
         gen = await _generate(key, refs, question, model=chosen_model,
                               max_tokens=eff_tokens, fps=fps,
-                              language=language, history=resolved_history)
+                              language=language, history=resolved_history,
+                              media_resolution=mr_override)
         answer, audio_tokens, finish = gen[0], gen[1], gen[2]
         thought_tok, cand_tok = (tuple(gen[3:]) + (0, 0))[:2]   # 0 for a legacy 3-tuple shape
     except Exception as e:
@@ -386,14 +564,19 @@ async def analyze_media(path: str = "", question: str = "", detail: str = "norma
         # transport errors (timeout/connect on a slow endpoint), neither a RuntimeError (#1/#2/#3).
         tool_log.log_tool("analyze_media", False, digest=anchor, model=chosen_model, error=str(e))
         err = {"success": False, "error": str(e),
-               "inputs": [str(p) for p in targets], "model": chosen_model}
+               "inputs": list(raw_inputs), "model": chosen_model}   # raw inputs (URLs/paths) the caller gave
         # a bad model 404s — surface what IS available so the next call picks a real one (#202)
         if any(s in str(e).lower() for s in ("404", "not available", "not found")):
-            try:
+            if _model_is_dead(str(e), chosen_model):
+                dead_models.record(chosen_model)   # self-healing skip-list — hide it next time (#233)
+            try:                                   # recorded FIRST, so it's already absent below
                 err["available_models"] = [m["id"] for m in await _list_models(key)]
             except Exception:
                 pass
         return json.dumps(err, ensure_ascii=False)
+    finally:
+        if tmpdir:                                 # #229 download route: a URL was fetched to a temp
+            shutil.rmtree(tmpdir, ignore_errors=True)   # dir; Gemini has the fileUri now, drop the temp
 
     # Persist + frame (Chris: the model thinks/answers freely, but only `char_limit` chars
     # reach Claude Code's context; the FULL text is preserved on disk so nothing is lost).
@@ -446,11 +629,26 @@ async def analyze_media(path: str = "", question: str = "", detail: str = "norma
         result["workspace"] = workspace_path
     if full_answer_file:
         result["full_answer_file"] = full_answer_file
-    if len(targets) == 1:                    # back-compat single-file shape
+    # Report what was analyzed HONESTLY (#229 / codex P2): a URL has no stable local file —
+    # native has none, a download's temp file is already cleaned — so report the URL as `source`,
+    # NEVER a deleted temp path. A LOCAL file keeps `file` so follow-up tools (extract_frame /
+    # prepare_media) still work; for a URL you'd use fetch_media when you want the file on disk.
+    if native:
+        result["native"] = True              # one-shot YouTube passthrough — a fresh analysis, not a follow-up
+        result["source"] = raw_inputs[0]
+        result["fileUri"] = refs[0].uri      # == the YouTube URL
+    elif had_url:
+        if len(raw_inputs) == 1:
+            result["source"] = raw_inputs[0]
+            result["fileUri"] = refs[0].uri
+        else:
+            result["sources"] = list(raw_inputs)
+            result["n_inputs"] = len(raw_inputs)
+    elif len(targets) == 1:                   # back-compat single LOCAL-file shape
         result["file"] = str(targets[0])
         result["mime"] = _mime_for(targets[0])
         result["fileUri"] = refs[0].uri
-    elif targets:
+    elif targets:                             # several LOCAL files (#202)
         result["inputs"] = [str(p) for p in targets]
         result["n_inputs"] = len(targets)
     else:
@@ -483,8 +681,21 @@ async def list_models() -> str:
     except (RuntimeError, httpx.HTTPError) as e:
         return json.dumps({"success": False, "error": str(e)})
     tool_log.log_tool("list_models", True, count=len(models))
-    return json.dumps({"success": True, "models": models, "default": _model_for("analyze", None)},
-                      ensure_ascii=False)
+    # #233: models.list has NO retired-signal (a retired and a working model are byte-identical),
+    # so a listed id can still 404 on use. Say so — and learn-from-404 hides ids that already did.
+    note = ("catalog presence is not a generateContent guarantee — a listed model can still 404 "
+            "(no retired-signal upstream); ids that 404'd before are already hidden (#233)")
+    default = _model_for("analyze", None)
+    result = {"success": True, "models": models, "note": note, "default": default}
+    # codex P2: if the configured default got learned-dead it's filtered out of `models` — don't
+    # silently advertise an unavailable default. Flag it (don't substitute — a wrong auto-pick
+    # could be worse) so the caller passes an explicit `model` / sets JAINE_MEDIA_MODEL.
+    if default not in {m["id"] for m in models}:
+        result["default_note"] = (f"configured default '{default}' is NOT in the live catalog "
+                                  "(retired/unavailable) — pass an explicit `model` or set "
+                                  "JAINE_MEDIA_MODEL to one of `models`; analyze_media would 404 "
+                                  "on the default until then (#233)")
+    return json.dumps(result, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -629,12 +840,15 @@ async def fetch_media(url: str, max_height: int = 720, prepare: bool = True) -> 
         loopback / link-local / non-global address. Covers only the URL you pass — NOT
         redirects or DNS-rebind (yt-dlp resolves + follows 30x itself). Personal-use tool:
         do not feed it untrusted URLs.
-      - Resolution capped at `max_height` AT DOWNLOAD time (no pulling 4K / hours).
+      - Resolution capped at `max_height` AT DOWNLOAD time, hard ceiling 1080p (no pulling
+        4K / hours — >1080p is zero gain and breaks analyze_media timeouts, #230).
       - Size capped at JAINE_MEDIA_MAX_DOWNLOAD_MB (~8GB) AT DOWNLOAD time — a runaway
         direct URL (no format ladder for the resolution cap to bound) aborts before it
         fills the disk; the ceiling sits ABOVE the Gemini fit limit so compress still runs.
-      - fit-check → auto-`prepare` (compress) backstop if the download still won't fit
-        Gemini's Files API (`prepare=False` to skip). Then call analyze_media on `file`.
+      - auto-`prepare` (compress) backstop when the download won't fit Gemini's Files API
+        OR escaped the 1080p ceiling (a single-format/direct 4K URL the selector couldn't
+        bound), `prepare=False` to skip. On a successful backstop `file` is REPOINTED to the
+        safe downscaled copy (raw stays under `raw_file`), so always analyze_media on `file`.
     """
     unsafe = fetch.validate_url(url)               # security first — reject before any work
     if unsafe:
@@ -669,13 +883,43 @@ async def fetch_media(url: str, max_height: int = 720, prepare: bool = True) -> 
         result = {"success": True, "url": url, "file": str(final),
                   "workspace": str(agent_paths.workspace_dir(digest)),
                   "fits": verdict["fits"], "size_mb": verdict["size_mb"]}
-        if not verdict["fits"] and prepare:         # backstop — primary cap was at download
+        # #230: warn on the ACTUAL downloaded height, not the requested cap. fetch.download caps
+        # the format selector at <=1080p, but its /w fallback can still return an uncapped stream
+        # for a single-format source (a direct 4K URL with no <=1080p rendition) — so probe the
+        # real output (codex P2: a request-based note would falsely claim "capped" on those, or
+        # falsely warn when the cap actually worked). >1080p risks analyze_media wait_active/
+        # generate timeouts for zero token/quality gain (source pixels aren't in the VIDEO formula).
+        try:
+            _, out_height = media.probe_dimensions(final)
+        except Exception:
+            out_height = 0                      # fail-open: can't probe (audio-only / ffprobe err) → don't warn
+        too_tall = out_height > fetch._MAX_HEIGHT
+        if too_tall:
+            result["height_note"] = (
+                f"downloaded at {out_height}p — the source had no <=1080p rendition so the cap "
+                "could not bound it. >1080p risks analyze_media timeouts for zero token/quality "
+                "gain (#230); analyze the downscaled 'prepared' file below.")
+        # backstop — downscale when EITHER the file is too big OR escaped the 1080p ceiling. A
+        # ~191MB 4K fits by size yet still times analyze_media out, so height must trigger prepare
+        # too, not just a warning (codex P2 round 2): otherwise the caller gets a 4K `file` path.
+        if (not verdict["fits"] or too_tall) and prepare:
+            reason = "exceeds the practical 1080p ceiling" if too_tall else "exceeded the size limit"
             for h in (720, 480, 360, 240):
                 cand = agent_paths.workspace_dir(digest) / f"compressed_{h}p.mp4"
-                if await asyncio.to_thread(media.compress, final, cand, height=h) and media.fits(cand)["fits"]:
-                    result["prepared"] = str(cand)
-                    result["prepared_mb"] = media.fits(cand)["size_mb"]
-                    result["note"] = f"download exceeded the size limit — compressed to {h}p (analyze the 'prepared' file)"
+                cand_fits = media.fits(cand)["fits"] if await asyncio.to_thread(media.compress, final, cand, height=h) else False
+                if cand_fits:
+                    cf = media.fits(cand)
+                    # `file` is the PRIMARY analyzable path (the docstring says "analyze `file`"),
+                    # so after a successful backstop repoint it at the SAFE downscaled copy — the
+                    # raw 4K/oversize path stays under `raw_file` (codex P2 r3: leaving `file` on
+                    # the 4K original kept the timeout footgun for callers following the primary).
+                    result["raw_file"] = result["file"]
+                    result["file"] = str(cand)
+                    result["fits"], result["size_mb"] = cf["fits"], cf["size_mb"]
+                    result["prepared"] = str(cand)               # back-compat alias of `file`
+                    result["prepared_mb"] = cf["size_mb"]
+                    result["note"] = (f"download {reason} — compressed to {h}p; 'file' now points at "
+                                      "the downscaled copy ('raw_file' is the original)")
                     break
         tool_log.log_tool("fetch_media", True, digest=digest, url=url, max_height=max_height,
                           size_mb=verdict["size_mb"], fits=verdict["fits"], prepared="prepared" in result)

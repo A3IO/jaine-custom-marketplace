@@ -1,7 +1,7 @@
 ---
 name: consult
-description: "Lightweight conversational design consultation via external AI reviewer(s) — for abstract design questions, architectural tradeoffs, and 'should I X or Y?' decisions before any artifact exists. Single-codex by default; add --panel for a 3-model (codex+grok+agy) parallel find-holes panel, or --panel --repo for informed multi-model review of a real codebase. Triggers on 'help me choose between', 'compare options', 'talk through this architecture', 'what tradeoffs am I missing', 'what am I overlooking', 'find the holes', 'sanity check', 'ask all three models', 'Помоги выбрать', 'обсудим архитектурное решение', 'какие тут компромиссы', 'спроси codex', 'спроси все три модели'. Do NOT use single-consult to review a file/diff on disk as the target — use bulldozer:check, or --panel --repo for a multi-model read of real code (a question that merely names a file as context is fine)."
-argument-hint: "[design question] — or: --panel [--repo PATH] [--verdict] <question>"
+description: "Lightweight conversational design consultation via external AI reviewer(s) — for abstract design questions, architectural tradeoffs, and 'should I X or Y?' decisions before any artifact exists. Single-codex by default; add --panel for a 3-model (codex+grok+agy) parallel find-holes panel, or --panel --repo for informed multi-model review of a real codebase. Pick a single model (--codex/--grok/--agy), or add --web for opt-in deep web research (live community practice). Triggers on 'help me choose between', 'compare options', 'search the web', 'talk through this architecture', 'what tradeoffs am I missing', 'what am I overlooking', 'find the holes', 'sanity check', 'ask all three models', 'Помоги выбрать', 'обсудим архитектурное решение', 'какие тут компромиссы', 'спроси codex', 'спроси все три модели'. Do NOT use single-consult to review a file/diff on disk as the target — use bulldozer:check, or --panel --repo for a multi-model read of real code (a question that merely names a file as context is fine)."
+argument-hint: "[design question] — or: [--codex|--grok|--agy|--panel] [--web[=models]] [--repo PATH] [--verdict] <question>"
 allowed-tools: ["Bash", "Read", "AskUserQuestion"]
 ---
 
@@ -222,14 +222,23 @@ BULLDOZER_DIR=$( { [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT
   && printf '%s\n' "$CLAUDE_PLUGIN_ROOT"; } || ls -dt ~/.claude/plugins/cache/*/bulldozer/*/ 2>/dev/null | head -1 )
 PANEL="$BULLDOZER_DIR/skills/consult/scripts/consult_panel.py"
 
-# isolated find-holes (abstract question, no file access) — panel default
+# isolated find-holes (abstract question, no file access) — all three, panel default
 python3 "$PANEL" "<question>"
+
+# pick specific models (any combination); bare panel-script call = all three
+python3 "$PANEL" --grok "<question>"            # one model alone
+python3 "$PANEL" --codex --grok "<question>"    # a subset
 
 # informed find-holes (models READ the real repo) — for questions ABOUT a codebase
 python3 "$PANEL" --repo <path> "<question>"
 
 # verdict mode (per-model GO/NO-GO, no merge) — add --verdict (works with --repo too)
 python3 "$PANEL" [--repo <path>] --verdict "<question>"
+
+# --web: opt-in DEEP web research (web search + subagents). ALWAYS use the =form so it
+# can't eat the question; blanket = all selected, scoped = a comma-list.
+python3 "$PANEL" --grok --web=grok "<question>"          # web on grok only
+python3 "$PANEL" --panel --web=codex,grok "<question>"   # web on codex+grok; agy isolated
 ```
 
 The `BULLDOZER_DIR` resolver above is required because `$CLAUDE_PLUGIN_ROOT` is **not exported to the Bash tool** (#221) and the script lives in the plugin cache (`~/.claude/plugins/cache/…`), not the consumer project the Bash tool runs from.
@@ -242,25 +251,50 @@ Output: a merged `## SHARED` / `## UNIQUE` synthesis (find-holes) or a per-model
 
 **agy notes (#189):** agy prints plain text (no JSON envelope), so the parser is `parse_codex`. It persists each `-p` call's prompt+response in a per-call session dir `~/.gemini/antigravity-cli/brain/<conversationId>/` (plaintext transcripts — verified by a unique-marker probe) plus a `conversations/<id>.db`. For statelessness the run injects a unique NONCE into agy's prompt (which agy logs into its transcript); `_run_one` snapshots the brain id-set BEFORE the run and afterward deletes only NEW UUID-named dirs whose transcript carries the nonce — plus `conversations/<that-id>.db*`. A CONCURRENT agy session (e.g. the user's visual/IDE Antigravity app running at the same time) creates its own `brain/<uuid>` WITHOUT our nonce, so it is **never swept** — that is what makes the diff visual-safe (verified live: a single panel run while the GUI created 2 new dirs left all 40+ untouched). (Earlier id-via-hook capture failed in the panel-default isolated mode — agy makes ZERO tool calls there, so the hook never fired and the transcript LEAKED, #189 code-review; the nonce works in both modes. The id is validated as a full UUID and the glob anchored to `<id>.db*`, so a prefix-sibling conversation is never swept.) Note: the panel does NOT touch `~/.gemini/.../cache/projects.json`, which accumulates a harmless stale entry per run for the agy leg's temp cwd. Override the model with `BULLDOZER_AGY_MODEL` (an `agy models` label) if the default `Gemini 3.1 Pro (High)` is renamed. **Prompt framing matters:** the informed find-holes wrapper uses BEHAVIORAL wording ("where the code could behave incorrectly, surprisingly, or not as a caller expects"), NOT "holes/bugs/vulnerabilities/security" — the latter trips Gemini's safety refusal on security-flavoured code (proven on an auth file: trigger-word framing → refused ×2; behavioral framing → full review naming the same issues). The no-`write_file` clause is kept (agy, like the old gemini CLI, can otherwise save findings to a file and return empty). The retired gemini CLI returned empty `response` on informed `--repo` runs (agentic plan-mode) and was deprecated 2026-06-15; agy replaced it. Display label in the panel output stays "Gemini" (same models). Design: `docs/superpowers/specs/2026-06-02-consult-panel-design.md`.
 
+## Web lane (`--web`) — opt-in deep web research
+
+`--web` lets the selected models do **deep web research** (web search + their own subagents), grounding the answer in CURRENT real-world practice — for questions that need live community practices, not just training knowledge. Per-model: `--web=grok,agy` (scoped) or bare `--web` (blanket = all selected). **Always emit the `=` form** (or put a bare `--web` LAST): argparse otherwise binds the question to `--web` and errors (empirically confirmed). Per-model effect: codex `-c web_search="live"` (canonical key); grok drops `--no-subagents`/`--disable-web-search` but KEEPS read-only `--permission-mode plan` (verified: still spawns parallel subagents); agy's read-only hook ALLOW gains `search_web`/`read_url_content`.
+
+**READ-side only, by design.** `--web` enables web fetch/search + subagents (reading), NEVER write/shell. So `--web --repo` lets a model read your real code AND reach the web — it **reverses the #189 no-egress guarantee** (opt-in, like `--repo`: code/design can egress to the web), but it can NOT mutate the repo. Default (no `--web`) stays fully isolated / no-egress.
+
+**Output & persistence:** each web model's raw research (large, sometimes garbled by parallel subagents) is pre-compressed to a findings+URL digest before the merge (inline shows the digest); the full raw is saved to `.bulldozer/consult-<ts>/` (self-ignoring `.gitignore`; `research.md` + `raw-<model>.md`; keep-last-10) for drill-down. The default `--timeout` rises to 600 s under `--web` (research runs ~3 min).
+
 ## Logging
 
-Append **one line per COMPLETED invocation** to `~/.claude/hooks/bulldozer-consult.log` — log at completion (when the verdict is known), NOT at start. (A survey found 903/912 lines were start-only stubs with `verdict=` / `tokens=0` and no completion data — log once, after Step 5 — #107.)
+Two kinds of line land in `~/.claude/hooks/bulldozer-consult.log`, told apart by their fields:
 
-**Strict schema** — these 8 fields, this order, `key=value` separated by ` | `:
+**1. Start-marker** — the `UserPromptSubmit` hook (`hooks/hooks.json`) writes one lean line the moment `/bulldozer:consult` is typed. It records only that an invocation started — nothing has run yet, so it carries NO `verdict`/`tokens`/`model`:
+
+```
+<ISO8601-ts> | event=consult-invoke | project=<P>
+```
+
+(#107 lesson: the marker used to carry always-empty `verdict=` / `tokens=0` / `model=`; those were dropped — empty fields read as *missing completion data*, not telemetry.)
+
+**2. Completion line** — one line per COMPLETED invocation, when the outcome is known. The panel path (`--panel` / per-model `--codex`/`--grok`/`--agy` / `--web`) writes it **deterministically** from `consult_panel.py::_log_completion`; the inline single-codex flow writes it from Step 6 below. Two shapes, both metadata-only:
+
+**Inline single-codex** — `model=` (one model), written by Step 6. Strict 8 fields, this order:
 
 ```
 <ISO8601-ts> | session=<S> | round=<N> | verdict=<V> | tokens=<T> | time=<X>s | model=<M> | project=<P>
 2026-05-25T03:15:00+03:00 | session=f7186873 | round=1 | verdict=GO | tokens=4500 | time=4.3s | model=gpt-5.5 | project=/path/to/repo
 ```
 
+**Panel / per-model / `--web`** — `models=` (comma list) + `web=`, written by the script:
+
+```
+<ISO8601-ts> | session=<S> | round=1 | verdict=<V> | tokens=NA | time=<X>s | models=<m,…> | web=<m,…> | project=<P>
+2026-06-22T00:30:08+07:00 | session=NA | round=1 | verdict=find-holes | tokens=NA | time=12.4s | models=codex,grok | web=codex | project=/path/to/repo
+```
+
 | Field | Value — and the ONLY accepted "no data" form |
 |-------|---------|
 | `session` | `${CLAUDE_CODE_SESSION_ID:0:8}`; `NA` if unset — **never the project name** |
-| `round` | integer ≥ 1 |
-| `verdict` | exactly one of `GO` / `NO-GO` / `MINOR-FIXES` / `INCONCLUSIVE` — **never `TBD` or empty** |
-| `tokens` | integer; `NA` if codex didn't report it — **one sentinel, not `N/A`/`na`/`-`/`~`/``/`0`** |
+| `round` | integer ≥ 1 (panel is single-shot → always `1`) |
+| `verdict` | inline: `GO` / `NO-GO` / `MINOR-FIXES` / `INCONCLUSIVE`. Panel: `find-holes` (no GO/NO-GO) · the collapsed per-model verdict or `mixed` (disagreement) in `--verdict` mode · `ERROR` (all models failed). **Never `TBD` or empty.** |
+| `tokens` | inline: integer, `NA` if codex didn't report it. Panel: always `NA` (no per-model token capture yet). **One sentinel, not `N/A`/`na`/`-`/`~`/``/`0`.** |
 | `time` | seconds, one decimal, `s` suffix (e.g. `4.3s`) |
-| `model` | the `-m` model id |
+| `model` / `models` | inline: the `-m` model id. Panel: comma-joined selected models (plus `web=` = the subset doing web research, empty when none) |
 | `project` | `git rev-parse --show-toplevel 2>/dev/null \|\| pwd` |
 
 **What we do NOT log:** the prompt content, the verdict body, any user-supplied text. Only metadata. This is a deliberate privacy property — see "What we don't do".

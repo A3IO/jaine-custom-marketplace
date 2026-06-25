@@ -87,10 +87,59 @@ def test_allows_public_literal_ip():
     assert fetch.validate_url("https://8.8.8.8/video.mp4") is None
 
 
+# --- is_url / is_youtube_url (native-YouTube routing in analyze_media, #229) ---
+
+def test_is_url_true_for_http_and_https():
+    assert fetch.is_url("https://youtu.be/abc") is True
+    assert fetch.is_url("http://example.com/v.mp4") is True
+
+
+def test_is_url_false_for_local_paths():
+    assert fetch.is_url("/Users/it/clip.mp4") is False
+    assert fetch.is_url("clip.mp4") is False
+    assert fetch.is_url("~/videos/x.MP4") is False
+    assert fetch.is_url("") is False
+
+
+def test_is_youtube_url_accepts_known_hosts():
+    assert fetch.is_youtube_url("https://www.youtube.com/watch?v=abc") is True
+    assert fetch.is_youtube_url("https://youtu.be/abc") is True
+    assert fetch.is_youtube_url("https://m.youtube.com/watch?v=abc") is True
+    assert fetch.is_youtube_url("https://youtube.com/shorts/abc") is True
+
+
+def test_is_youtube_url_rejects_non_youtube():
+    assert fetch.is_youtube_url("https://vimeo.com/123") is False
+    assert fetch.is_youtube_url("https://example.com/v.mp4") is False
+    assert fetch.is_youtube_url("/local/clip.mp4") is False
+
+
+def test_is_youtube_url_rejects_lookalike_host():
+    # host must MATCH, not substring-contain — a lookalike domain is NOT YouTube (no native pass).
+    assert fetch.is_youtube_url("https://youtube.com.evil.com/x") is False
+    assert fetch.is_youtube_url("https://notyoutube.com/x") is False
+    assert fetch.is_youtube_url("https://youtu.be.evil.com/x") is False
+
+
+def test_is_youtube_url_requires_http_scheme():
+    # codex P3: a YouTube HOST on a non-http(s) scheme is NOT a native-routable URL — it must
+    # not bypass the http(s) gate and get handed straight to Gemini as a fileUri.
+    assert fetch.is_youtube_url("ftp://youtube.com/watch?v=x") is False
+    assert fetch.is_youtube_url("//youtube.com/watch?v=x") is False        # protocol-relative
+
+
 # --- _safe_height (clamp so a huge value can't disable the download-time quality cap) ---
 
 def test_safe_height_clamps_absurdly_large():
-    assert fetch._safe_height(999999) == 2160
+    assert fetch._safe_height(999999) == 1080
+
+
+def test_safe_height_caps_4k_at_1080():
+    # #230: 4K (and 2K) downloads break analyze_media (wait_active/generate timeouts) for
+    # ZERO token/quality gain — VIDEO tokens = duration×fps×mediaResolution, source pixels
+    # are not in the formula. The practical ceiling is 1080p.
+    assert fetch._safe_height(2160) == 1080
+    assert fetch._safe_height(1440) == 1080
 
 
 def test_safe_height_clamps_zero_and_negative():
@@ -100,6 +149,7 @@ def test_safe_height_clamps_zero_and_negative():
 
 def test_safe_height_passes_reasonable_value():
     assert fetch._safe_height(720) == 720
+    assert fetch._safe_height(1080) == 1080   # exactly at the cap — kept
 
 
 def test_download_format_string_uses_clamped_height(tmp_path, monkeypatch):
@@ -114,7 +164,7 @@ def test_download_format_string_uses_clamped_height(tmp_path, monkeypatch):
     monkeypatch.setattr(fetch.subprocess, "run", fake_run)
     fetch.download("https://8.8.8.8/v.mp4", tmp_path, max_height=999999)
     fmt = captured["cmd"][captured["cmd"].index("-f") + 1]
-    assert "2160" in fmt and "999999" not in fmt
+    assert "1080" in fmt and "2160" not in fmt and "999999" not in fmt
 
 
 def test_download_format_hard_caps_no_soft_match(tmp_path, monkeypatch):
@@ -242,3 +292,102 @@ async def test_fetch_media_preserves_prior_file_when_move_fails(tmp_path, monkey
     d2 = json.loads(await server.fetch_media("https://8.8.8.8/v.mp4"))
     assert d2["success"] is False
     assert final.read_bytes() == prior   # prior valid file NOT orphaned
+
+
+async def test_fetch_media_warns_when_output_exceeds_1080(tmp_path, monkeypatch):
+    # #230 (codex P2): the note must reflect the ACTUAL downloaded height, not the request.
+    # yt-dlp's /w fallback can still return an uncapped stream for a single-format source (a
+    # direct 4K URL with no <=1080p rendition), so fetch_media PROBES the real output.
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.media, "has_tool", lambda _n: True)
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+    monkeypatch.setattr(server.media, "probe_dimensions", lambda _p: (3840, 2160))  # 4K slipped through
+
+    def fake_download(_url, dest, **_kw):
+        f = Path(dest) / "dl.mp4"
+        shutil.copy(_VIDEO, f)
+        return f
+
+    monkeypatch.setattr(server.fetch, "download", fake_download)
+    d = json.loads(await server.fetch_media("https://8.8.8.8/v.mp4", max_height=2160))
+    assert d["success"] is True
+    assert "height_note" in d
+    assert "2160" in d["height_note"]        # reports the ACTUAL output height, not the request
+
+
+async def test_fetch_media_no_warn_when_output_within_1080(tmp_path, monkeypatch):
+    # a capped/small output (the common case) doesn't nag — EVEN if the REQUEST was >1080p.
+    # This is the codex P2 case: requested 4K but yt-dlp capped it → no footgun → no note.
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.media, "has_tool", lambda _n: True)
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+    monkeypatch.setattr(server.media, "probe_dimensions", lambda _p: (1280, 720))   # cap worked
+
+    def fake_download(_url, dest, **_kw):
+        f = Path(dest) / "dl.mp4"
+        shutil.copy(_VIDEO, f)
+        return f
+
+    monkeypatch.setattr(server.fetch, "download", fake_download)
+    d = json.loads(await server.fetch_media("https://8.8.8.8/v.mp4", max_height=2160))  # asked 4K
+    assert d["success"] is True
+    assert "height_note" not in d            # output was within 1080p → no footgun → silent
+
+
+async def test_fetch_media_downscales_escaped_4k_even_when_size_fits(tmp_path, monkeypatch):
+    # #230 (codex P2 round 2): an escaped >1080p file that FITS by size (a ~191MB 4K) would
+    # skip the size-only prepare backstop and hand the caller a 4K file → analyze_media
+    # timeouts persist. When the REAL output exceeds 1080p, prepare must downscale anyway and
+    # surface a safe `prepared` — a warning alone doesn't remove the footgun.
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.media, "has_tool", lambda _n: True)
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+    monkeypatch.setattr(server.media, "probe_dimensions", lambda _p: (3840, 2160))   # 4K slipped through
+    monkeypatch.setattr(server.media, "fits", lambda _p: {"fits": True, "size_mb": 191.0})  # fits by size
+
+    captured = {}
+
+    def fake_compress(_src, dst, *, height, **_kw):
+        captured["height"] = height
+        Path(dst).write_bytes(b"small")
+        return True
+
+    monkeypatch.setattr(server.media, "compress", fake_compress)
+
+    def fake_download(_url, dest, **_kw):
+        f = Path(dest) / "dl.mp4"
+        shutil.copy(_VIDEO, f)
+        return f
+
+    monkeypatch.setattr(server.fetch, "download", fake_download)
+    d = json.loads(await server.fetch_media("https://8.8.8.8/v.mp4", max_height=2160))
+    assert d["success"] is True
+    assert "prepared" in d                   # a downscaled safe file was produced despite fitting
+    assert captured["height"] <= 1080        # downscaled to within the practical ceiling
+    assert "height_note" in d                # raw file still flagged as >1080p
+    # codex P2 r3: `file` is the PRIMARY analyzable path (the docstring says "analyze `file`"),
+    # so after a successful backstop it must point at the SAFE downscaled copy, not the 4K raw.
+    assert d["file"] == d["prepared"]        # primary path is the safe one
+    assert "compressed_" in d["file"]
+    assert d["raw_file"].endswith("source.mp4")   # original preserved under raw_file
+    assert d["fits"] is True                 # fits reflects the repointed (safe) file
+
+
+async def test_fetch_media_escaped_4k_respects_prepare_false(tmp_path, monkeypatch):
+    # prepare=False → don't auto-downscale (caller opted out), but STILL warn so it's not silent.
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.media, "has_tool", lambda _n: True)
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+    monkeypatch.setattr(server.media, "probe_dimensions", lambda _p: (3840, 2160))
+    monkeypatch.setattr(server.media, "fits", lambda _p: {"fits": True, "size_mb": 191.0})
+
+    def fake_download(_url, dest, **_kw):
+        f = Path(dest) / "dl.mp4"
+        shutil.copy(_VIDEO, f)
+        return f
+
+    monkeypatch.setattr(server.fetch, "download", fake_download)
+    d = json.loads(await server.fetch_media("https://8.8.8.8/v.mp4", max_height=2160, prepare=False))
+    assert d["success"] is True
+    assert "prepared" not in d               # opted out of auto-downscale
+    assert "height_note" in d                # but the footgun is still surfaced

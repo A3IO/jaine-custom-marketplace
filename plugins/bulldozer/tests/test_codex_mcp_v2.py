@@ -46,6 +46,39 @@ def _isolate_codex_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path_factory.mktemp("codex-home")))
 
 
+@pytest.fixture(autouse=True)
+def _reset_cc_stream_fixture():
+    """#264: install a fresh CCStream singleton before every test so same-process tests never
+    inherit queued frames, a partial buffer, or a sticky EOF from a prior test (the module
+    singleton _cc_stream is shared by main()/cc_read_fn/pump)."""
+    import codex_server as cs
+    cs._reset_cc_stream()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _redirect_codex_log(tmp_path_factory, monkeypatch):
+    """Hygiene: NO test (offline OR slow) writes drift/approval lines to the real
+    ~/.claude/hooks/bulldozer-codex.log. Tests that assert log contents override this
+    with their own monkeypatch.setenv in the body (runs after fixtures, so it wins).
+    Independent of CODEX_HOME, so slow/live-codex tests are NOT exempt."""
+    logdir = tmp_path_factory.mktemp("codexlog")
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logdir / "bulldozer-codex.log"))
+
+
+def test_real_codex_log_is_never_touched_by_tests(tmp_path_factory):
+    """Hygiene guard: the autouse redirect must point BULLDOZER_CODEX_LOG OFF the real
+    monitoring log for EVERY test (offline + slow), so the suite never pollutes it
+    (the cause of the uncalibratable #251 corpus)."""
+    p = os.environ.get("BULLDOZER_CODEX_LOG")
+    assert p, "BULLDOZER_CODEX_LOG must be set by the autouse redirect fixture"
+    assert "/.claude/hooks/" not in p, f"test log must not be under the real hooks dir: {p}"
+    # review E1: assert it lives under pytest's actual tmp base (robust to --basetemp), not a
+    # fragile "/tmp"/"pytest" substring heuristic that false-fails on a custom basetemp.
+    base = str(tmp_path_factory.getbasetemp())
+    assert p.startswith(base), f"redirect must be under pytest tmp base {base}, got {p}"
+
+
 # ---------------------------------------------------------------------------
 # Task 2: JsonRpcStream, classify, Reactor
 # ---------------------------------------------------------------------------
@@ -129,6 +162,473 @@ def test_reactor_reads_frames_from_both_fds_no_deadlock():
             pass
         proc.terminate()
         proc.wait()
+
+
+class _FakePipe:
+    """A pollable fd backed by an os.pipe; feed() writes the write end."""
+    def __init__(self):
+        self.r, self.w = os.pipe()
+    def feed(self, data: bytes):
+        os.write(self.w, data)
+    def fileno(self):
+        return self.r
+
+
+def test_reactor_pump_default_is_child_only(monkeypatch):
+    """watch_cc defaults False → select never includes sys.stdin (R2-F1)."""
+    import json
+    import codex_server as cs
+    child = _FakePipe()
+    r = cs.Reactor(child.fileno(), os.open(os.devnull, os.O_WRONLY))
+    captured = {}
+    real_select = cs.select.select
+    def spy(rl, wl, xl, to):
+        captured["rlist"] = list(rl)
+        return real_select(rl, wl, xl, to)
+    monkeypatch.setattr(cs.select, "select", spy)
+    child.feed(b'{"method":"x","params":{}}\n')
+    frames = r.pump(timeout=0.5)
+    assert captured["rlist"] == [child.fileno()]          # stdin NOT watched
+    assert frames and frames[0]["method"] == "x"
+    assert all("__cc__" not in f for f in frames)          # no CC tagging
+
+
+def test_reactor_pump_watch_cc_reads_cc_frame(monkeypatch):
+    """watch_cc=True → a CC stdin line is parsed and tagged __cc__; child frames untagged."""
+    import codex_server as cs
+    child = _FakePipe()
+    ccpipe = _FakePipe()
+    # Real file object so BOTH fileno() (select) AND readline() (pump) work (R1-F4).
+    monkeypatch.setattr(cs.sys, "stdin", os.fdopen(ccpipe.r))
+    r = cs.Reactor(child.fileno(), os.open(os.devnull, os.O_WRONLY))
+    ccpipe.feed(b'{"method":"notifications/cancelled","params":{"requestId":4}}\n')
+    frames = r.pump(timeout=0.5, watch_cc=True)
+    cc = [f["__cc__"] for f in frames if "__cc__" in f]
+    assert len(cc) == 1 and cc[0]["method"] == "notifications/cancelled"
+    assert cc[0]["params"]["requestId"] == 4
+
+
+def test_reactor_pump_watch_cc_tags_eof(monkeypatch):
+    """watch_cc=True → CC stdin EOF (write end closed) is tagged {"__eof__": True} (R1-F1)."""
+    import codex_server as cs
+    child = _FakePipe()
+    ccpipe = _FakePipe()
+    monkeypatch.setattr(cs.sys, "stdin", os.fdopen(ccpipe.r))
+    os.close(ccpipe.w)                                  # close write end → reader sees EOF
+    r = cs.Reactor(child.fileno(), os.open(os.devnull, os.O_WRONLY))
+    frames = r.pump(timeout=0.5, watch_cc=True)
+    cc = [f["__cc__"] for f in frames if "__cc__" in f]
+    assert cc == [{"__eof__": True}]
+
+
+# ---------------------------------------------------------------------------
+# #264: CCStream — the single CC-stdin owner (shared os.read + JsonRpcStream queue)
+# ---------------------------------------------------------------------------
+
+def _cc_stdin(monkeypatch):
+    """Point cs.sys.stdin at a fresh pipe; return the _FakePipe (write end via .feed)."""
+    import codex_server as cs
+    p = _FakePipe()
+    monkeypatch.setattr(cs.sys, "stdin", os.fdopen(p.r))
+    return p
+
+
+def test_ccstream_single_frame(monkeypatch):
+    import codex_server as cs
+    p = _cc_stdin(monkeypatch)
+    s = cs.CCStream()
+    p.feed(b'{"method":"ping"}\n')
+    assert s.next_frame(0.5) == ("frame", {"method": "ping"})
+
+
+def test_ccstream_burst_two_frames_no_second_read(monkeypatch):
+    """THE F4 FIX: two frames in ONE os.write — both delivered across two next_frame
+    calls, the 2nd WITHOUT any new write (queue-first). Under readline the 2nd line
+    would strand in the TextIOWrapper buffer (select reports fd-not-ready)."""
+    import codex_server as cs
+    p = _cc_stdin(monkeypatch)
+    s = cs.CCStream()
+    p.feed(b'{"method":"ping"}\n{"method":"notifications/cancelled"}\n')  # ONE write
+    assert s.next_frame(0.5) == ("frame", {"method": "ping"})
+    # No second feed: the 2nd frame must come from the queue.
+    assert s.next_frame(0) == ("frame", {"method": "notifications/cancelled"})
+
+
+def test_ccstream_partial_frame_across_writes(monkeypatch):
+    import codex_server as cs
+    p = _cc_stdin(monkeypatch)
+    s = cs.CCStream()
+    p.feed(b'{"id":1,')
+    assert s.next_frame(0.2) == ("none", None)        # partial → nothing yet
+    p.feed(b'"result":{}}\n')
+    assert s.next_frame(0.5) == ("frame", {"id": 1, "result": {}})
+
+
+def test_ccstream_bad_json_dropped(monkeypatch):
+    import codex_server as cs
+    p = _cc_stdin(monkeypatch)
+    s = cs.CCStream()
+    p.feed(b'not json at all\n')
+    assert s.next_frame(0.3) == ("none", None)        # JsonRpcStream drops it → none
+
+
+def test_ccstream_blank_line_dropped(monkeypatch):
+    import codex_server as cs
+    p = _cc_stdin(monkeypatch)
+    s = cs.CCStream()
+    p.feed(b'\n')
+    assert s.next_frame(0.3) == ("none", None)        # blank skipped → none
+
+
+def test_ccstream_eof_after_queued_frame(monkeypatch):
+    """A frame then EOF in the buffer: frame delivered FIRST, then eof (queue drains
+    before EOF surfaces — real bytes precede the 0-byte read)."""
+    import codex_server as cs
+    p = _cc_stdin(monkeypatch)
+    s = cs.CCStream()
+    p.feed(b'{"method":"x"}\n')
+    os.close(p.w)                                     # EOF after the frame
+    assert s.next_frame(0.5) == ("frame", {"method": "x"})
+    assert s.next_frame(0.5) == ("eof", None)
+
+
+def test_ccstream_eof_empty_queue(monkeypatch):
+    import codex_server as cs
+    p = _cc_stdin(monkeypatch)
+    s = cs.CCStream()
+    os.close(p.w)
+    assert s.next_frame(0.5) == ("eof", None)
+
+
+def test_ccstream_eof_is_sticky(monkeypatch):
+    """Once EOF, every next_frame returns eof (no re-read)."""
+    import codex_server as cs
+    p = _cc_stdin(monkeypatch)
+    s = cs.CCStream()
+    os.close(p.w)
+    assert s.next_frame(0.5) == ("eof", None)
+    assert s.next_frame(0) == ("eof", None)
+
+
+def test_ccstream_has_queued(monkeypatch):
+    import codex_server as cs
+    p = _cc_stdin(monkeypatch)
+    s = cs.CCStream()
+    assert s.has_queued() is False
+    p.feed(b'{"a":1}\n{"b":2}\n')
+    assert s.next_frame(0.5) == ("frame", {"a": 1})
+    assert s.has_queued() is True                     # 2nd frame still buffered
+    assert s.next_frame(0) == ("frame", {"b": 2})
+    assert s.has_queued() is False
+
+
+def test_reset_cc_stream_replaces_singleton(monkeypatch):
+    """_reset_cc_stream() installs a fresh CCStream (clears queue/_buf/_eof)."""
+    import codex_server as cs
+    p = _cc_stdin(monkeypatch)
+    cs._reset_cc_stream()
+    first = cs._cc_stream
+    p.feed(b'{"a":1}\n')
+    assert cs._cc_stream.next_frame(0.5) == ("frame", {"a": 1})
+    cs._reset_cc_stream()
+    assert cs._cc_stream is not first                 # new instance
+    assert cs._cc_stream.has_queued() is False        # fresh, empty
+
+
+def test_pump_watch_cc_burst_two_frames_no_strand(monkeypatch):
+    """#264 F4 REGRESSION: two CC frames in ONE os.write — pump(watch_cc=True) called twice
+    must return BOTH (one per call). Under the old readline path the 2nd line stranded in the
+    TextIOWrapper buffer (select saw the OS fd not-ready) and the 2nd pump returned no CC frame
+    — a queued cancel was missed. This is the F4 hole; RED until pump drains CCStream."""
+    import codex_server as cs
+    cs._reset_cc_stream()
+    child = _FakePipe()
+    ccpipe = _FakePipe()
+    monkeypatch.setattr(cs.sys, "stdin", os.fdopen(ccpipe.r))
+    r = cs.Reactor(child.fileno(), os.open(os.devnull, os.O_WRONLY))
+    # ONE write carrying two frames (ping + cancel), as a CC frame-batch would arrive:
+    ccpipe.feed(b'{"method":"ping"}\n'
+                b'{"method":"notifications/cancelled","params":{"requestId":7}}\n')
+    f1 = [f["__cc__"] for f in r.pump(timeout=0.5, watch_cc=True) if "__cc__" in f]
+    f2 = [f["__cc__"] for f in r.pump(timeout=0.5, watch_cc=True) if "__cc__" in f]
+    assert f1 == [{"method": "ping"}]
+    assert f2 == [{"method": "notifications/cancelled", "params": {"requestId": 7}}]
+
+
+def test_no_readline_on_cc_stdin_path():
+    """#264 grep-guard (AST-based, ignores docstrings/comments): no `sys.stdin.readline()` and
+    no `for line in sys.stdin` remain in CODE — os.read and TextIOWrapper.readline must never
+    both read the CC fd. The ONLY legitimate `sys.stdin` access is CCStream._fd()'s .fileno()."""
+    import ast
+    src = open(os.path.join(MCP_DIR, "codex_server.py"), encoding="utf-8").read()
+    tree = ast.parse(src)
+
+    def _is_sys_stdin(n):
+        return (isinstance(n, ast.Attribute) and n.attr == "stdin"
+                and isinstance(n.value, ast.Name) and n.value.id == "sys")
+
+    readline_calls, stdin_iter, stdin_attrs = [], [], []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "readline" and _is_sys_stdin(node.func.value)):
+            readline_calls.append(node.lineno)
+        if isinstance(node, ast.For) and _is_sys_stdin(node.iter):
+            stdin_iter.append(node.lineno)
+        if _is_sys_stdin(node):
+            stdin_attrs.append(node.lineno)
+
+    assert readline_calls == [], f"sys.stdin.readline() must not appear in code (lines {readline_calls})"
+    assert stdin_iter == [], f"`for line in sys.stdin` must not appear in code (lines {stdin_iter})"
+    # Exactly one sys.stdin touch in code — CCStream._fd() -> sys.stdin.fileno().
+    assert len(stdin_attrs) == 1, f"sys.stdin should be accessed exactly once (CCStream._fd); found at {stdin_attrs}"
+
+
+def test_shared_queue_handoff_cc_read_then_pump(monkeypatch):
+    """#264 bonus property: a burst [elicitation-response, cancel] in one write is split across
+    consumers — the approval-wait drain (next_frame) takes the response, and the still-queued
+    cancel surfaces in the turn-loop pump. Under readline the trailing cancel stranded in the
+    TextIOWrapper across the approval->turn-loop boundary; the shared queue hands it off."""
+    import codex_server as cs
+    cs._reset_cc_stream()
+    child = _FakePipe()
+    ccpipe = _FakePipe()
+    monkeypatch.setattr(cs.sys, "stdin", os.fdopen(ccpipe.r))
+    r = cs.Reactor(child.fileno(), os.open(os.devnull, os.O_WRONLY))
+    ccpipe.feed(b'{"id":5,"result":{"action":"accept"}}\n'
+                b'{"method":"notifications/cancelled","params":{"requestId":9}}\n')
+    # consumer 1 (approval-wait style next_frame): takes the elicitation response
+    kind, resp = cs._cc_stream.next_frame(0.5)
+    assert kind == "frame" and resp == {"id": 5, "result": {"action": "accept"}}
+    # consumer 2 (turn-loop pump): the cancel is still queued and surfaces here
+    cc = [f["__cc__"] for f in r.pump(timeout=0.5, watch_cc=True) if "__cc__" in f]
+    assert cc == [{"method": "notifications/cancelled", "params": {"requestId": 9}}]
+
+
+def _mk_ts(**over):
+    """Build a turn-state dict for _handle_child_frame / interrupt-routine unit tests."""
+    ts = {"final_message_parts": [], "usage_snapshot": {}, "retries": 0,
+          "interrupting": False, "interrupted_by": "cancel", "acc": [],
+          "manager": None, "turn_start_t": 0.0, "mcp_mode": "isolated",
+          "mcp_servers_enabled": [], "effort_val": None, "model_val": None,
+          "mode": "implement", "thread_id": "t1", "review_target": None}
+    ts.update(over)
+    return ts
+
+
+def test_handle_child_frame_accumulates_delta():
+    import codex_server as cs
+    ts = _mk_ts()
+    out = cs._handle_child_frame(
+        {"method": "item/agentMessage/delta", "params": {"delta": "hello"}}, ts)
+    assert out is None and ts["final_message_parts"] == ["hello"]
+
+
+def test_handle_child_frame_completed_returns_result():
+    import codex_server as cs
+    ts = _mk_ts(final_message_parts=["done"])
+    out = cs._handle_child_frame(
+        {"method": "turn/completed", "params": {"turn": {"status": "completed"}}}, ts)
+    assert out is not None and "error" not in out and out.get("result") == "done"
+
+
+def test_handle_child_frame_failed_status_returns_error():
+    import codex_server as cs
+    ts = _mk_ts()
+    out = cs._handle_child_frame(
+        {"method": "turn/completed", "params": {"turn": {"status": "failed"}}}, ts)
+    assert out is not None and "error" in out
+
+
+def test_build_interrupted_result_no_error_key_and_partial():
+    import codex_server as cs
+    ts = _mk_ts(mode="implement", final_message_parts=["partial work"])
+    res = cs._build_interrupted_result(ts, interrupted_by="cancel")
+    assert "error" not in res                         # F7: isError must stay false
+    assert res["status"] == "interrupted"
+    assert res["interrupted_by"] == "cancel"
+    assert res["partial_text"] == "partial work"
+    assert res["thread_warm"] is True
+    assert res["result"] == "partial work"            # implement mode shape preserved
+
+
+def test_build_interrupted_result_review_mode_shape():
+    import codex_server as cs
+    ts = _mk_ts(mode="review", final_message_parts=['{"verdict":"x","findings":[]}'])
+    res = cs._build_interrupted_result(ts, interrupted_by="timeout")
+    assert "error" not in res and res["status"] == "interrupted"
+    assert "schema_ok" in res or "verdict" in res     # review shape keys present
+
+
+def test_build_interrupted_result_teardown_thread_cold():
+    import codex_server as cs
+    ts = _mk_ts(final_message_parts=[])
+    res = cs._build_interrupted_result(ts, interrupted_by="cancel", thread_warm=False)
+    assert res["thread_warm"] is False and res["partial_text"] == ""
+
+
+def test_dispatcher_interrupted_result_not_marked_iserror():
+    """An interrupted result has no 'error' key → the dispatcher's `if 'error' in res` rule
+    keeps isError unset (a graceful partial, not a failure)."""
+    res = {"status": "interrupted", "partial_text": "", "thread_id": "t"}
+    assert ("error" in res) is False
+
+
+class _ScriptedReactor:
+    """A reactor whose pump() replays scripted frame-batches (for interrupt-routine tests)."""
+    def __init__(self, batches):
+        self._batches = list(batches)
+    def pump(self, timeout=0.1, watch_cc=False):
+        return self._batches.pop(0) if self._batches else []
+
+
+class _FakeManager:
+    def __init__(self, reactor):
+        self._reactor = reactor
+        self.writes = []
+        self._idc = 0
+        self._child = type("C", (), {"kill": lambda self: None})()
+    def _write(self, frame):
+        self.writes.append(frame)
+    def _next_id(self):
+        self._idc += 1
+        return self._idc
+
+
+def test_run_interrupt_sends_turn_interrupt_with_id_and_returns_graceful():
+    import codex_server as cs
+    # batch: the empty {} response to turn/interrupt (id==1) THEN turn/completed interrupted
+    r = _ScriptedReactor([[{"id": 1, "result": {}},
+                           {"method": "turn/completed", "params": {"turn": {"status": "interrupted"}}}]])
+    mgr = _FakeManager(r)
+    ts = _mk_ts(final_message_parts=["half"]); ts["manager"] = mgr
+    res = cs._run_interrupt(mgr, ts, turn_id="turn_1", interrupted_by="cancel")
+    assert mgr.writes[0]["method"] == "turn/interrupt"
+    assert mgr.writes[0]["id"] == 1                       # R2-F1: request, not notification
+    assert mgr.writes[0]["params"] == {"threadId": "t1", "turnId": "turn_1"}
+    assert res["status"] == "interrupted" and res["partial_text"] == "half"
+    assert res["thread_warm"] is True and "error" not in res
+    assert "_drift" not in res                            # the {} response is consumed, not drift
+
+
+def test_run_interrupt_no_completion_tears_down_cold(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setattr(cs, "_INTERRUPT_COMPLETE_TIMEOUT", 0.05)
+    r = _ScriptedReactor([])                              # child never completes
+    mgr = _FakeManager(r)
+    killed = {"n": 0}
+    mgr._child = type("C", (), {"kill": lambda self: killed.__setitem__("n", killed["n"] + 1)})()
+    ts = _mk_ts(); ts["manager"] = mgr
+    res = cs._run_interrupt(mgr, ts, turn_id="turn_1", interrupted_by="timeout")
+    assert killed["n"] == 1 and mgr._child is None
+    assert res["status"] == "interrupted" and res["thread_warm"] is False
+
+
+def test_run_interrupt_no_turn_id_tears_down_without_sending():
+    import codex_server as cs
+    r = _ScriptedReactor([]); mgr = _FakeManager(r)
+    ts = _mk_ts(); ts["manager"] = mgr
+    res = cs._run_interrupt(mgr, ts, turn_id=None, interrupted_by="cancel")
+    assert mgr.writes == []                               # nothing sent — no turnId
+    assert res["thread_warm"] is False and res["status"] == "interrupted"
+
+
+def test_route_cc_cancel_for_our_id_returns_interrupt():
+    import codex_server as cs
+    replies = []
+    f = {"method": "notifications/cancelled", "params": {"requestId": 7}}
+    assert cs._route_cc_frame(f, cc_id=7, reply_fn=lambda *a, **k: replies.append((a, k))) == "interrupt"
+    assert replies == []                        # a notification gets no reply
+
+
+def test_route_cc_cancel_for_other_id_continues():
+    import codex_server as cs
+    f = {"method": "notifications/cancelled", "params": {"requestId": 99}}
+    assert cs._route_cc_frame(f, cc_id=7, reply_fn=lambda *a, **k: None) == "continue"
+
+
+def test_route_cc_second_tools_call_gets_calltoolresult_busy():
+    import codex_server as cs
+    seen = {}
+    def reply_fn(mid, result=None, error=None):
+        seen.update(id=mid, result=result, error=error)
+    f = {"id": 12, "method": "tools/call", "params": {"name": "codex_run"}}
+    assert cs._route_cc_frame(f, cc_id=7, reply_fn=reply_fn) == "continue"
+    assert seen["id"] == 12 and seen["error"] is None
+    assert seen["result"]["isError"] is True
+    assert "already in flight" in seen["result"]["content"][0]["text"]
+
+
+def test_route_cc_ping_and_tools_list_get_valid_results():
+    import codex_server as cs
+    out = []
+    def reply_fn(mid, result=None, error=None):
+        out.append((mid, result, error))
+    assert cs._route_cc_frame({"id": 1, "method": "ping"}, 7, reply_fn) == "continue"
+    assert out[-1] == (1, {}, None)
+    assert cs._route_cc_frame({"id": 2, "method": "tools/list"}, 7, reply_fn) == "continue"
+    assert out[-1][0] == 2 and "tools" in out[-1][1]
+
+
+def test_route_cc_unparseable_or_notification_continues():
+    import codex_server as cs
+    assert cs._route_cc_frame(None, 7, lambda *a, **k: None) == "continue"
+    assert cs._route_cc_frame({"method": "notifications/foo"}, 7, lambda *a, **k: None) == "continue"
+
+
+def test_route_cc_response_shaped_frame_is_ignored():
+    """A response-shaped CC frame mid-turn (id + result, no method) is not ours to answer (R1-F3)."""
+    import codex_server as cs
+    out = []
+    assert cs._route_cc_frame({"id": 5, "result": {"action": "accept"}}, 7,
+                              lambda *a, **k: out.append(a)) == "continue"
+    assert out == []                            # no reply written to a response
+
+
+def test_route_cc_eof_marker_returns_teardown():
+    """CC stdin EOF marker → teardown (CC gone) (R1-F1)."""
+    import codex_server as cs
+    assert cs._route_cc_frame({"__eof__": True}, 7, lambda *a, **k: None) == "teardown"
+
+
+def test_interrupts_enabled_env_gate(monkeypatch):
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_CODEX_NO_INTERRUPT", raising=False)
+    assert cs._interrupts_enabled() is True
+    monkeypatch.setenv("BULLDOZER_CODEX_NO_INTERRUPT", "1")
+    assert cs._interrupts_enabled() is False
+
+
+# (#218 turn-pump interrupt INTEGRATION tests live after ExtendedFakeChild / call_codex_run,
+#  since InterruptFakeChild subclasses ExtendedFakeChild — see "Task 6 integration" below.)
+
+
+# InterruptFakeChild + _drive_interrupt + the #218 integration tests are defined below,
+# after ExtendedFakeChild / call_codex_run (see "Task 6 integration").
+
+
+def test_python_version_error_guard():
+    """#256: tomllib needs py3.11+, but .mcp.json launches a bare `python3` — the guard returns a
+    clear message (not a cryptic ModuleNotFoundError) on an old interpreter."""
+    from codex_server import _python_version_error
+    assert _python_version_error((3, 10)) is not None
+    assert "3.11" in _python_version_error((3, 10))
+    assert _python_version_error((3, 11)) is None
+    assert _python_version_error((3, 14)) is None
+
+
+def test_initialize_result_includes_routing_instructions():
+    """#256: the initialize reply carries an `instructions` routing manifest — CC injects
+    InitializeResult.instructions into the model's context on connect (CC #30135), so the model
+    can discover/choose codex_review / codex_run / codex_info (the latter two are MCP-only)."""
+    from codex_server import _initialize_result, SERVER_INSTRUCTIONS, PROTO
+    r = _initialize_result({"protocolVersion": "2025-06-18"})
+    assert r["instructions"] == SERVER_INSTRUCTIONS
+    for tok in ("codex_review", "codex_run", "codex_info", "isolated"):
+        assert tok in r["instructions"], tok
+    assert r["serverInfo"]["name"] == "bulldozer-codex"
+    assert r["protocolVersion"] == "2025-06-18"
+    assert r["capabilities"] == {"tools": {}}
+    assert _initialize_result({})["protocolVersion"] == PROTO  # falls back when caller omits it
 
 
 def test_reactor_sees_server_request_frame():
@@ -641,6 +1141,133 @@ def test_permissions_and_legacy_human_labels_round_trip():
     assert handle_server_request(msg, cc.write, cc.read)["result"]["decision"] == "approved_for_session"
 
 
+def test_permissions_accept_echoes_requested_profile():
+    """#4: accepting item/permissions/requestApproval must GRANT what codex asked
+    for — echo params['permissions'] into the response — not an empty {} (a silent
+    no-op). Schema: request/response profiles share the {fileSystem?,network?} shape."""
+    from codex_server import handle_server_request, LBL_GRANT_TURN, LBL_GRANT_SESSION, LBL_DONT_GRANT
+    requested = {"network": {"enabled": True},
+                 "fileSystem": {"entries": [{"access": "read",
+                                             "path": {"type": "path", "path": "/x"}}]}}
+
+    def run(label):
+        cc = FakeCC()
+        cc.set_answer("accept", {"label": label})
+        msg = {"id": "perm", "method": "item/permissions/requestApproval",
+               "params": {"threadId": "T", "turnId": "U", "itemId": "I",
+                          "startedAtMs": 1, "cwd": "/tmp", "reason": None,
+                          "permissions": requested}}
+        return handle_server_request(msg, cc.write, cc.read)["result"]
+
+    grant_turn = run(LBL_GRANT_TURN)
+    assert grant_turn == {"permissions": requested, "scope": "turn"}, grant_turn
+
+    grant_session = run(LBL_GRANT_SESSION)
+    assert grant_session == {"permissions": requested, "scope": "session"}, grant_session
+
+    # Decline still grants nothing (safe default preserved).
+    cc = FakeCC()
+    cc.set_answer("accept", {"label": LBL_DONT_GRANT})
+    msg = {"id": "perm2", "method": "item/permissions/requestApproval",
+           "params": {"threadId": "T", "turnId": "U", "itemId": "I",
+                      "startedAtMs": 1, "cwd": "/tmp", "reason": None,
+                      "permissions": requested}}
+    declined = handle_server_request(msg, cc.write, cc.read)["result"]
+    assert declined == {"permissions": {}, "scope": "turn"}, declined
+
+
+def test_permissions_dialog_surfaces_requested_profile():
+    """#4 safety (codex_review P1): once an accept GRANTS the requested fs/network
+    profile (not empty {}), the approval dialog MUST render what is being granted —
+    otherwise the user clicks Grant blind. Mirrors the command dialog, which shows the
+    authoritative command/cwd. The path/host are authoritative → never translated."""
+    from codex_server import handle_server_request
+    cc = FakeCC()
+    cc.set_answer("accept", {"label": "Grant for this turn"})
+    requested = {"network": {"enabled": True},
+                 "fileSystem": {"entries": [{"access": "write",
+                                             "path": {"type": "path", "path": "/etc/hosts"}}]}}
+    msg = {"id": "perm", "method": "item/permissions/requestApproval",
+           "params": {"threadId": "T", "turnId": "U", "itemId": "I",
+                      "startedAtMs": 1, "cwd": "/tmp", "reason": None,
+                      "permissions": requested}}
+    handle_server_request(msg, cc.write, cc.read)
+    dialog = _last_elicit_message(cc)
+    assert "/etc/hosts" in dialog, f"requested path not surfaced in dialog: {dialog!r}"
+    assert "write" in dialog, f"requested access mode not surfaced: {dialog!r}"
+    assert "network" in dialog.lower(), f"requested network not surfaced: {dialog!r}"
+
+
+def test_permissions_dialog_empty_profile_no_detail_line():
+    """An empty requested profile (codex asks with permissions={}) adds no payload
+    summary line — the dialog degrades to the prior header+reason shape, no crash."""
+    from codex_server import handle_server_request
+    cc = FakeCC()
+    cc.set_answer("accept", {"label": "Grant for this turn"})
+    msg = {"id": "perm", "method": "item/permissions/requestApproval",
+           "params": {"threadId": "T", "turnId": "U", "itemId": "I",
+                      "startedAtMs": 1, "cwd": "/tmp", "reason": None, "permissions": {}}}
+    r = handle_server_request(msg, cc.write, cc.read)["result"]
+    assert r == {"permissions": {}, "scope": "turn"}, r
+    # message still well-formed (no exception, has the permissions header)
+    assert _last_elicit_message(cc)
+
+
+def _perm_msg(permissions, label="Grant for this turn"):
+    """Drive a permissions approval with a given requested profile + chosen label;
+    return (result_dict, dialog_message)."""
+    from codex_server import handle_server_request
+    cc = FakeCC()
+    cc.set_answer("accept", {"label": label} if label is not None else {})
+    msg = {"id": "perm", "method": "item/permissions/requestApproval",
+           "params": {"threadId": "T", "turnId": "U", "itemId": "I",
+                      "startedAtMs": 1, "cwd": "/tmp", "reason": None,
+                      "permissions": permissions}}
+    res = handle_server_request(msg, cc.write, cc.read)["result"]
+    return res, _last_elicit_message(cc)
+
+
+def test_permissions_dialog_network_visible_even_with_large_filesystem():
+    """B (review): a large fileSystem profile must NOT truncate the security-sensitive
+    network grant off the dialog. Network appended last + a single-line summary + a
+    head-only char cap hid it; the user would grant egress they never saw."""
+    requested = {"fileSystem": {"entries": [
+        {"access": "write", "path": {"type": "path", "path": "/very/long/path/number/{:02d}/file".format(i)}}
+        for i in range(25)]},
+        "network": {"enabled": True}}
+    res, dialog = _perm_msg(requested)
+    assert res == {"permissions": requested, "scope": "turn"}, res   # grant still full+exact
+    assert "network" in dialog.lower(), f"network grant truncated off the dialog: {dialog!r}"
+
+
+def test_permissions_unknown_label_fails_closed_to_decline():
+    """C (review): #4 made grant meaningful, so an accept with an UNRECOGNIZED label
+    must fail CLOSED (grant nothing) — not silently grant the full profile. Bare accept
+    (no label) is the legitimate plain-Accept and still grants for the turn."""
+    requested = {"network": {"enabled": True}}
+    # present-but-unknown label → decline (grant nothing)
+    res_unknown, _ = _perm_msg(requested, label="Totally Bogus Label")
+    assert res_unknown == {"permissions": {}, "scope": "turn"}, res_unknown
+    # bare accept (no label key) → still grants for the turn (CC's plain Accept)
+    res_bare, _ = _perm_msg(requested, label=None)
+    assert res_bare == {"permissions": requested, "scope": "turn"}, res_bare
+
+
+def test_permissions_non_dict_requested_not_echoed():
+    """D (review): a malformed truthy non-dict permissions (e.g. a list) must NOT be
+    echoed verbatim into the grant (a schema-violating response); fail open to {}."""
+    res, _ = _perm_msg(["fileSystem", "network"])   # truthy non-dict
+    assert res == {"permissions": {}, "scope": "turn"}, res
+
+
+def test_summarize_permissions_legacy_read_write_lists():
+    """E5 (review): legacy fileSystem.read/write path-lists are summarized (not just the
+    entries form), so the user sees those paths in the dialog."""
+    from codex_server import _summarize_permissions
+    s = _summarize_permissions({"fileSystem": {"read": ["/a/r"], "write": ["/a/w"]}})
+    assert "/a/r" in s and "/a/w" in s, s
+
+
 def test_dedupe_labels_no_collision_with_preexisting_suffix():
     """_dedupe_labels must guarantee UNIQUE output labels even when a generated
     "(N)" suffix would collide with a natural input label or a prior suffix —
@@ -940,6 +1567,657 @@ def test_command_approval_schema_label_is_optional():
     assert "required" not in schema, f"label must be optional; schema={schema}"
 
 
+# ── #239 / #224: approval-dialog truncation + context surfacing ───────────
+# #239: a huge heredoc command must not flood the elicitation dialog (300-line wall,
+# decision buttons scroll off). #224: surface codex's reason / commandActions /
+# networkApprovalContext / agentMessage narrative in the SAME dialog.
+
+def test_truncate_for_display_short_text_unchanged():
+    from codex_server import _truncate_for_display
+    s = "echo hi\nls -la"
+    assert _truncate_for_display(s) == s  # fits → returned verbatim, no marker
+
+
+def test_truncate_for_display_none_is_empty():
+    from codex_server import _truncate_for_display
+    assert _truncate_for_display(None) == ""
+
+
+def test_truncate_for_display_caps_many_lines():
+    from codex_server import _truncate_for_display
+    s = "\n".join(f"line{i}" for i in range(50))
+    out = _truncate_for_display(s, max_lines=12)
+    assert out.count("\n") <= 13  # ≤12 kept lines + 1 marker line
+    assert "line0" in out and "line11" in out
+    assert "line40" not in out  # dropped tail not shown
+    assert "…" in out and "more line" in out
+
+
+def test_truncate_for_display_caps_single_long_line_by_chars():
+    from codex_server import _truncate_for_display
+    s = "a" * 5000  # single line, no newlines → must still be capped by chars
+    out = _truncate_for_display(s, max_chars=800)
+    assert len(out) < 5000
+    assert "…" in out and "more char" in out
+
+
+def test_truncate_for_display_keeps_tail_when_char_capped():
+    """codex_review P2 (round 2): a command too long by CHARS (few lines, or a huge head)
+    must STILL show its tail when tail_lines>0 — an op appended after a huge generated
+    line (rm / uv run / && …) is exactly what the truncation must keep visible."""
+    from codex_server import _truncate_for_display
+    s = "echo " + "A" * 5000 + " && rm -rf /important"
+    out = _truncate_for_display(s, max_chars=800, tail_lines=4)
+    assert out.startswith("echo ")            # head preserved
+    assert "rm -rf /important" in out          # TAIL preserved despite char-driven cap
+    assert "…" in out
+    assert len(out) < 1400                     # still bounded
+
+
+def test_summarize_command_actions_friendly_kinds():
+    from codex_server import _summarize_command_actions
+    actions = [
+        {"type": "read", "name": "foo.py", "path": "/p/foo.py", "command": "cat foo.py"},
+        {"type": "search", "query": "TODO", "command": "rg TODO"},
+        {"type": "listFiles", "path": "/p", "command": "ls /p"},
+    ]
+    out = _summarize_command_actions(actions)
+    assert "read foo.py" in out
+    assert "search 'TODO'" in out
+    assert "list /p" in out
+
+
+def test_summarize_command_actions_skips_unknown_and_nonlist():
+    from codex_server import _summarize_command_actions
+    assert _summarize_command_actions(None) == ""
+    assert _summarize_command_actions("nope") == ""
+    # 'unknown' adds nothing over the raw command → skipped
+    assert _summarize_command_actions([{"type": "unknown", "command": "weird"}]) == ""
+
+
+def _cmd_approval_msg_with(command, **extra):
+    params = {"threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1",
+              "startedAtMs": 1000, "command": command, "cwd": "/tmp"}
+    params.update(extra)
+    return {"id": "req-x", "method": "item/commandExecution/requestApproval", "params": params}
+
+
+def _last_elicit_message(cc):
+    elicit = next(r for r in cc._requests if r.get("method") == "elicitation/create")
+    return elicit["params"]["message"]
+
+
+def test_truncate_for_display_head_and_tail_keeps_both_ends():
+    """#239 security review: tail_lines keeps the FIRST and LAST lines (middle dropped) so a
+    dangerous op appended after a benign heredoc stays visible at approval time."""
+    from codex_server import _truncate_for_display
+    s = "\n".join(f"line{i}" for i in range(50))
+    out = _truncate_for_display(s, max_lines=12, tail_lines=4)
+    assert "line0" in out          # head shown
+    assert "line49" in out         # tail shown (the security point)
+    assert "line25" not in out     # middle dropped
+    assert "…" in out and "more line" in out
+    assert out.count("\n") <= 14   # head(8) + marker + tail(4) bounded
+
+
+def test_command_approval_message_truncates_long_command():
+    """#239 (grounded in the real 04ad23aa incident: cat>...<<PY ~230 lines PY; uv run pytest):
+    the heredoc body is bounded (head+tail), but the executable TAIL (uv run pytest) stays
+    visible — head-only would have hidden exactly the command being run."""
+    from codex_server import handle_server_request
+    big = ("cat > tests/t.py <<'PY'\n"
+           + "\n".join(f"x{i} = {i}" for i in range(300))
+           + "\nPY\nuv run pytest tests/t.py -v")
+    cc = FakeCC()
+    handle_server_request(_cmd_approval_msg_with(big), cc.write, cc.read)
+    msg = _last_elicit_message(cc)
+    assert msg.count("\n") < 40, f"dialog still a wall: {msg.count(chr(10))} lines"
+    assert "…" in msg and "more line" in msg
+    assert "CWD: /tmp" in msg
+    assert "cat > tests/t.py" in msg          # head shown
+    assert "uv run pytest tests/t.py -v" in msg  # TAIL shown — the executable action
+    assert "x150 = 150" not in msg            # heredoc middle dropped
+
+
+def test_command_approval_message_bounds_oversized_context_fields():
+    """#239 completeness: a huge reason / commandActions / cwd must NOT bloat the dialog
+    in spite of command truncation (panel finding E)."""
+    from codex_server import handle_server_request
+    cc = FakeCC()
+    handle_server_request(_cmd_approval_msg_with(
+        "echo hi",
+        cwd="/" + "d/" * 500,                              # pathological cwd
+        reason="R" * 5000,                                  # huge reason
+        commandActions=[{"type": "read", "name": "n" * 5000, "command": "cat"}],
+    ), cc.write, cc.read)
+    msg = _last_elicit_message(cc)
+    assert msg.count("\n") < 40, f"context fields bloated the dialog: {msg.count(chr(10))} lines"
+    assert len(msg) < 4000, f"dialog too large: {len(msg)} chars"
+
+
+def test_command_approval_message_short_command_no_marker():
+    """#239: a short command is shown verbatim — no truncation marker."""
+    from codex_server import handle_server_request
+    cc = FakeCC()
+    handle_server_request(_cmd_approval_msg_with("echo hi"), cc.write, cc.read)
+    msg = _last_elicit_message(cc)
+    assert "echo hi" in msg
+    assert "…" not in msg and "more line" not in msg
+
+
+def test_command_approval_message_surfaces_reason_actions_network():
+    """#224: reason + commandActions summary + networkApprovalContext host appear in the dialog."""
+    from codex_server import handle_server_request
+    cc = FakeCC()
+    handle_server_request(_cmd_approval_msg_with(
+        "curl https://api.example.com",
+        reason="needs network access",
+        commandActions=[{"type": "read", "name": "secrets.env",
+                         "path": "/p/secrets.env", "command": "cat"}],
+        networkApprovalContext={"host": "api.example.com", "protocol": "https"},
+    ), cc.write, cc.read)
+    msg = _last_elicit_message(cc)
+    assert "needs network access" in msg
+    assert "read secrets.env" in msg
+    assert "api.example.com" in msg
+
+
+def test_command_approval_message_includes_narrative_when_provided():
+    """#224: a narrative passed to bridge_approval is surfaced as 'Codex explained: …'."""
+    from codex_server import bridge_approval
+    cc = FakeCC()
+    params = {"threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1",
+              "startedAtMs": 1, "command": "echo hi", "cwd": "/tmp"}
+    bridge_approval("item/commandExecution/requestApproval", params, cc.write, cc.read,
+                    narrative="I'll run a quick sanity check first.")
+    msg = _last_elicit_message(cc)
+    assert "Codex explained:" in msg
+    assert "sanity check" in msg
+
+
+def test_filechange_approval_includes_narrative():
+    """#224: narrative is surfaced in the fileChange dialog too."""
+    from codex_server import bridge_approval
+    cc = FakeCC()
+    params = {"threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1",
+              "startedAtMs": 1, "reason": "edit file"}
+    bridge_approval("item/fileChange/requestApproval", params, cc.write, cc.read,
+                    narrative="Patching the config to add the flag.")
+    msg = _last_elicit_message(cc)
+    assert "Codex explained:" in msg
+    assert "Patching the config" in msg
+
+
+def test_permissions_approval_includes_narrative():
+    """#224: narrative is surfaced in the permissions dialog too."""
+    from codex_server import bridge_approval
+    cc = FakeCC()
+    params = {"threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1",
+              "startedAtMs": 1, "reason": "need perms"}
+    bridge_approval("item/permissions/requestApproval", params, cc.write, cc.read,
+                    narrative="Requesting write access to apply the change.")
+    msg = _last_elicit_message(cc)
+    assert "Codex explained:" in msg
+    assert "write access" in msg
+
+
+def test_command_approval_no_narrative_no_explained_line():
+    """Back-compat: no narrative → no 'Codex explained:' line."""
+    from codex_server import handle_server_request
+    cc = FakeCC()
+    handle_server_request(_cmd_approval_msg_with("echo hi"), cc.write, cc.read)
+    msg = _last_elicit_message(cc)
+    assert "Codex explained:" not in msg
+
+
+# ── #251 step-0: approval-event logging ───────────────────────────────────
+
+_APPROVAL_PARAMS = {"threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1",
+                    "startedAtMs": 1, "command": "echo hi", "cwd": "/tmp"}
+
+
+def _approval_log_fields(line):
+    """Parse ' | '-delimited key=value segments of an APPROVAL log line."""
+    return dict(seg.split("=", 1) for seg in line.split(" | ") if "=" in seg)
+
+
+def test_bridge_approval_logs_accept_event(tmp_path, monkeypatch):
+    """#251 step-0: a completed approval writes ONE APPROVAL line carrying
+    method / decision / wait_ms / timed_out."""
+    from codex_server import bridge_approval
+    logf = tmp_path / "codex.log"
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logf))
+    cc = FakeCC()  # default answer: accept
+    bridge_approval("item/commandExecution/requestApproval", dict(_APPROVAL_PARAMS),
+                    cc.write, cc.read)
+    assert logf.exists(), "approval event was not logged"
+    lines = [l for l in logf.read_text().splitlines() if "| APPROVAL |" in l]
+    assert len(lines) == 1, lines
+    f = _approval_log_fields(lines[0])
+    assert f["method"] == "item/commandExecution/requestApproval"
+    assert f["decision"] == "accept"
+    assert f["timed_out"] == "false"
+    assert int(f["wait_ms"]) >= 0
+
+
+def test_bridge_approval_logs_timeout_event(tmp_path, monkeypatch):
+    """#251 step-0: a timed-out approval logs timed_out=true plus the safe-default decision."""
+    from codex_server import bridge_approval
+    logf = tmp_path / "codex.log"
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logf))
+    cc = FakeCC()
+    cc.never_answer_elicitation()
+    decision = bridge_approval("item/commandExecution/requestApproval",
+                               dict(_APPROVAL_PARAMS), cc.write, cc.read, timeout=0.05)
+    assert decision == "decline"  # safe default on no-reply
+    assert logf.exists(), "timed-out approval event was not logged"
+    lines = [l for l in logf.read_text().splitlines() if "| APPROVAL |" in l]
+    assert len(lines) == 1, lines
+    f = _approval_log_fields(lines[0])
+    assert f["timed_out"] == "true"
+    assert f["decision"] == "decline"
+
+
+def test_bridge_approval_log_best_effort_never_raises(monkeypatch):
+    """#251 step-0: logging is best-effort — an unwritable log path never breaks the approval."""
+    from codex_server import bridge_approval
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", "/nonexistent-root/x/y.log")
+    cc = FakeCC()  # default accept
+    decision = bridge_approval("item/commandExecution/requestApproval",
+                               dict(_APPROVAL_PARAMS), cc.write, cc.read)
+    assert decision == "accept"  # returned despite the unwritable log
+
+
+def test_log_approval_event_sanitizes_delimiters(tmp_path, monkeypatch):
+    """#251 step-0: a decision/method value carrying the log delimiter or a newline must NOT
+    corrupt the greppable single-line format the #251 miner parses. The CC 'action' passthrough
+    (mcpServer/elicitation/request) is free text → defend at the write boundary (review P3)."""
+    from codex_server import _log_approval_event
+    logf = tmp_path / "codex.log"
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logf))
+    _log_approval_event("m | x\ninjected", {"action": "a | b\nfake"}, 5, False)
+    physical = [l for l in logf.read_text().splitlines() if l.strip()]
+    assert len(physical) == 1, physical          # a newline in a value must not add lines
+    f = _approval_log_fields(physical[0])
+    assert "fake" in f["decision"]               # the whole value survived in ONE field
+    assert f["wait_ms"] == "5"
+    assert f["timed_out"] == "false"
+
+
+def test_approval_decision_label_amendment_dicts():
+    """#251 step-0: amendment-accept decisions log their kind, not the generic 'other' —
+    they ARE accepts ('Allow & always permit' / network-rule), and losing that defeats the
+    #251 mining this step exists to enable (codex_review P2)."""
+    from codex_server import _approval_decision_label
+    assert _approval_decision_label(
+        {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": {}}}) == "accept:execpolicy"
+    assert _approval_decision_label(
+        {"applyNetworkPolicyAmendment": {"network_policy_amendment": {}}}) == "accept:network"
+
+
+def test_narrative_streamed_before_approval_reaches_dialog():
+    """#224 main work: an agentMessage narrative streamed BEFORE an approval is threaded
+    through the pump into the elicitation dialog ('Codex explained: …')."""
+    from codex_server import codex_run_v2, AppServerManager
+
+    NARRATIVE = "I'll first read the config to understand the layout."
+
+    class _NarrativeThenApproval(ExtendedFakeChild):
+        def _dispatch(self, msg):
+            method = msg.get("method")
+            mid = msg.get("id")
+            params = msg.get("params") or {}
+            # The bridge's reply to our approval (id=APPROVE1, has result) → finish the turn.
+            if mid == "APPROVE1" and "result" in msg:
+                self._write_msg({"method": "turn/completed", "params": {
+                    "threadId": "T1",
+                    "turn": {"id": "TURN1", "items": [], "itemsView": "loaded",
+                             "status": "completed", "error": None,
+                             "startedAt": 0, "completedAt": 0, "durationMs": 10}}})
+                return
+            if method == "turn/start":
+                self.turn_start_params = params
+                # 1. ACK
+                self._write_msg({"id": mid, "result": {"turn": {
+                    "id": "TURN1", "items": [], "itemsView": "loaded",
+                    "status": "running", "error": None,
+                    "startedAt": 0, "completedAt": None, "durationMs": None}}})
+                # 2. narrative streamed BEFORE the approval (codex flushes it first)
+                self._write_msg({"method": "item/agentMessage/delta", "params": {
+                    "delta": NARRATIVE, "threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1"}})
+                # 3. approval request
+                self._write_msg({"id": "APPROVE1",
+                                 "method": "item/commandExecution/requestApproval",
+                                 "params": {"threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1",
+                                            "startedAtMs": 1, "command": "cat config.toml",
+                                            "cwd": "/tmp"}})
+                return
+            super()._dispatch(msg)
+
+    fc = _NarrativeThenApproval()
+    try:
+        m = AppServerManager(bin=fc)
+        written: list = []
+
+        def cc_write(f):
+            written.append(f)
+
+        def cc_read(timeout=10.0):
+            eid = next((w["id"] for w in reversed(written)
+                        if w.get("method") == "elicitation/create"), 1)
+            return {"id": eid, "result": {"action": "accept", "content": None}}
+
+        r = codex_run_v2({"prompt": "hi", "mcp": "isolated", "mode": "implement"},
+                         manager=m, cc_write_fn=cc_write, cc_read_fn=cc_read)
+        assert "error" not in r, r
+        elicit = next(w for w in written if w.get("method") == "elicitation/create")
+        assert "Codex explained:" in elicit["params"]["message"]
+        assert "read the config" in elicit["params"]["message"]
+    finally:
+        fc.kill()
+
+
+def test_non_narrative_request_does_not_consume_narrative(monkeypatch):
+    """Panel finding (Grok#2): the narrative offset must advance ONLY for narrative-bearing
+    approvals. A non-narrative request (tool/requestUserInput) arriving between the narrative
+    and a commandExecution approval must NOT consume the narrative — else the command approval
+    would show nothing."""
+    from codex_server import codex_run_v2, AppServerManager
+
+    NARRATIVE = "I'll inspect the layout before editing."
+
+    class _UserInputThenApproval(ExtendedFakeChild):
+        def _dispatch(self, msg):
+            method = msg.get("method")
+            mid = msg.get("id")
+            params = msg.get("params") or {}
+            if mid == "USERINPUT1" and "result" in msg:
+                # after answering the (non-narrative) user-input, emit the command approval
+                self._write_msg({"id": "APPROVE1",
+                                 "method": "item/commandExecution/requestApproval",
+                                 "params": {"threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1",
+                                            "startedAtMs": 1, "command": "vi config", "cwd": "/tmp"}})
+                return
+            if mid == "APPROVE1" and "result" in msg:
+                self._write_msg({"method": "turn/completed", "params": {
+                    "threadId": "T1",
+                    "turn": {"id": "TURN1", "items": [], "itemsView": "loaded",
+                             "status": "completed", "error": None,
+                             "startedAt": 0, "completedAt": 0, "durationMs": 10}}})
+                return
+            if method == "turn/start":
+                self.turn_start_params = params
+                self._write_msg({"id": mid, "result": {"turn": {
+                    "id": "TURN1", "items": [], "itemsView": "loaded",
+                    "status": "running", "error": None,
+                    "startedAt": 0, "completedAt": None, "durationMs": None}}})
+                # narrative streamed FIRST
+                self._write_msg({"method": "item/agentMessage/delta", "params": {
+                    "delta": NARRATIVE, "threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1"}})
+                # then a NON-narrative request (must not consume the narrative offset)
+                self._write_msg({"id": "USERINPUT1",
+                                 "method": "item/tool/requestUserInput",
+                                 "params": {"threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1",
+                                            "startedAtMs": 1}})
+                return
+            super()._dispatch(msg)
+
+    fc = _UserInputThenApproval()
+    try:
+        m = AppServerManager(bin=fc)
+        written: list = []
+
+        def cc_write(f):
+            written.append(f)
+
+        def cc_read(timeout=10.0):
+            eid = next((w["id"] for w in reversed(written)
+                        if w.get("method") == "elicitation/create"), 1)
+            return {"id": eid, "result": {"action": "accept", "content": {"label": "ok"}}}
+
+        r = codex_run_v2({"prompt": "hi", "mcp": "isolated", "mode": "implement"},
+                         manager=m, cc_write_fn=cc_write, cc_read_fn=cc_read)
+        assert "error" not in r, r
+        # The command approval (2nd elicitation) must still carry the narrative.
+        cmd_elicits = [w for w in written if w.get("method") == "elicitation/create"
+                       and "Command: vi config" in w["params"]["message"]]
+        assert cmd_elicits, "command approval elicitation not found"
+        assert "Codex explained:" in cmd_elicits[-1]["params"]["message"]
+        assert "inspect the layout" in cmd_elicits[-1]["params"]["message"]
+    finally:
+        fc.kill()
+
+
+# ── #247: opt-in approval-dialog localization via LiteLLM translation ──────
+# Translate codex's reason + narrative into the user's language (default off) via the
+# LiteLLM gateway; codex itself stays English. Fail-open, lazy key, batched, cached.
+
+def _clear_tr_cache():
+    import codex_server as cs
+    cs._translate_cached.cache_clear()
+
+
+def test_translate_off_when_no_lang(monkeypatch):
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_APPROVAL_LANG", raising=False)
+    called = []
+    monkeypatch.setattr(cs, "_translate_http", lambda *a, **k: called.append(1) or '["x"]')
+    assert cs._translate_texts(["hello"], cs._approval_lang()) == ["hello"]
+    assert not called, "no HTTP when lang is off"
+
+
+def test_translate_off_when_no_key(monkeypatch):
+    import codex_server as cs
+    _clear_tr_cache()
+    monkeypatch.delenv("BULLDOZER_TRANSLATE_API_KEY", raising=False)
+    monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
+    called = []
+    monkeypatch.setattr(cs, "_translate_http", lambda *a, **k: called.append(1) or '["x"]')
+    assert cs._translate_texts(["hello"], "ru") == ["hello"]
+    assert not called, "fail-open with no key, no HTTP"
+
+
+def test_translate_success(monkeypatch):
+    import codex_server as cs
+    _clear_tr_cache()
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "k")
+    monkeypatch.setattr(cs, "_translate_http",
+                        lambda endpoint, model, key, prompt, timeout: '["Привет", "Мир"]')
+    assert cs._translate_texts(["Hello", "World"], "ru") == ["Привет", "Мир"]
+
+
+def test_translate_fail_open_on_error(monkeypatch):
+    import codex_server as cs
+    _clear_tr_cache()
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "k")
+    def boom(*a, **k):
+        raise TimeoutError("slow")
+    monkeypatch.setattr(cs, "_translate_http", boom)
+    assert cs._translate_texts(["Hello", "World"], "ru") == ["Hello", "World"]
+
+
+def test_translate_fail_open_on_count_mismatch(monkeypatch):
+    import codex_server as cs
+    _clear_tr_cache()
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "k")
+    monkeypatch.setattr(cs, "_translate_http", lambda *a, **k: '["только одна"]')
+    assert cs._translate_texts(["Hello", "World"], "ru") == ["Hello", "World"]
+
+
+def test_translate_handles_multiline_via_json(monkeypatch):
+    """A multi-line narrative must round-trip (JSON batch, not line-numbering)."""
+    import codex_server as cs
+    _clear_tr_cache()
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "k")
+    monkeypatch.setattr(cs, "_translate_http",
+                        lambda *a, **k: '["строка один\\nстрока два"]')
+    assert cs._translate_texts(["line one\nline two"], "ru") == ["строка один\nстрока два"]
+
+
+def test_translate_lazy_key_read(monkeypatch):
+    """Key resolved FRESH per real (cache-miss) call, never import-frozen."""
+    import codex_server as cs
+    _clear_tr_cache()
+    seen = []
+    monkeypatch.setattr(cs, "_translate_http",
+                        lambda endpoint, model, key, prompt, timeout: seen.append(key) or '["да"]')
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "first")
+    cs._translate_texts(["Yes"], "ru")
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "second")
+    _clear_tr_cache()  # force a miss so the key is re-read
+    cs._translate_texts(["Yes"], "ru")
+    assert seen == ["first", "second"]
+
+
+def test_translate_caches_identical(monkeypatch):
+    import codex_server as cs
+    _clear_tr_cache()
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "k")
+    n = []
+    monkeypatch.setattr(cs, "_translate_http", lambda *a, **k: n.append(1) or '["кэш"]')
+    cs._translate_texts(["Cache"], "ru")
+    cs._translate_texts(["Cache"], "ru")
+    assert len(n) == 1, "second identical request is a cache hit"
+
+
+def test_dialog_labels_fallback_english():
+    import codex_server as cs
+    assert cs._dialog_labels(None)["reason"] == "Reason"
+    assert cs._dialog_labels("")["reason"] == "Reason"
+    assert cs._dialog_labels("xx")["reason"] == "Reason"   # unknown lang → EN labels
+    assert cs._dialog_labels("ru")["reason"] == "Причина"
+
+
+def test_command_message_translates_when_lang_set(monkeypatch):
+    import codex_server as cs
+    _clear_tr_cache()
+    monkeypatch.setenv("BULLDOZER_APPROVAL_LANG", "ru")
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "k")
+    monkeypatch.setattr(cs, "_translate_http",
+                        lambda *a, **k: '["Удалить временный файл", "Я создам файл"]')
+    params = {"command": "rm /tmp/x", "cwd": "/tmp", "reason": "Delete the temp file"}
+    msg = cs._build_command_approval_message(params, narrative="I will create a file")
+    assert "Удалить временный файл" in msg          # reason translated
+    assert "Я создам файл" in msg                   # narrative translated
+    assert "Запрос codex на одобрение" in msg       # localized header
+    assert "Команда:" in msg and "Причина:" in msg  # localized labels
+    assert "rm /tmp/x" in msg                       # command NEVER translated
+
+
+def test_command_message_english_when_lang_unset(monkeypatch):
+    """Back-compat: lang off → English, no HTTP."""
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_APPROVAL_LANG", raising=False)
+    called = []
+    monkeypatch.setattr(cs, "_translate_http", lambda *a, **k: called.append(1) or '["x"]')
+    params = {"command": "echo hi", "cwd": "/tmp", "reason": "because"}
+    msg = cs._build_command_approval_message(params, narrative="doing it")
+    assert "Codex approval request" in msg and "Reason: because" in msg
+    assert "Codex explained: doing it" in msg
+    assert not called, "no translation HTTP when lang is off"
+
+
+def test_simple_message_translates_when_lang_set(monkeypatch):
+    import codex_server as cs
+    _clear_tr_cache()
+    monkeypatch.setenv("BULLDOZER_APPROVAL_LANG", "ru")
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "k")
+    monkeypatch.setattr(cs, "_translate_http", lambda *a, **k: '["Изменить файл конфигурации"]')
+    msg = cs._build_simple_approval_message("filechange", "Edit the config file", None)
+    assert "Изменить файл конфигурации" in msg
+    assert "Codex: одобрение изменения файла" in msg  # localized header
+
+
+def test_translate_failure_not_cached_retries_after_recovery(monkeypatch):
+    """codex_review P3: a transient failure must NOT be cached — a later identical call retries
+    (lru_cache must not memoize the failure)."""
+    import codex_server as cs
+    _clear_tr_cache()
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "k")
+    calls = {"n": 0}
+    def flaky(endpoint, model, key, prompt, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("transient")
+        return '["восстановлено"]'
+    monkeypatch.setattr(cs, "_translate_http", flaky)
+    assert cs._translate_texts(["recover"], "ru") == ["recover"]        # 1st: fail-open
+    assert cs._translate_texts(["recover"], "ru") == ["восстановлено"]  # 2nd: retried, not cached
+
+
+def test_translate_never_raises_on_weird_http_return(monkeypatch):
+    """Defensive: even a non-string _translate_http return must fail-open, never raise into
+    the approval path."""
+    import codex_server as cs
+    _clear_tr_cache()
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "k")
+    monkeypatch.setattr(cs, "_translate_http", lambda *a, **k: {"not": "a string"})
+    assert cs._translate_texts(["x"], "ru") == ["x"]
+
+
+def test_translate_timeout_clamped(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_TIMEOUT", "9999")
+    assert cs._translate_timeout() <= 10.0
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_TIMEOUT", "0.001")
+    assert cs._translate_timeout() >= 0.5
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_TIMEOUT", "garbage")
+    assert cs._translate_timeout() == 2.5
+
+
+def test_dialog_labels_normalizes_region():
+    import codex_server as cs
+    assert cs._dialog_labels("ru-RU")["reason"] == "Причина"
+    assert cs._dialog_labels("RU")["reason"] == "Причина"
+    assert cs._dialog_labels("ru_RU")["reason"] == "Причина"
+
+
+def test_extract_json_array_tolerates_preamble():
+    import codex_server as cs
+    assert cs._extract_json_array('Sure, here: ["a", "b"]') == ["a", "b"]
+    assert cs._extract_json_array('["a", "b"]') == ["a", "b"]
+    assert cs._extract_json_array('```json\n["a"]\n```') == ["a"]
+
+
+def test_simple_message_safe_on_unknown_kind(monkeypatch):
+    """Review: an unexpected `kind` must NOT KeyError into the approval path — degrade to a
+    plain header (every other path is fail-open; this one must be too)."""
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_APPROVAL_LANG", raising=False)
+    msg = cs._build_simple_approval_message("bogus_kind", "do it", None)  # must not raise
+    assert "Reason: do it" in msg
+
+
+def test_translate_failure_is_logged(monkeypatch, tmp_path):
+    """Review: fail-open is silent → write a best-effort diagnostic line on failure so an
+    operator can tell WHY localization isn't working."""
+    import codex_server as cs
+    cs._translate_cached.cache_clear()
+    logf = tmp_path / "codex.log"
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logf))
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "k")
+    def boom(*a, **k):
+        raise TimeoutError("slow")
+    monkeypatch.setattr(cs, "_translate_http", boom)
+    assert cs._translate_texts(["x"], "ru") == ["x"]   # fail-open
+    assert "TRANSLATE_FAILED" in logf.read_text()
+
+
+def test_translate_cache_ignores_timeout_change(monkeypatch):
+    """Review: timeout is transport tuning, not a translation determinant → excluded from the
+    cache key. Changing it between identical calls must still hit cache (no re-call)."""
+    import codex_server as cs
+    cs._translate_cached.cache_clear()
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_API_KEY", "k")
+    n = []
+    monkeypatch.setattr(cs, "_translate_http", lambda *a, **k: n.append(1) or '["кэш"]')
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_TIMEOUT", "2")
+    cs._translate_texts(["Cache"], "ru")
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_TIMEOUT", "8")
+    cs._translate_texts(["Cache"], "ru")
+    assert len(n) == 1   # cache hit despite timeout change (timeout not in cache key)
+
+
 def test_handle_server_request_threads_timeout():
     """handle_server_request passes its timeout through to bridge_approval, so the
     interactive-approval wait is human-paced (default 300s) and overridable."""
@@ -961,11 +2239,13 @@ def test_handle_server_request_threads_timeout():
     assert waited and max(waited) < 1.0
 
 
-def test_elicitation_reply_id_correlation_skips_unrelated_frames():
-    """bridge_approval skips frames with id != eid and honors the matching reply.
+def test_elicitation_reply_id_correlation_answers_unrelated_request():
+    """bridge_approval correlates the elicitation reply by id, and (#269) ANSWERS an unrelated
+    id-bearing CC request (e.g. a `ping`) that arrives first — while the real reply (id == eid)
+    is still honored.
 
-    An unrelated frame (e.g. a ping or notification arriving before the real
-    elicitation reply) must be skipped; the real reply is still honored.
+    Pre-#269 the unrelated frame was silently skipped; #269 routes it through _route_cc_frame so
+    CC doesn't block on its request. The id correlation of the real reply is unchanged.
     """
     from codex_server import handle_server_request
 
@@ -975,21 +2255,20 @@ def test_elicitation_reply_id_correlation_skips_unrelated_frames():
         assert msg.get("jsonrpc") == "2.0"
         cc_written.append(msg)
 
-    # Capture eid from the elicitation/create frame, then deliver:
-    #   1. an unrelated frame (id != eid, simulating a mid-turn ping)
-    #   2. the real elicitation reply (id == eid, action=accept)
+    def _eid():
+        # the elicitation/create frame's id — NOT cc_written[-1] (a #269 pong is written too)
+        return next(f["id"] for f in cc_written if f.get("method") == "elicitation/create")
+
+    # Deliver: (1) an unrelated id-bearing request (a real ping: method + id, NO result),
+    # then (2) the real elicitation reply (id == eid, action=accept).
     call_count = [0]
 
     def cc_read(timeout=10.0):
         call_count[0] += 1
-        # The first write is the elicitation/create; extract its eid
-        eid = cc_written[-1]["id"] if cc_written else 999
         if call_count[0] == 1:
-            # Unrelated frame — different id
-            return {"jsonrpc": "2.0", "id": eid + 1000, "method": "ping", "result": {}}
-        # Real reply matching eid
-        return {"jsonrpc": "2.0", "id": eid, "result": {"action": "accept",
-                                                          "content": {"label": "accept"}}}
+            return {"jsonrpc": "2.0", "id": _eid() + 1000, "method": "ping"}
+        return {"jsonrpc": "2.0", "id": _eid(), "result": {"action": "accept",
+                                                           "content": {"label": "accept"}}}
 
     msg = {
         "id": "req-corr",
@@ -1000,9 +2279,12 @@ def test_elicitation_reply_id_correlation_skips_unrelated_frames():
         },
     }
     resp = handle_server_request(msg, cc_write, cc_read)
-    # Unrelated frame skipped; real accept reply honored → decision is "accept" string
+    # Real accept reply honored (id-correlated) → decision is "accept"
     assert resp["result"]["decision"] == "accept"
-    assert call_count[0] == 2  # skipped 1 unrelated, consumed 1 real
+    assert call_count[0] == 2  # 1 unrelated (answered), 1 real
+    # #269: the unrelated ping was ANSWERED with a {} pong, not dropped
+    pongs = [f for f in cc_written if f.get("id") == _eid() + 1000 and f.get("result") == {}]
+    assert pongs, f"unrelated ping not answered — written: {cc_written}"
 
 
 def test_command_approval_cancel_cc_action_returns_cancel():
@@ -1444,6 +2726,420 @@ def call_codex_run(fake_child_inst, prompt, mode="review", sandbox=None,
     return codex_run_v2(args, manager=manager, cc_write_fn=cc_write, cc_read_fn=cc_read)
 
 
+# ── Task 6 integration: #218 turn-pump interrupt (InterruptFakeChild + sys.stdin CC) ──
+
+class InterruptFakeChild(ExtendedFakeChild):
+    """#218 integration child: ACKs a turn (with turn.id) + one delta, then does NOT
+    auto-complete — it completes ONLY on turn/interrupt (→ status=interrupted). Variants:
+    'wait' (default), 'no_ack' (never ACK), 'review_no_turnid' (review/start ACK w/o turn.id)."""
+    def __init__(self, variant="wait"):
+        super().__init__()
+        self._variant = variant
+
+    def _dispatch(self, msg):
+        method = msg.get("method")
+        mid = msg.get("id")
+        params = msg.get("params") or {}
+        if method == "turn/start":
+            self.turn_start_params = params
+            if self._variant == "no_ack":
+                return                                       # never ACK (pre-ACK / ack-timeout tests)
+            tid = params.get("threadId", "T1")
+            self._write_msg({"id": mid, "result": {"turn": {
+                "id": "TURN1", "items": [], "status": "running", "error": None}}})
+            self._write_msg({"method": "item/agentMessage/delta",
+                             "params": {"delta": "partial", "threadId": tid, "turnId": "TURN1"}})
+            return                                           # then WAIT (no turn/completed)
+        if method == "review/start":
+            if self._variant == "review_no_turnid":
+                self._write_msg({"id": mid, "result": {
+                    "reviewThreadId": params.get("threadId", "T1")}})   # ACK without turn.id
+                return
+            super()._dispatch(msg)
+            return
+        if method == "turn/interrupt":
+            self._write_msg({"id": mid, "result": {}})       # empty {} response
+            self._write_msg({"method": "turn/completed", "params": {
+                "threadId": params.get("threadId", "T1"),
+                "turn": {"id": params.get("turnId", "TURN1"), "items": [],
+                         "status": "interrupted", "error": None}}})
+            return
+        super()._dispatch(msg)
+
+
+def _drive_interrupt(monkeypatch, fc, *, cc_frames=(), close_stdin=False, timeout=None,
+                     ack_timeout=None, mode="implement", review=False, omit_cc_id=False):
+    """Drive codex_run_v2 with a controllable sys.stdin (CC side) + a scripted child.
+    Keeps the stdin write end OPEN (no spurious EOF) unless close_stdin=True."""
+    import json
+    import codex_server as cs
+    if ack_timeout is not None:
+        monkeypatch.setattr(cs, "_ACK_TIMEOUT", ack_timeout)
+    r, w = os.pipe()
+    monkeypatch.setattr(cs.sys, "stdin", os.fdopen(r))
+    for fr in cc_frames:
+        os.write(w, (json.dumps(fr) + "\n").encode())
+    if close_stdin:
+        os.close(w)
+    m = cs.AppServerManager(bin=fc)
+    sm = cs.TurnStateMachine()
+    args = {"prompt": "hi", "mode": mode, "mcp": "isolated"}
+    if not omit_cc_id:
+        args["_cc_id"] = "CCID"
+    if timeout is not None:
+        args["timeout"] = timeout
+    if review:
+        args["_review_target"] = {"type": "uncommitted"}
+    res = cs.codex_run_v2(args, manager=m, cc_write_fn=cs.reply,
+                          cc_read_fn=lambda timeout=10: None, state_machine=sm)
+    if not close_stdin:
+        try:
+            os.close(w)
+        except OSError:
+            pass
+    return res, sm
+
+
+class _NonDictFrameChild(ExtendedFakeChild):
+    """Emits a bare JSON scalar (`42`) — a NON-dict frame — between the ACK and turn/completed,
+    to exercise the non-dict-frame guards in the turn loop / EOF scan (reviewer1 F3)."""
+    def _dispatch(self, msg):
+        if msg.get("method") == "turn/start":
+            self.turn_start_params = msg.get("params") or {}
+            mid = msg.get("id")
+            tid = (msg.get("params") or {}).get("threadId", "T1")
+            self._write_msg({"id": mid, "result": {"turn": {"id": "TURN1", "items": [], "status": "running"}}})
+            self._srv_stdout.write(b"42\n"); self._srv_stdout.flush()   # bare scalar (non-dict) frame
+            self._write_msg({"method": "item/agentMessage/delta",
+                             "params": {"delta": self._final_message, "threadId": tid, "turnId": "TURN1"}})
+            self._write_msg({"method": "turn/completed", "params": {"threadId": tid,
+                             "turn": {"id": "TURN1", "items": [], "status": "completed", "error": None}}})
+            return
+        super()._dispatch(msg)
+
+
+_CANCEL = {"method": "notifications/cancelled", "params": {"requestId": "CCID"}}
+
+
+def test_turn_midstream_cancel_interrupts_with_partial(monkeypatch):
+    fc = InterruptFakeChild("wait")
+    try:
+        res, sm = _drive_interrupt(monkeypatch, fc, cc_frames=[_CANCEL], timeout=8)
+    finally:
+        fc.kill()
+    assert res["status"] == "interrupted"
+    assert res["interrupted_by"] == "cancel"
+    assert res["partial_text"] == "partial"
+    assert "error" not in res
+    assert sm.is_busy() is False                              # state cleared
+
+
+def test_turn_optin_timeout_returns_graceful(monkeypatch):
+    monkeypatch.delenv("BULLDOZER_CODEX_NO_INTERRUPT", raising=False)
+    fc = InterruptFakeChild("wait")
+    try:
+        res, sm = _drive_interrupt(monkeypatch, fc, timeout=0.6)   # ACKs, never completes → opt-in timeout
+    finally:
+        fc.kill()
+    assert res["status"] == "interrupted" and res["interrupted_by"] == "timeout"
+    assert sm.is_busy() is False
+
+
+def test_turn_no_cc_id_completes_normally(monkeypatch):
+    """R5-F1: without _cc_id, watch=False → no stdin read → a normal turn completes."""
+    monkeypatch.delenv("BULLDOZER_CODEX_NO_INTERRUPT", raising=False)
+    fc = ExtendedFakeChild()
+    fc.script_final_message("ok done")
+    try:
+        res, sm = _drive_interrupt(monkeypatch, fc, omit_cc_id=True)
+    finally:
+        fc.kill()
+    assert res.get("status") != "interrupted"
+    assert res.get("result") == "ok done"
+
+
+def test_turn_pre_ack_cancel_no_ack_tears_down_cold(monkeypatch):
+    """Cancel pre-ACK + ACK never arrives → graceful COLD teardown (R1-F2)."""
+    fc = InterruptFakeChild("no_ack")
+    try:
+        res, sm = _drive_interrupt(monkeypatch, fc, cc_frames=[_CANCEL], ack_timeout=0.6, timeout=8)
+    finally:
+        fc.kill()
+    assert res["status"] == "interrupted" and res["thread_warm"] is False
+    assert sm.is_busy() is False
+
+
+def test_turn_stdin_eof_tears_down(monkeypatch):
+    """CC stdin EOF mid-turn → FORCED cold teardown, no turn/interrupt sent (R1-F1)."""
+    fc = InterruptFakeChild("wait")
+    try:
+        res, sm = _drive_interrupt(monkeypatch, fc, close_stdin=True, timeout=8)
+    finally:
+        fc.kill()
+    assert res["status"] == "interrupted" and res["thread_warm"] is False
+    methods = [m.get("method") for m in fc.received_msgs]
+    assert "turn/interrupt" not in methods                    # EOF teardown sends NO interrupt
+    assert sm.is_busy() is False
+
+
+def test_turn_review_missing_turn_id_interrupt_cold(monkeypatch):
+    """review/start ACK without turn.id, then cancel → cold teardown + not busy (R1-F2/R4-F1)."""
+    fc = InterruptFakeChild("review_no_turnid")
+    try:
+        res, sm = _drive_interrupt(monkeypatch, fc, cc_frames=[_CANCEL], review=True,
+                                   mode="review", timeout=8)
+    finally:
+        fc.kill()
+    assert res["status"] == "interrupted" and res["thread_warm"] is False
+    assert sm.is_busy() is False
+
+
+# ── Task 7: #252 approval-wait child drain + cancel/EOF/terminal during approval ──
+
+def _drain_ctx(reactor, ts, cc_id="CCID"):
+    return {"reactor": reactor, "ts": ts, "cc_id": cc_id}
+
+
+_CMD_APPROVAL = {"threadId": "T1", "turnId": "TURN1", "itemId": "I1",
+                 "startedAtMs": 1, "command": "echo hi", "cwd": "/tmp"}
+
+
+def test_approval_wait_drains_child_no_deadlock_keeps_deltas():
+    """#252: a child delta arriving DURING the approval wait is drained + accumulated (no
+    deadlock), and the approval reply still resolves."""
+    import codex_server as cs
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([[{"method": "item/agentMessage/delta",
+                                  "params": {"delta": "X" * 5000}}]])
+    cc = FakeCC(); cc.set_answer("accept", None)
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL), cc.write, cc.read,
+        drain_ctx=_drain_ctx(reactor, ts))
+    assert decision == "accept"                                  # reply resolved (no deadlock)
+    assert "".join(ts["final_message_parts"]) == "X" * 5000      # drained delta accumulated
+
+
+def test_cancel_during_approval_sets_flag_and_declines():
+    """A cancel (our cc_id) during the approval wait → ts['cancel_during_approval']=True and the
+    per-method decline (the existing read_correlated-None branch) is returned (F2)."""
+    import codex_server as cs
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([])
+    cancel = {"method": "notifications/cancelled", "params": {"requestId": "CCID"}}
+    state = {"n": 0}
+    def cc_read(timeout=10.0):
+        state["n"] += 1
+        return cancel if state["n"] == 1 else None
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL), lambda m: None, cc_read,
+        timeout=2.0, drain_ctx=_drain_ctx(reactor, ts))
+    assert decision == "decline"
+    assert ts.get("cancel_during_approval") is True
+
+
+def test_eof_during_approval_sets_flag_and_declines():
+    """CC stdin EOF (cc_read → _CC_EOF) during the approval wait → ts['eof_during_approval']=True
+    and a per-method decline (R6-F1)."""
+    import codex_server as cs
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([])
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL), lambda m: None,
+        lambda timeout=10.0: cs._CC_EOF, timeout=2.0, drain_ctx=_drain_ctx(reactor, ts))
+    assert decision == "decline"
+    assert ts.get("eof_during_approval") is True
+
+
+def test_terminal_error_during_approval_sets_flag_and_declines():
+    """A terminal child error during the approval wait → ts['terminal_during_approval'] holds the
+    result, and a per-method decline is returned (R1-F5)."""
+    import codex_server as cs
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([[{"method": "error", "params": {"error": {"message": "boom"}}}]])
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL), lambda m: None,
+        lambda timeout=10.0: None, timeout=2.0, drain_ctx=_drain_ctx(reactor, ts))
+    assert decision == "decline"
+    assert ts.get("terminal_during_approval") is not None
+    assert "boom" in ts["terminal_during_approval"]["error"]
+
+
+def test_id_bearing_ping_during_approval_is_answered():
+    """#269: an id-bearing CC request (e.g. `ping` keepalive) arriving during the approval wait
+    MUST be answered (`{}` pong), not dropped — else CC blocks on it and may tear down the
+    session. The turn-pump path already answers id-bearing requests; the approval wait must too.
+    RED until read_correlated routes the otherwise-skipped frame through _route_cc_frame."""
+    import codex_server as cs
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([])
+    sent = []
+    def cc_write(frame):
+        sent.append(frame)
+    ping = {"jsonrpc": "2.0", "id": 4242, "method": "ping"}
+    state = {"n": 0}
+    def cc_read(timeout=10.0):
+        state["n"] += 1
+        return ping if state["n"] == 1 else None      # ping once, then nothing → wait times out
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL), cc_write, cc_read,
+        timeout=1.0, drain_ctx=_drain_ctx(reactor, ts))
+    pongs = [f for f in sent if f.get("id") == 4242 and f.get("result") == {}]
+    assert pongs, f"ping not answered (dropped) — sent frames: {sent}"
+    assert decision == "decline"                       # ping did NOT falsely resolve the elicitation
+
+
+def test_id_bearing_toolslist_during_approval_is_answered():
+    """#269: a `tools/list` request mid-approval is answered with the tools (not dropped)."""
+    import codex_server as cs
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([])
+    sent = []
+    def cc_write(frame):
+        sent.append(frame)
+    req = {"jsonrpc": "2.0", "id": 77, "method": "tools/list"}
+    state = {"n": 0}
+    def cc_read(timeout=10.0):
+        state["n"] += 1
+        return req if state["n"] == 1 else None
+    cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL), cc_write, cc_read,
+        timeout=1.0, drain_ctx=_drain_ctx(reactor, ts))
+    answers = [f for f in sent if f.get("id") == 77 and isinstance(f.get("result"), dict)
+               and "tools" in f["result"]]
+    assert answers, f"tools/list not answered — sent frames: {sent}"
+
+
+def test_cancel_during_approval_ignored_under_killswitch(monkeypatch):
+    """Kill-switch set → a cancel during approval is IGNORED (no flag), but the drain still runs
+    and the reply resolves (F8 — #252 drain is independent of the interrupt kill-switch)."""
+    monkeypatch.setenv("BULLDOZER_CODEX_NO_INTERRUPT", "1")
+    import codex_server as cs
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([[{"method": "item/agentMessage/delta", "params": {"delta": "Y" * 5000}}]])
+    cc = FakeCC(); cc.set_answer("accept", None)
+    cancel = {"method": "notifications/cancelled", "params": {"requestId": "CCID"}}
+    state = {"n": 0}
+    def cc_read(timeout=10.0):
+        state["n"] += 1
+        return cancel if state["n"] == 1 else cc.read(timeout)
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL), cc.write, cc_read,
+        timeout=2.0, drain_ctx=_drain_ctx(reactor, ts))
+    assert decision == "accept"                              # cancel ignored, reply resolves
+    assert ts.get("cancel_during_approval") is not True      # no interrupt flag under kill-switch
+    assert "".join(ts["final_message_parts"]) == "Y" * 5000  # but the drain still ran
+
+
+# ── Dogfood fixes (codex_review + reviewers): approval-drain hardening ──
+
+def test_approval_drain_buffers_non_notification_frames():
+    """codex P1: a response/request frame (e.g. a turn/start ACK) drained during an approval is
+    BUFFERED in ts['drained_frames'] (not dropped via _handle_child_frame), so the turn loop can
+    still process it — otherwise a pre-ACK approval would falsely time out."""
+    import codex_server as cs
+    ts = _mk_ts()
+    ack = {"id": 99, "result": {"turn": {"id": "TURN1", "status": "running"}}}
+    reactor = _ScriptedReactor([[ack]])
+    cc = FakeCC(); cc.set_answer("accept", None)
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL), cc.write, cc.read,
+        timeout=2.0, drain_ctx=_drain_ctx(reactor, ts))
+    assert decision == "accept"
+    assert ts.get("drained_frames") == [ack]                 # ACK buffered, NOT dropped
+
+
+def test_approval_drain_eof_beats_same_iteration_terminal():
+    """codex P2: a terminal child frame + CC EOF in the SAME drain iteration → EOF wins
+    (eof_during_approval set; terminal NOT surfaced — it would be undeliverable to a closed CC)."""
+    import codex_server as cs
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([[{"method": "error", "params": {"error": {"message": "boom"}}}]])
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL), lambda m: None,
+        lambda timeout=10.0: cs._CC_EOF, timeout=2.0, drain_ctx=_drain_ctx(reactor, ts))
+    assert decision == "decline"
+    assert ts.get("eof_during_approval") is True
+    assert ts.get("terminal_during_approval") is None        # EOF won; terminal held, not surfaced
+
+
+def test_approval_drain_terminal_surfaced_when_no_eof():
+    """The held terminal IS surfaced when the CC side has no EOF/reply that iteration (R1-F5)."""
+    import codex_server as cs
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([[{"method": "error", "params": {"error": {"message": "boom"}}}]])
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL), lambda m: None,
+        lambda timeout=10.0: None, timeout=2.0, drain_ctx=_drain_ctx(reactor, ts))
+    assert decision == "decline"
+    assert ts.get("terminal_during_approval") is not None
+    assert "boom" in ts["terminal_during_approval"]["error"]
+
+
+def test_approval_drain_cancel_requires_cc_id():
+    """reviewer2 obs1: with cc_id=None, a cancel-without-requestId must NOT false-trigger
+    the cancel flag via `None == None`."""
+    import codex_server as cs
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([])
+    bad_cancel = {"method": "notifications/cancelled", "params": {}}   # no requestId
+    state = {"n": 0}
+    def cc_read(timeout=10.0):
+        state["n"] += 1
+        return bad_cancel if state["n"] == 1 else None
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL), lambda m: None, cc_read,
+        timeout=1.0, drain_ctx=_drain_ctx(reactor, ts, cc_id=None))
+    assert decision == "decline"                             # timed out (cancel skipped)
+    assert ts.get("cancel_during_approval") is not True
+
+
+def test_turn_loop_tolerates_non_dict_child_frame(monkeypatch):
+    """reviewer1 F3: a non-dict child frame (bare JSON scalar) in a pump batch must not crash
+    the EOF scan / __cc__ check — the turn completes normally."""
+    fc = _NonDictFrameChild()
+    fc.script_final_message("ok")
+    try:
+        res, sm = _drive_interrupt(monkeypatch, fc)
+    finally:
+        fc.kill()
+    assert "error" not in res                                # no crash / no turn-execution-error
+    assert res.get("status") != "interrupted"
+
+
+# ── Task 8: kill-switch matrix + log-once (F8) ──────────────────────────────
+
+def test_kill_switch_disables_cancel_interrupt(monkeypatch):
+    """Kill-switch set → watch=False → a mid-turn cancel is never read → the turn completes
+    normally (no interrupt). The #252 drain is unaffected (tested separately)."""
+    monkeypatch.setenv("BULLDOZER_CODEX_NO_INTERRUPT", "1")
+    fc = ExtendedFakeChild()
+    fc.script_final_message("z")
+    try:
+        res, sm = _drive_interrupt(monkeypatch, fc, cc_frames=[_CANCEL])
+    finally:
+        fc.kill()
+    assert res.get("status") != "interrupted"
+    assert res.get("result") == "z"
+
+
+def test_kill_switch_logs_once(monkeypatch, tmp_path):
+    """The kill-switch is logged ONCE per process to the stable codex log; no-op when enabled."""
+    import codex_server as cs
+    logf = tmp_path / "codex.log"
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logf))
+    if hasattr(cs._log_kill_switch_once, "_done"):
+        delattr(cs._log_kill_switch_once, "_done")
+    # enabled → no-op
+    monkeypatch.delenv("BULLDOZER_CODEX_NO_INTERRUPT", raising=False)
+    cs._log_kill_switch_once()
+    assert not logf.exists() or "INTERRUPT_DISABLED" not in logf.read_text()
+    # disabled → logs exactly once
+    monkeypatch.setenv("BULLDOZER_CODEX_NO_INTERRUPT", "1")
+    cs._log_kill_switch_once()
+    cs._log_kill_switch_once()
+    assert logf.read_text().count("INTERRUPT_DISABLED") == 1
+
+
 # ── Surface additions (2026-06-21): config-doc / codex_info / codex_review ──
 
 def test_config_param_documents_passthrough_keys():
@@ -1780,8 +3476,9 @@ def test_get_manager_singleton_spawns_from_lazy_resolution(monkeypatch):
     monkeypatch.setattr(cs, "_v2_manager", None)
     monkeypatch.setattr(cs, "_resolve_codex_bin", lambda: "/lazy/resolved/codex")
     monkeypatch.setattr(cs, "_spawn_appserver", fake_spawn)
-    monkeypatch.setattr(cs.AppServerManager, "_adopt",
-                        lambda self, child: setattr(self, "_child", child))
+    # #227b: ensure() builds a reactor from the child; stub _make_reactor (the _Stub has no
+    # real streams) — ensure() commits self._child itself on success, no _adopt anymore.
+    monkeypatch.setattr(cs.AppServerManager, "_make_reactor", lambda self, child: None)
     monkeypatch.setattr(cs.AppServerManager, "_do_initialize", lambda *a, **k: None)
     cs._get_manager().ensure([])
     assert captured["bin"] == "/lazy/resolved/codex"
@@ -1988,13 +3685,70 @@ def test_implement_mode_returns_free_text(ext_child):
 
 
 def test_codex_run_no_codex_returns_error(monkeypatch):
-    """If codex binary is absent, codex_run_v2 returns a clean error result (no manager → binary check)."""
+    """If codex binary is absent AND no warm child exists, codex_run_v2 returns a clean error
+    result (no manager → binary check) ahead of mcp validation. The explicit singleton reset
+    pins the 'no warm child' precondition: #227 part-2 relaxed the gate to skip the binary
+    requirement when a warm child could serve, so this no-codex contract now needs a guaranteed
+    childless singleton (a prior test must not leave one live)."""
     import codex_server
+    monkeypatch.setattr(codex_server, "_v2_manager", None)   # no warm child → spawn unavoidable
     monkeypatch.setattr(codex_server, "_resolve_codex_bin", lambda: "/nonexistent/codex")
     # Call codex_run_v2 directly without an explicit manager so the binary check runs
     r = codex_server.codex_run_v2({"prompt": "test"})
     assert "error" in r
     assert "codex binary not found" in r["error"]   # no-codex branch precedes mcp validation
+
+
+def test_codex_run_warm_reuse_when_binary_missing(monkeypatch):
+    """#227 part-2: a 2nd+ codex_run reuses a warm app-server child of the SAME isolation
+    signature WITHOUT the codex binary on disk (mirrors codex_info #225 P3). The binary is
+    needed only to SPAWN; a same-signature warm child left by a prior codex_run serves the
+    call even if the codex symlink was removed mid-session (an upgrade). Design C (#227b)
+    makes admitting the call safe. Exercises the real singleton dispatch path (manager=None)."""
+    import codex_server as cs
+    fake = InfoFakeChild()
+    mgr = cs.AppServerManager(bin=fake)
+    mgr.ensure([])                                   # warm child, isolation signature ()
+    assert cs._is_child_alive(mgr._child) and mgr._isolation_sig == ()
+    monkeypatch.setattr(cs, "_v2_manager", mgr)      # singleton has a live child
+    monkeypatch.setattr(cs, "_resolve_codex_bin", lambda: "/nonexistent/codex")  # binary gone mid-session
+
+    def _sentinel_start(**kw):
+        # Raised AFTER ensure() returns the warm child → proves the binary gate was skipped
+        # and the warm reuse reached thread setup (no respawn, no binary needed).
+        raise RuntimeError("REACHED_THREAD_START")
+    monkeypatch.setattr(mgr, "start_thread", _sentinel_start)
+
+    r = cs.codex_run_v2({"prompt": "x", "mcp": "all"})   # mcp='all' → signature () → warm reuse
+    assert "binary not found" not in r.get("error", ""), f"warm child must serve without binary: {r}"
+    assert "REACHED_THREAD_START" in r.get("error", ""), f"must reach thread setup via warm reuse: {r}"
+    fake.kill()
+
+
+def test_codex_run_mismatch_signature_no_binary_fails_safe(monkeypatch):
+    """#227 part-2 boundary: a DIFFERENT mcp signature needs a respawn → the binary IS
+    required. With it gone the call fails honestly, but design C (#227b) keeps the ORIGINAL
+    warm child alive — the old kill-then-spawn would have destroyed a still-usable server.
+
+    The warm child is brought up via a fake, then `_bin` is set to None so the mismatch
+    respawn takes the production singleton path (`_resolve_codex_bin()` — the monkeypatched
+    missing binary). With `bin=fake` the respawn would clone the fake class and never consult
+    the binary, replacing+killing the warm child and passing for the wrong reason (codex
+    review P2)."""
+    import codex_server as cs
+    fake = InfoFakeChild()
+    mgr = cs.AppServerManager(bin=fake)
+    mgr.ensure([])                                   # warm child, signature () == mcp 'all'
+    warm = mgr._child
+    mgr._bin = None                                  # next spawn resolves the binary lazily (real path)
+    monkeypatch.setattr(cs, "_v2_manager", mgr)
+    monkeypatch.setattr(cs, "_resolve_codex_bin", lambda: "/nonexistent/codex")  # binary gone mid-session
+    r = cs.codex_run_v2({"prompt": "x", "mcp": "isolated"})   # signature differs → respawn → binary needed
+    assert "error" in r and "ensure failed" in r["error"], \
+        f"a mismatch respawn without the binary must fail at ensure(), not the top gate: {r}"
+    assert mgr._child is warm and cs._is_child_alive(warm), \
+        "the ORIGINAL warm child must survive a failed mismatch respawn (design C)"
+    fake.kill()
 
 
 # ---------------------------------------------------------------------------
@@ -2084,6 +3838,9 @@ class TestV2Dispatcher:
             assert server_info.get("version") == _plugin_version(), (
                 f"Expected serverInfo.version={_plugin_version()!r}, got: {server_info.get('version')!r}"
             )
+            # #256: initialize carries the routing manifest end-to-end (CC injects it on connect).
+            assert "instructions" in result, f"Missing instructions in {result}"
+            assert "codex_review" in result["instructions"]
         finally:
             self._shutdown(proc)
 
@@ -2166,6 +3923,29 @@ class TestV2Dispatcher:
         finally:
             self._shutdown(proc)
 
+    def test_malformed_tools_call_params_does_not_crash_dispatcher(self):
+        """A tools/call with truthy NON-dict params (e.g. a list) must NOT crash the
+        long-lived dispatcher — it must return a guarded error reply and keep serving.
+        Regression guard: `req.get('params',{}) or {}` only coerces FALSY non-dicts — a
+        truthy list/str passes through, so every params access (arguments, name) must stay
+        INSIDE the try, or .get() raises OUTSIDE it and kills main()."""
+        proc = self._start_server()
+        try:
+            self._send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            self._recv(proc)
+            # params is a truthy list → not coerced to {} → .get() would raise
+            self._send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                              "params": [1, 2, 3]})
+            resp = self._recv(proc)   # must REPLY (not crash, not hang)
+            assert resp.get("id") == 2, f"expected a reply for the malformed frame: {resp}"
+            assert resp.get("result", {}).get("isError"), \
+                f"malformed params must yield a guarded error reply: {resp}"
+            # dispatcher must still be alive afterwards
+            self._send(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+            assert self._recv(proc).get("id") == 3, "dispatcher must survive the malformed frame"
+        finally:
+            self._shutdown(proc)
+
 
 # ---------------------------------------------------------------------------
 # Task 1 (GATING): thread/resume round-trips across a process restart.
@@ -2235,6 +4015,73 @@ def test_e2e_implement_real_appserver():
     assert "error" not in r, f"codex_run_v2 returned error: {r.get('error')}"
     assert r.get("thread_id"), f"thread_id must be non-empty, got: {r}"
     assert r.get("result"), f"result must be non-empty for implement mode, got: {r}"
+
+
+@skip_if_no_codex
+@pytest.mark.slow
+def test_e2e_turn_interrupt_real_appserver():
+    """#218 LIVE: start a long real turn, let deltas flow, then _run_interrupt → status=interrupted
+    and the app-server session stays WARM (a new thread starts on the SAME child, no process kill).
+    Mirrors /tmp/turn_interrupt_probe.py through the production interrupt routine. Allow 30-150 s."""
+    import time as _t
+    import codex_server as cs
+    mgr = cs.AppServerManager()
+    try:
+        mgr.ensure([])
+        tid = mgr.start_thread(sandbox="read-only", approval_policy="never")
+        ts = {"final_message_parts": [], "usage_snapshot": {}, "retries": 0,
+              "interrupting": False, "interrupted_by": "cancel", "acc": [],
+              "manager": mgr, "turn_start_t": _t.time(), "mcp_mode": "isolated",
+              "mcp_servers_enabled": [], "effort_val": None, "model_val": None,
+              "mode": "implement", "thread_id": tid, "review_target": None}
+        prompt = ("Produce a thorough numbered list of 80 distinct edge cases for parsing "
+                  "ISO-8601 timestamps, each with a one-sentence explanation. End with: done")
+        mid = mgr._next_id()
+        mgr._write({"id": mid, "method": "turn/start",
+                    "params": {"threadId": tid, "input": cs._turn_input(prompt)}})
+        turn_id = None
+        deltas = 0
+        t0 = _t.time()
+        while _t.time() - t0 < 150:
+            for f in mgr._reactor.pump(timeout=0.2):
+                if f.get("id") == mid and "result" in f:
+                    turn_id = ((f.get("result") or {}).get("turn") or {}).get("id")
+                if "delta" in (f.get("method") or ""):
+                    deltas += 1
+            if turn_id and deltas > 0:
+                break
+        assert turn_id, "no turn ACK within 150s"
+        res = cs._run_interrupt(mgr, ts, turn_id, "cancel")
+        assert res["status"] == "interrupted", f"expected interrupted, got: {res}"
+        assert "error" not in res
+        # WARM: a new thread starts on the SAME live child (no cold-start kill needed)
+        tid2 = mgr.start_thread(sandbox="read-only", approval_policy="never")
+        assert tid2 and tid2 != tid, "session not warm after interrupt"
+    finally:
+        try:
+            if mgr._child is not None:
+                mgr._child.kill()
+        except Exception:
+            pass
+
+
+@skip_if_no_codex
+@pytest.mark.slow
+def test_e2e_optin_timeout_graceful_real_appserver():
+    """#218 LIVE full stack: a heavy real turn + a small opt-in timeout → graceful, resumable
+    result (no crash/hang), via codex_run_v2's production interrupt path. The session is usable
+    afterward (codex_info has no cold-start crash). Allow 30-120 s."""
+    from codex_server import codex_run_v2, codex_info_v2
+    r = codex_run_v2({
+        "prompt": "Write a detailed 60-step data-migration plan, elaborating each step in a full paragraph.",
+        "mode": "implement", "mcp": "isolated", "timeout": 3,
+    })
+    assert "error" not in r, f"opt-in timeout must be graceful (no error), got: {r.get('error')}"
+    assert r.get("thread_id"), f"must carry a resumable thread_id: {r}"
+    if r.get("status") == "interrupted":
+        assert r.get("interrupted_by") == "timeout", f"interrupted_by must be 'timeout': {r}"
+    info = codex_info_v2({"query": "models"})
+    assert "error" not in info or info.get("result") is not None
 
 
 @skip_if_no_codex
@@ -2769,6 +4616,51 @@ def test_manager_ensure_clears_state_when_initialize_fails(monkeypatch):
     finally:
         fc.kill()
 
+def test_ensure_failed_respawn_preserves_warm_child(monkeypatch):
+    """#227b transactional respawn: a different-signature respawn whose initialize FAILS must
+    leave the existing warm child + its signature INTACT — the old kill-then-spawn killed the
+    warm child first, so a spawn/init failure left no usable server at all."""
+    import pytest
+    import codex_server as cs
+    from codex_server import AppServerManager, _is_child_alive
+    fc = FakeChild()
+    try:
+        m = AppServerManager(bin=fc)
+        m.ensure(["-c", "x=1"])                       # establish a warm child (real init)
+        warm = m._child
+        assert warm is not None and m._isolation_sig == ("-c", "x=1")
+        # A different-sig respawn whose initialize fails:
+        monkeypatch.setattr(cs.AppServerManager, "_do_initialize",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("init timed out")))
+        with pytest.raises(RuntimeError):
+            m.ensure(["-c", "y=2"])
+        assert m._child is warm, "warm child must survive a failed respawn (was killed-first)"
+        assert m._isolation_sig == ("-c", "x=1"), "signature must be unchanged on failed respawn"
+        assert _is_child_alive(warm), "the surviving warm child must still be alive"
+    finally:
+        fc.kill()
+
+
+def test_ensure_make_reactor_failure_kills_temp_child(monkeypatch):
+    """#227b: if _make_reactor raises AFTER the child is spawned, the temp child must be killed —
+    no leaked/zombie codex process. Requires _make_reactor to sit INSIDE the transactional try."""
+    import pytest
+    import codex_server as cs
+    killed = []
+
+    class _Stub:
+        def poll(self): return None
+        def kill(self): killed.append(True)
+
+    monkeypatch.setattr(cs, "_spawn_appserver", lambda b, a=None: _Stub())
+    monkeypatch.setattr(cs.AppServerManager, "_make_reactor",
+                        lambda self, child: (_ for _ in ()).throw(RuntimeError("no fd")))
+    m = cs.AppServerManager(bin="/bin/codex")
+    with pytest.raises(RuntimeError):
+        m.ensure([])
+    assert killed == [True], "temp child must be killed when _make_reactor fails (no zombie)"
+
+
 def test_manager_respawn_passes_new_isolation_argv_to_spawn(monkeypatch):
     """F6 (#215 review): a string-bin manager that respawns on signature change must call
     _spawn_appserver with the NEW isolation argv. The FakeChild respawn test above takes the
@@ -2786,7 +4678,9 @@ def test_manager_respawn_passes_new_isolation_argv_to_spawn(monkeypatch):
         return _Stub()
 
     monkeypatch.setattr(cs, "_spawn_appserver", fake_spawn)
-    monkeypatch.setattr(cs.AppServerManager, "_adopt", lambda self, child: setattr(self, "_child", child))
+    # #227b: stub _make_reactor (the _Stub has no real streams); ensure() commits self._child
+    # itself on a successful init — _adopt is gone.
+    monkeypatch.setattr(cs.AppServerManager, "_make_reactor", lambda self, child: None)
     monkeypatch.setattr(cs.AppServerManager, "_do_initialize", lambda *a, **k: None)
     m = cs.AppServerManager(bin="/bin/codex")
     m.ensure(["-c", "x=1"])            # first spawn
@@ -2977,8 +4871,11 @@ def test_default_has_no_work_duration_deadline(ext_child):
     r = call_codex_run(ext_child, prompt="hi", mode="implement", mcp="isolated")
     assert "error" not in r and r.get("result") is not None
 
-def test_opt_in_timeout_fires_when_set():
-    """A turn that never completes + a tiny timeout → clean timeout error (no hang)."""
+def test_opt_in_timeout_fires_when_set(monkeypatch):
+    """With the kill-switch set, a never-completing turn + a tiny timeout → LEGACY bare timeout
+    error (no hang). #218 makes the DEFAULT a graceful interrupt instead — that path is covered
+    by test_turn_optin_timeout_returns_graceful; this guards the kill-switch legacy arm (F8)."""
+    monkeypatch.setenv("BULLDOZER_CODEX_NO_INTERRUPT", "1")
     from codex_server import codex_run_v2, AppServerManager
 
     class _NeverCompletes(ExtendedFakeChild):
@@ -3174,27 +5071,32 @@ def test_fake_appserver_approval_uses_real_available_decisions():
 @skip_if_no_codex
 @pytest.mark.slow
 def test_e2e_env_secret_does_not_leak_to_codex_shell(monkeypatch):
-    """A secret in CC's env must NOT be visible to codex's shell (env allowlist).
+    """A CC-env var must NOT be visible to codex's shell (env allowlist).
     F3 (#215 review): use an EXPLICIT FRESH manager so the child is spawned AFTER the canary
     setenv. Otherwise, in the full `-m slow` suite, the module singleton (already spawned by an
     earlier slow test, BEFORE the canary existed) is warm-reused → the canary was never in the
-    child env regardless of whether the allowlist works → the test passes VACUOUSLY."""
+    child env regardless of whether the allowlist works → the test passes VACUOUSLY.
+    #238: the canary is named/valued NEUTRALLY and the prompt avoids 'secret'/'leak'/'reveal'
+    framing — the old `CANARY_SECRET_204=leak-me-if-you-can` + 'report verbatim' wording
+    intermittently tripped gpt-5.5's safety refusal ('I can't reveal environment secret values'),
+    making this LLM-nondeterministic. The allowlist check only needs a specific var to be ABSENT —
+    no secret-revealing is required."""
     import codex_server as cs
     from codex_server import codex_run_v2, AppServerManager
-    monkeypatch.setenv("CANARY_SECRET_204", "leak-me-if-you-can")
+    monkeypatch.setenv("CC_ENV_CANARY_204", "cc-env-canary-204-value")
     m = AppServerManager(bin=cs.CODEX)   # fresh child spawns NOW, after the canary setenv
     try:
         r = codex_run_v2({
-            "prompt": "Run the shell command `printenv CANARY_SECRET_204 || echo ABSENT` "
-                      "and report exactly what it printed, verbatim.",
+            "prompt": "Run the shell command `printenv CC_ENV_CANARY_204 || echo ABSENT` "
+                      "and report exactly the single line it printed.",
             "mode": "implement", "mcp": "isolated", "sandbox": "workspace-write",
             "approval_policy": "never", "cwd": "/tmp",
         }, manager=m)
         assert "error" not in r, f"turn errored: {r.get('error')}"
         out = r.get("result") or ""
-        # prove the command ACTUALLY RAN (else the secret-absence below is vacuously true).
+        # prove the command ACTUALLY RAN (else the absence check below is vacuously true).
         assert "ABSENT" in out, f"printenv did not run / report — env test is vacuous: {out!r}"
-        assert "leak-me-if-you-can" not in out, "secret leaked into codex shell"
+        assert "cc-env-canary-204-value" not in out, "CC-env var leaked into codex shell"
     finally:
         try:
             if m._child is not None:

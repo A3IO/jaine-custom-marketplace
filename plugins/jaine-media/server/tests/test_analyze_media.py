@@ -5,6 +5,7 @@ structured {success: false, error} — never crash the tool with an exception.
 The network boundary (upload + generate) is mocked; everything else is real.
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -63,6 +64,28 @@ async def test_missing_file_returns_structured_error(local_video, monkeypatch):
     monkeypatch.setattr(server.gemini_files, "compute_file_hash", _gone)
     d = json.loads(await server.analyze_media(str(local_video), "q"))
     assert d["success"] is False
+
+
+async def test_invalid_media_resolution_rejected(local_video):
+    # #232: an unrecognized media_resolution is rejected early (structured error, not silently
+    # ignored) — fires before any file/network work.
+    d = json.loads(await server.analyze_media(str(local_video), "q", media_resolution="ultra"))
+    assert d["success"] is False
+    assert "media_resolution" in d["error"]
+
+
+async def test_media_resolution_override_reaches_generate(local_video, monkeypatch):
+    # #232: a valid friendly override ('low') normalizes to the enum and reaches _generate,
+    # overriding the family-aware default (keeps OCR-on-3.x reachable).
+    captured = {}
+
+    async def _capture(*_a, **k):
+        captured["mr"] = k.get("media_resolution")
+        return ("ok", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server, "_generate", _capture)
+    await server.analyze_media(str(local_video), "q", media_resolution="low")
+    assert captured["mr"] == "MEDIA_RESOLUTION_LOW"
 
 
 async def test_httpx_timeout_returns_structured_error(local_video, monkeypatch):
@@ -260,6 +283,353 @@ async def test_no_file_given_is_structured_error(monkeypatch):
     assert "path" in d["error"].lower()
 
 
+async def test_malformed_history_is_structured_error_not_crash(local_video, monkeypatch):
+    # codex P2: a non-dict history item (caller-owned) must yield {success:false}, NOT crash the
+    # tool — the URL scan over history must run inside the never-crash try, not before it.
+    async def _gen(*_a, **_k):
+        return ("ok", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server, "_generate", _gen)
+    d = json.loads(await server.analyze_media(str(local_video), "q", history=["not-a-dict"]))
+    assert d["success"] is False
+
+
+# --- URL routing in analyze_media (#229): native YouTube vs download ---
+
+async def test_youtube_url_uses_native_passthrough(monkeypatch, tmp_path):
+    # #229: a one-shot public YouTube URL goes straight to Gemini — NO download, NO upload.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    called = {"upload": False, "download": False}
+
+    async def _no_upload(*_a, **_k):
+        called["upload"] = True
+        return FileRef(uri="files/x", name="files/x", mime_type="video/mp4", expires_at=0.0)
+
+    def _no_download(*_a, **_k):
+        called["download"] = True
+        return None
+
+    captured = {}
+
+    async def _gen(_key, refs, _q, **_k):
+        captured["refs"] = refs
+        return ("ответ", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server.gemini_files, "get_or_upload", _no_upload)
+    monkeypatch.setattr(server.fetch, "download", _no_download)
+    monkeypatch.setattr(server, "_generate", _gen)
+    d = json.loads(await server.analyze_media("https://youtu.be/abc", "о чём?"))
+    assert d["success"] is True
+    assert called["upload"] is False          # native = no upload
+    assert called["download"] is False        # native = no download
+    assert captured["refs"][0].uri == "https://youtu.be/abc"
+
+
+async def test_non_youtube_url_downloads_then_uploads(monkeypatch, tmp_path):
+    # native is YouTube-only; any other URL is downloaded (SSRF-guarded) then uploaded.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+    called = {"download": False, "upload": False}
+
+    def _download(_url, dest, **_k):
+        called["download"] = True
+        f = Path(dest) / "dl.mp4"
+        f.write_bytes(b"x")
+        return f
+
+    async def _hash(_p):
+        return "abcd1234abcd1234"
+
+    async def _upload(*_a, **_k):
+        called["upload"] = True
+        return FileRef(uri="files/u", name="files/u", mime_type="video/mp4", expires_at=0.0, state="ACTIVE")
+
+    async def _gen(*_a, **_k):
+        return ("ok", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server.fetch, "download", _download)
+    monkeypatch.setattr(server.gemini_files, "compute_file_hash", _hash)
+    monkeypatch.setattr(server.gemini_files, "get_or_upload", _upload)
+    monkeypatch.setattr(server, "_generate", _gen)
+    d = json.loads(await server.analyze_media("https://example.com/v.mp4", "q"))
+    assert d["success"] is True
+    assert called["download"] is True
+    assert called["upload"] is True
+
+
+async def test_youtube_url_with_history_downloads(monkeypatch, tmp_path):
+    # multi-turn (history) → NOT native (re-pull every turn is costly) → download+reuse.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+    called = {"download": False}
+
+    def _download(_url, dest, **_k):
+        called["download"] = True
+        f = Path(dest) / "dl.mp4"
+        f.write_bytes(b"x")
+        return f
+
+    async def _hash(_p):
+        return "h" * 16
+
+    async def _upload(*_a, **_k):
+        return FileRef(uri="files/u", name="files/u", mime_type="video/mp4", expires_at=0.0, state="ACTIVE")
+
+    async def _gen(*_a, **_k):
+        return ("ok", 0, "STOP", 0, 5)
+
+    async def _reshist(*_a, **_k):
+        return []
+
+    monkeypatch.setattr(server.fetch, "download", _download)
+    monkeypatch.setattr(server.gemini_files, "compute_file_hash", _hash)
+    monkeypatch.setattr(server.gemini_files, "get_or_upload", _upload)
+    monkeypatch.setattr(server, "_generate", _gen)
+    monkeypatch.setattr(server, "_resolve_history", _reshist)
+    hist = [{"role": "user", "text": "prev"}, {"role": "model", "text": "a"}]
+    d = json.loads(await server.analyze_media("https://youtu.be/abc", "ещё?", history=hist))
+    assert d["success"] is True
+    assert called["download"] is True         # youtube+history → download, not native
+
+
+async def test_local_path_does_not_download(local_video, monkeypatch):
+    # regression: a plain local path keeps the existing upload flow — no download attempted.
+    called = {"download": False}
+
+    def _download(*_a, **_k):
+        called["download"] = True
+        return None
+
+    async def _gen(*_a, **_k):
+        return ("ok", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server.fetch, "download", _download)
+    monkeypatch.setattr(server, "_generate", _gen)
+    d = json.loads(await server.analyze_media(str(local_video), "q"))
+    assert d["success"] is True
+    assert called["download"] is False
+
+
+async def test_non_youtube_unsafe_url_refused(monkeypatch, tmp_path):
+    # the download route keeps the SSRF guard — a private/blocked URL is refused, not fetched.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: "resolves to a non-public address")
+    d = json.loads(await server.analyze_media("http://169.254.169.254/x.mp4", "q"))
+    assert d["success"] is False
+    assert "non-public" in d["error"] or "unsafe" in d["error"].lower()
+
+
+async def test_native_result_reports_url_not_continued(monkeypatch, tmp_path):
+    # codex P2: native one-shot must report the URL as `source` + native:True — NOT continued:True
+    # (it's a fresh analysis, not a follow-up) and NOT a `file` (there is no local file).
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+
+    async def _gen(*_a, **_k):
+        return ("ответ", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server, "_generate", _gen)
+    d = json.loads(await server.analyze_media("https://youtu.be/abc", "о чём?"))
+    assert d["success"] is True
+    assert d.get("native") is True
+    assert d["source"] == "https://youtu.be/abc"
+    assert d["fileUri"] == "https://youtu.be/abc"
+    assert "continued" not in d            # a one-shot is NOT a conversation follow-up
+    assert "file" not in d                 # native has no local file
+
+
+async def test_url_download_result_reports_source_not_temp_file(monkeypatch, tmp_path):
+    # codex P2: a downloaded URL's temp file is cleaned in `finally`, so the success result must
+    # report the URL as `source`, never the already-deleted temp path as `file`.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+
+    def _download(_url, dest, **_k):
+        f = Path(dest) / "dl.mp4"
+        f.write_bytes(b"x")
+        return f
+
+    async def _hash(_p):
+        return "abcd1234abcd1234"
+
+    async def _upload(*_a, **_k):
+        return FileRef(uri="files/u", name="files/u", mime_type="video/mp4", expires_at=0.0, state="ACTIVE")
+
+    async def _gen(*_a, **_k):
+        return ("ok", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server.fetch, "download", _download)
+    monkeypatch.setattr(server.gemini_files, "compute_file_hash", _hash)
+    monkeypatch.setattr(server.gemini_files, "get_or_upload", _upload)
+    monkeypatch.setattr(server, "_generate", _gen)
+    d = json.loads(await server.analyze_media("https://example.com/v.mp4", "q"))
+    assert d["success"] is True
+    assert d["source"] == "https://example.com/v.mp4"
+    assert "file" not in d                 # never leak a deleted temp path
+
+
+async def test_multi_url_downloads_to_distinct_dirs(monkeypatch, tmp_path):
+    # codex P2: fetch.download writes a fixed dl.* name, so two URLs in ONE temp dir collide
+    # (second overwrites first → same file twice). Each URL must get its own download dir.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+    dests = []
+
+    def _download(_url, dest, **_k):
+        dests.append(str(dest))
+        f = Path(dest) / "dl.mp4"
+        f.write_bytes(b"x")
+        return f
+
+    async def _hash(p):
+        return f"hash-{Path(p).parent.name}"      # distinct per download dir
+
+    async def _upload(_key, _base, path, *_a, **_k):
+        return FileRef(uri=f"files/{path}", name="files/u", mime_type="video/mp4",
+                       expires_at=0.0, state="ACTIVE")
+
+    captured = {}
+
+    async def _gen(_key, refs, *_a, **_k):
+        captured["uris"] = [r.uri for r in refs]
+        return ("ok", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server.fetch, "download", _download)
+    monkeypatch.setattr(server.gemini_files, "compute_file_hash", _hash)
+    monkeypatch.setattr(server.gemini_files, "get_or_upload", _upload)
+    monkeypatch.setattr(server, "_generate", _gen)
+    await server.analyze_media(paths=["https://example.com/a.mp4", "https://example.com/b.mp4"],
+                               question="compare")
+    assert len(dests) == 2
+    assert dests[0] != dests[1]            # each URL downloaded into its OWN dir — no collision
+    assert captured["uris"][0] != captured["uris"][1]   # → two distinct files reach Gemini
+
+
+async def test_history_url_path_is_localized(monkeypatch, tmp_path):
+    # codex P2 r2: a URL inside history[*].paths must be DOWNLOADED+uploaded, not treated as a
+    # local file (which crashes on compute_file_hash of a nonexistent path) — the advertised
+    # YouTube+history multi-turn flow.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+    dls = []
+
+    def _download(url, dest, **_k):
+        dls.append(url)
+        f = Path(dest) / "dl.mp4"
+        f.write_bytes(b"x")
+        return f
+
+    async def _hash(p):
+        return f"h-{Path(p).parent.name}"
+
+    async def _upload(*_a, **_k):
+        return FileRef(uri="files/u", name="files/u", mime_type="video/mp4", expires_at=0.0, state="ACTIVE")
+
+    async def _gen(*_a, **_k):
+        return ("ok", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server.fetch, "download", _download)
+    monkeypatch.setattr(server.gemini_files, "compute_file_hash", _hash)
+    monkeypatch.setattr(server.gemini_files, "get_or_upload", _upload)
+    monkeypatch.setattr(server, "_generate", _gen)
+    hist = [{"role": "user", "text": "что это?", "paths": ["https://youtu.be/abc"]},
+            {"role": "model", "text": "видео про X"}]
+    d = json.loads(await server.analyze_media(question="а звук там какой?", history=hist))
+    assert d["success"] is True
+    assert "https://youtu.be/abc" in dls   # the history URL was downloaded, not hashed as a local path
+
+
+async def test_url_download_oversized_is_downscaled_before_upload(monkeypatch, tmp_path):
+    # codex P2 r3: a direct URL whose download escaped the caps (>1080p / oversized) must be
+    # downscaled BEFORE upload — parity with fetch_media's #230 backstop — else Gemini times out.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+    monkeypatch.setattr(server.media, "probe_dimensions", lambda _p: (3840, 2160))      # escaped 4K
+    monkeypatch.setattr(server.media, "fits", lambda _p: {"fits": True, "size_mb": 191.0})
+
+    compressed = {}
+
+    def _compress(_src, dst, *, height, **_k):
+        compressed["height"] = height
+        Path(dst).write_bytes(b"small")
+        return True
+
+    def _download(_url, dest, **_k):
+        f = Path(dest) / "dl.mp4"
+        f.write_bytes(b"x")
+        return f
+
+    async def _hash(p):
+        return f"h-{Path(p).name}"
+
+    uploaded = {}
+
+    async def _upload(_key, _base, path, *_a, **_k):
+        uploaded["path"] = path
+        return FileRef(uri="files/u", name="files/u", mime_type="video/mp4", expires_at=0.0, state="ACTIVE")
+
+    async def _gen(*_a, **_k):
+        return ("ok", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server.media, "compress", _compress)
+    monkeypatch.setattr(server.fetch, "download", _download)
+    monkeypatch.setattr(server.gemini_files, "compute_file_hash", _hash)
+    monkeypatch.setattr(server.gemini_files, "get_or_upload", _upload)
+    monkeypatch.setattr(server, "_generate", _gen)
+    d = json.loads(await server.analyze_media("https://example.com/huge.mp4", "q"))
+    assert d["success"] is True
+    assert compressed["height"] <= 1080            # downscaled before upload
+    assert "compressed_" in uploaded["path"]       # the UPLOADED file is the downscaled copy
+
+
+async def test_url_download_backstop_fail_open_without_ffmpeg(monkeypatch, tmp_path):
+    # codex P3: if compression can't run (ffmpeg missing → media.compress RAISES), the backstop
+    # must fail OPEN — upload the original — not crash the URL analysis (local-file analysis works
+    # without ffmpeg, so URL analysis must too).
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server.fetch, "validate_url", lambda _u: None)
+    monkeypatch.setattr(server.media, "probe_dimensions", lambda _p: (3840, 2160))  # oversized → backstop
+    monkeypatch.setattr(server.media, "fits", lambda _p: {"fits": True, "size_mb": 191.0})
+
+    def _compress_boom(*_a, **_k):
+        raise FileNotFoundError("ffmpeg not found")
+
+    def _download(_url, dest, **_k):
+        f = Path(dest) / "dl.mp4"
+        f.write_bytes(b"x")
+        return f
+
+    async def _hash(_p):
+        return "h"
+
+    uploaded = {}
+
+    async def _upload(_key, _base, path, *_a, **_k):
+        uploaded["path"] = path
+        return FileRef(uri="files/u", name="files/u", mime_type="video/mp4", expires_at=0.0, state="ACTIVE")
+
+    async def _gen(*_a, **_k):
+        return ("ok", 0, "STOP", 0, 5)
+
+    monkeypatch.setattr(server.media, "compress", _compress_boom)
+    monkeypatch.setattr(server.fetch, "download", _download)
+    monkeypatch.setattr(server.gemini_files, "compute_file_hash", _hash)
+    monkeypatch.setattr(server.gemini_files, "get_or_upload", _upload)
+    monkeypatch.setattr(server, "_generate", _gen)
+    d = json.loads(await server.analyze_media("https://example.com/huge.mp4", "q"))
+    assert d["success"] is True                    # did NOT crash — uploaded the original
+    assert uploaded["path"].endswith("dl.mp4")     # the ORIGINAL was uploaded (no downscale possible)
+
+
 async def test_list_models_returns_catalog(monkeypatch):
     # #202: a tool so the consumer sees model options instead of guessing (404s)
     monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
@@ -287,6 +657,89 @@ async def test_invalid_model_error_lists_available(local_video, monkeypatch):
 
     assert d["success"] is False
     assert "gemini-2.5-flash" in d["available_models"]
+
+
+async def test_list_models_includes_catalog_caveat(monkeypatch):
+    # #233: models.list has no retired-signal, so a listed id can still 404 on use. Say so —
+    # the tool promises "pick a model without guessing", a silent 404-risk undermines that.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+
+    async def _fake(_key):
+        return [{"id": "gemini-2.5-flash", "preview": False}]
+
+    monkeypatch.setattr(server, "_list_models", _fake)
+    d = json.loads(await server.list_models())
+    assert d["success"] is True
+    assert "note" in d and "404" in d["note"]
+
+
+async def test_list_models_flags_dead_default(monkeypatch, tmp_path):
+    # codex P2 r3: if the configured default model itself got learned-dead, _list_models filters
+    # it out of `models` but list_models would still advertise it as `default` (an unavailable id
+    # absent from the selectable catalog). Flag it instead of silently advertising a dead default.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+    default = server._model_for("analyze", None)
+
+    async def _fake(_key):                       # live catalog WITHOUT the (dead) default
+        return [{"id": "gemini-3.5-flash", "preview": False}]
+
+    monkeypatch.setattr(server, "_list_models", _fake)
+    d = json.loads(await server.list_models())
+    assert d["success"] is True
+    assert "default_note" in d                   # the absent default is flagged
+    assert default in d["default_note"]
+
+
+async def test_list_models_no_default_note_when_default_listed(monkeypatch):
+    # the common case: the default IS in the catalog → no nag.
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    default = server._model_for("analyze", None)
+
+    async def _fake(_key):
+        return [{"id": default, "preview": False}]
+
+    monkeypatch.setattr(server, "_list_models", _fake)
+    d = json.loads(await server.list_models())
+    assert "default_note" not in d
+
+
+async def test_retired_model_404_is_recorded_as_dead(local_video, monkeypatch, tmp_path):
+    # #233 learn-from-404: a "no longer available" 404 names the model as retired → record it so
+    # list_models hides it next time (self-healing, no hardcoded retired list).
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("Gemini HTTP 404: model models/gemini-3-pro-preview is no longer available")
+
+    async def _fake(_key):
+        return [{"id": "gemini-2.5-flash"}]
+
+    monkeypatch.setattr(server, "_generate", _boom)
+    monkeypatch.setattr(server, "_list_models", _fake)
+    d = json.loads(await server.analyze_media(str(local_video), "q", model="gemini-3-pro-preview"))
+    assert d["success"] is False
+    from agent import dead_models
+    assert "gemini-3-pro-preview" in dead_models.load()
+
+
+async def test_generic_404_does_not_record_dead(local_video, monkeypatch, tmp_path):
+    # a 404 that does NOT name the model as retired (a stale fileUri / unrelated resource) must
+    # NOT poison the skip-list — requiring the model id in the message guards a real model from
+    # being hidden by an unrelated failure.
+    monkeypatch.setenv("JAINE_MEDIA_DATA_DIR", str(tmp_path))
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("Gemini HTTP 404: File files/abc123 is not found")
+
+    async def _fake(_key):
+        return [{"id": "gemini-2.5-flash"}]
+
+    monkeypatch.setattr(server, "_generate", _boom)
+    monkeypatch.setattr(server, "_list_models", _fake)
+    await server.analyze_media(str(local_video), "q", model="gemini-2.5-flash")
+    from agent import dead_models
+    assert "gemini-2.5-flash" not in dead_models.load()
 
 
 async def test_history_paths_resolved_and_passed_to_generate(local_video, monkeypatch):

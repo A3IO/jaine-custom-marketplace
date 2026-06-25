@@ -39,6 +39,25 @@ def is_blocked_ip(ip: str) -> bool:
     return not addr.is_global or addr.is_unspecified
 
 
+_YOUTUBE_HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+                  "music.youtube.com")
+
+
+def is_url(s: str) -> bool:
+    """True if `s` is an http(s) URL (vs a local path). Routing primitive for #229 —
+    analyze_media accepts a URL OR a path and auto-routes."""
+    return urlparse(s).scheme in ("http", "https")
+
+
+def is_youtube_url(s: str) -> bool:
+    """True if `s` is an http(s) YouTube URL — the only host Gemini ingests NATIVELY
+    (fileData.fileUri, no download). Requires the http(s) scheme (so ftp:// or a protocol-
+    relative //youtube.com isn't handed straight to Gemini) AND matches the HOST exactly (not a
+    substring) so a lookalike domain like youtube.com.evil.com is NOT treated as YouTube."""
+    parsed = urlparse(s)
+    return parsed.scheme in ("http", "https") and (parsed.hostname or "").lower() in _YOUTUBE_HOSTS
+
+
 def validate_url(url: str) -> str | None:
     """Return an error reason if the URL is unsafe to fetch (SSRF guard), else None.
     Scope: the URL's INITIAL host only — redirects/rebind are not covered (see module doc)."""
@@ -59,12 +78,16 @@ def validate_url(url: str) -> str | None:
     return None
 
 
-_MIN_HEIGHT, _MAX_HEIGHT = 144, 2160
+# Practical ceiling is 1080p, NOT the source's max (#230): above 1080p a download breaks
+# analyze_media (wait_active/generate timeouts on a 4K file) for ZERO gain — VIDEO tokens =
+# duration×fps×mediaResolution, source pixels aren't in the formula (measured: 720p == 4K ==
+# 162008 VIDEO tokens). So 4K = ~7× traffic + broken timeouts for nothing. Hard-cap here.
+_MIN_HEIGHT, _MAX_HEIGHT = 144, 1080
 
 
 def _safe_height(max_height: int) -> int:
-    """Clamp to [144, 2160]. A caller-supplied huge value (or 0/negative) must not be
-    able to disable the download-time quality cap (resource exhaustion)."""
+    """Clamp to [144, 1080]. A caller-supplied huge value (or 0/negative) must not be able to
+    disable the download-time quality cap; >1080p is impractical for video understanding (#230)."""
     try:
         h = int(max_height)
     except (TypeError, ValueError):

@@ -12,6 +12,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import pytest
+import re
 import sqlite3
 import subprocess
 import sys
@@ -35,6 +37,14 @@ def _load_panel():
 
 
 panel = _load_panel()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_panel_writes(tmp_path, monkeypatch):
+    """Redirect the panel's two on-disk writes to a tmp dir so no test pollutes real state:
+    the --web bundle (BUNDLE_BASE) and the completion log (CONSULT_LOG)."""
+    monkeypatch.setattr(panel, "BUNDLE_BASE", tmp_path / ".bulldozer")
+    monkeypatch.setattr(panel, "CONSULT_LOG", tmp_path / "consult.log", raising=False)
 
 
 # ── §3.7 verdict classifier (single-consult parsing-fix) ──
@@ -1081,6 +1091,94 @@ def test_main_no_repo_is_isolated(tmp_path, capsys):
     assert all(c["cwd"] != str(tmp_path) for c in model_calls)
 
 
+# ── panel completion logging (deterministic telemetry, written by the script) ──
+
+
+def test_run_panel_appends_one_completion_line():
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    assert panel.CONSULT_LOG.exists(), "run_panel must write a completion line"
+    lines = panel.CONSULT_LOG.read_text().splitlines()
+    assert len(lines) == 1, f"exactly one completion line, got {lines!r}"
+    line = lines[0]
+    assert "round=1" in line
+    assert "tokens=NA" in line
+    assert "models=codex,grok,agy" in line
+    assert "verdict=find-holes" in line
+
+
+def test_completion_line_has_session_and_project_fields():
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "session=" in line and "project=" in line
+
+
+def test_completion_line_time_has_seconds_suffix():
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert re.search(r"\| time=\d+\.\d+s \|", line), line
+
+
+def test_completion_find_holes_web_field_empty():
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "| web= |" in line, line
+
+
+def test_completion_web_field_lists_web_models():
+    panel.run_panel("Q", web_models={"codex"}, runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "| web=codex |" in line, line
+
+
+def test_completion_verdict_mode_all_go_collapses_to_go():
+    def runner(cmd, env, cwd, timeout):
+        body = "VERDICT: GO"
+        out = json.dumps({"text": body}) if cmd[0] == "grok" else body
+        return panel.ModelResult(True, out, None)
+    panel.run_panel("Q", verdict_mode=True, runner=runner)
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "verdict=GO" in line, line
+
+
+def test_completion_verdict_mode_mixed_is_mixed():
+    def runner(cmd, env, cwd, timeout):
+        name = cmd[0]
+        body = "VERDICT: GO" if name == "codex" else "VERDICT: NO-GO"
+        out = json.dumps({"text": body}) if name == "grok" else body
+        return panel.ModelResult(True, out, None)
+    panel.run_panel("Q", verdict_mode=True, runner=runner)
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "verdict=mixed" in line, line
+
+
+def test_completion_total_failure_is_error():
+    panel.run_panel("Q", runner=_make_fake_runner([], fail=("codex", "grok", "agy")))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "verdict=ERROR" in line, line
+
+
+def test_logging_never_raises_when_log_unwritable(tmp_path, monkeypatch):
+    # CONSULT_LOG parent is a FILE → mkdir/open fails → run_panel must still return cleanly.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")
+    monkeypatch.setattr(panel, "CONSULT_LOG", blocker / "consult.log", raising=False)
+    out, ok = panel.run_panel("Q", runner=_make_fake_runner([]))
+    assert out and ok, "logging failure must not break the panel"
+
+
+def test_consult_hook_is_lean_marker():
+    """The UserPromptSubmit consult hook writes a lean start-marker — no always-empty
+    verdict=/tokens=/model= fields (the substantive completion line is written by
+    consult_panel.py now, so the hook only records that an invocation started)."""
+    hooks = json.loads((PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
+    ups = hooks["hooks"]["UserPromptSubmit"]
+    consult = next(h for h in ups if "bulldozer:consult" in h["matcher"])
+    cmd = consult["hooks"][0]["command"]
+    assert "event=consult-invoke" in cmd
+    for empty in ("verdict=", "tokens=", "model="):
+        assert empty not in cmd, f"lean marker must drop always-empty {empty!r}"
+
+
 # ── dogfood findings: isolation/robustness fixes (P0+P1) ──
 
 
@@ -1421,10 +1519,10 @@ def test_run_one_readonly_hook_cleans_conversation_even_on_runner_failure(tmp_pa
 
 
 def test_model_spec_prepare_returns_cmd_with_wrapped_prompt():
-    """Each spec.prepare(wrapped, repo, timeout) → (argv, env) carrying the wrapped
+    """Each spec.prepare(wrapped, repo, timeout, web) → (argv, env) carrying the wrapped
     prompt — the single seam _run_one uses to build any model's invocation."""
     for name, spec in panel._MODEL_SPECS.items():
-        cmd, env = spec.prepare("WRAPPED_PROMPT", None, 180)
+        cmd, env = spec.prepare("WRAPPED_PROMPT", None, 180, False)
         assert isinstance(cmd, list) and cmd
         assert cmd[0] == name
         assert "WRAPPED_PROMPT" in cmd
@@ -1705,3 +1803,296 @@ def test_grok_cmd_real_home_no_override():
     assert "--permission-mode" in cmd and "plan" in cmd
     assert "HOME" not in env, "grok must NOT override HOME (sandbox broke its worker)"
     assert not any(k.startswith("XDG_") for k in env), "no XDG redirect either"
+
+
+# ── per-model --web: command builders (plan Task 1) ──
+
+
+def test_build_codex_cmd_web_adds_live_search():
+    cmd = panel.build_codex_cmd("Q", web=True)
+    assert "-c" in cmd and 'web_search="live"' in cmd
+    assert cmd[-1] == "Q"  # prompt stays last
+
+
+def test_build_codex_cmd_no_web_has_no_search():
+    cmd = panel.build_codex_cmd("Q")
+    assert 'web_search="live"' not in cmd
+
+
+def test_build_grok_cmd_web_drops_isolation_keeps_plan():
+    cmd, _ = panel.build_grok_cmd("Q", web=True)
+    assert "--no-subagents" not in cmd
+    assert "--disable-web-search" not in cmd
+    assert cmd[cmd.index("--permission-mode") + 1] == "plan"  # read-only retained
+    assert "--no-memory" in cmd
+
+
+def test_build_grok_cmd_no_web_unchanged():
+    cmd, _ = panel.build_grok_cmd("Q")
+    assert "--no-subagents" in cmd and "--disable-web-search" in cmd
+
+
+# ── per-model --web: agy read-only hook ALLOW-set (plan Task 2) ──
+
+
+def test_agy_hook_no_web_denies_search_web(tmp_path):
+    panel._seed_readonly_hook(tmp_path, web=False)
+    src = (tmp_path / ".agents" / "readonly-hook.py").read_text()
+    assert "search_web" not in src
+    assert "view_file" in src          # base reads kept
+    assert "run_command" not in src    # never allowed
+
+
+def test_agy_hook_web_allows_search_web_and_url(tmp_path):
+    panel._seed_readonly_hook(tmp_path, web=True)
+    src = (tmp_path / ".agents" / "readonly-hook.py").read_text()
+    assert "search_web" in src and "read_url_content" in src
+    assert "run_command" not in src    # still denied — read-side only
+
+
+def test_agy_hook_denies_run_command_allows_search_web_at_runtime(tmp_path):
+    import subprocess
+    panel._seed_readonly_hook(tmp_path, web=True)
+    hook = tmp_path / ".agents" / "readonly-hook.py"
+
+    def decide(tool):
+        out = subprocess.run(
+            [sys.executable, str(hook)],
+            input=json.dumps({"toolCall": {"name": tool}}),
+            capture_output=True, text=True,
+        ).stdout
+        return json.loads(out)["decision"]
+
+    assert decide("run_command") == "deny"   # write/exec stays denied even with --web
+    assert decide("search_web") == "allow"   # web read allowed under --web
+
+
+# ── per-model --web: threading through ModelSpec.prepare + _run_one (plan Task 3) ──
+
+
+def _capture_runner(box):
+    def runner(cmd, env, cwd, timeout):
+        box.append(cmd)
+        return panel.ModelResult(ok=True, output="ok", reason=None)
+    return runner
+
+
+def test_run_one_codex_web_threads_live_search():
+    box = []
+    panel._run_one("codex", "WRAPPED", None, 60, _capture_runner(box), web=True)
+    assert 'web_search="live"' in box[0]
+
+
+def test_run_one_grok_no_web_keeps_isolation():
+    box = []
+    panel._run_one("grok", "WRAPPED", None, 60, _capture_runner(box), web=False)
+    assert "--disable-web-search" in box[0]
+
+
+def test_run_one_agy_web_seeds_web_hook(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(panel, "_seed_readonly_hook", lambda wd, web=False: captured.update(web=web))
+    monkeypatch.setattr(panel, "_agy_brain_ids", lambda: set())
+    monkeypatch.setattr(panel, "_agy_clean_new_by_nonce", lambda *a, **k: None)
+    panel._run_one("agy", "W", None, 60, lambda *a: panel.ModelResult(True, "ok", None), web=True)
+    assert captured.get("web") is True
+
+
+# ── per-model --web: selection + parsing in run_panel/CLI (plan Task 4) ──
+
+
+def test_run_panel_runs_only_selected_models():
+    seen = []
+    def runner(cmd, env, cwd, timeout):
+        seen.append(cmd[0])
+        return panel.ModelResult(ok=True, output="VERDICT: GO", reason=None)
+    panel.run_panel("Q", models=["grok"], verdict_mode=True, runner=runner)
+    assert set(seen) == {"grok"}
+
+
+def test_run_panel_threads_web_only_to_web_models():
+    seen = {}
+    def runner(cmd, env, cwd, timeout):
+        seen[cmd[0]] = cmd
+        return panel.ModelResult(ok=True, output="ok", reason=None)
+    panel.run_panel("Q", models=["codex", "grok"], web_models={"grok"},
+                    verdict_mode=True, runner=runner)
+    assert 'web_search="live"' not in seen["codex"]   # codex not in web_models
+    assert "--disable-web-search" not in seen["grok"]  # grok in web_models → web on
+
+
+def test_parser_web_equals_scoped_safe_before_question():
+    args = panel._build_parser().parse_args(["--panel", "--web=codex,grok", "Q"])
+    assert args.web == "codex,grok" and args.question == "Q"
+
+
+def test_parser_web_bare_blanket_when_last():
+    args = panel._build_parser().parse_args(["--grok", "Q", "--web"])
+    assert args.web == "__ALL__" and args.question == "Q"
+
+
+def test_parser_web_bare_before_question_rejected():
+    """argparse nargs='?' eats the positional if --web precedes it — SKILL.md emits the
+    safe `--web=<list>` form instead. This guard locks the known limitation."""
+    import pytest
+    with pytest.raises(SystemExit):
+        panel._build_parser().parse_args(["--grok", "--web", "the question"])
+
+
+def test_main_rejects_unknown_web_model():
+    import pytest
+    with pytest.raises(SystemExit):
+        panel.main(["--grok", "--web=nope", "Q"],
+                   runner=lambda *a: panel.ModelResult(True, "x", None))
+
+
+def test_main_rejects_web_for_nonselected_model():
+    import pytest
+    with pytest.raises(SystemExit):
+        panel.main(["--grok", "--web=codex", "Q"],
+                   runner=lambda *a: panel.ModelResult(True, "x", None))
+
+
+# ── per-model --web: wrap() must INVITE web research, not suppress tools (dogfood 2026-06-21) ──
+
+
+def test_wrap_web_isolated_invites_research_drops_textonly():
+    w = panel.wrap("Q", web=True).lower()
+    assert "search the web" in w
+    assert "cite" in w and ("url" in w or "source" in w)
+    assert "do not inspect files or run tools" not in w   # the tool-suppressor is gone
+
+
+def test_wrap_no_web_isolated_keeps_textonly():
+    w = panel.wrap("Q").lower()
+    assert "do not inspect files or run tools" in w        # unchanged isolation framing
+
+
+def test_run_panel_web_leg_gets_web_prompt_nonweb_does_not():
+    seen = {}
+    def runner(cmd, env, cwd, timeout):
+        seen[cmd[0]] = " ".join(cmd).lower()
+        return panel.ModelResult(ok=True, output="ok", reason=None)
+    panel.run_panel("Q", models=["grok", "codex"], web_models={"grok"},
+                    verdict_mode=True, runner=runner)
+    assert "search the web" in seen["grok"]          # web leg → research prompt
+    assert "search the web" not in seen["codex"]     # non-web leg → text-only
+
+
+# ── per-model --web: pre-compress before merge (plan Task 5) ──
+
+
+def test_compress_research_uses_codex_and_returns_digest():
+    def runner(cmd, env, cwd, timeout):
+        assert cmd[0] == "codex"
+        return panel.ModelResult(ok=True, output="DIGEST: 3 findings + 2 URLs", reason=None)
+    out = panel._compress_research("...94KB of raw...", 60, runner)
+    assert "DIGEST" in out
+
+
+def test_compress_research_degrades_to_raw_on_failure():
+    def runner(cmd, env, cwd, timeout):
+        return panel.ModelResult(ok=False, output=None, reason="boom")
+    assert panel._compress_research("RAWTEXT", 60, runner) == "RAWTEXT"
+
+
+def _digest_or_raw_runner(cmd, env, cwd, timeout):
+    # codex compress pass carries the _COMPRESS_PROMPT marker; model legs carry the wrapped Q
+    if "Condense the following web-research" in " ".join(cmd):
+        return panel.ModelResult(True, "COMPRESSED-DIGEST", None)
+    return panel.ModelResult(True, "RAW-RESEARCH-BLOB", None)
+
+
+def test_run_panel_web_survivor_is_compressed():
+    out, _ = panel.run_panel("Q", models=["codex"], web_models={"codex"},
+                             runner=_digest_or_raw_runner)
+    assert "COMPRESSED-DIGEST" in out
+    assert "RAW-RESEARCH-BLOB" not in out      # raw replaced by digest in rendered output
+
+
+def test_run_panel_nonweb_survivor_not_compressed():
+    out, _ = panel.run_panel("Q", models=["codex"], runner=_digest_or_raw_runner)  # no web
+    assert "RAW-RESEARCH-BLOB" in out
+    assert "COMPRESSED-DIGEST" not in out
+
+
+# ── per-model --web: raw bundle .bulldozer/consult-<ts>/ (plan Task 6) ──
+
+
+def test_write_web_bundle_layout(tmp_path):
+    base = tmp_path / ".bulldozer"
+    d = panel._write_web_bundle(base, "20260621-120000", "SYNTH",
+                                {"Grok": "rawgrok", "GPT": "rawgpt"}, {"Grok"})
+    assert (d / "research.md").read_text() == "SYNTH"
+    assert (d / "raw-grok.md").read_text() == "rawgrok"   # web model → raw file
+    assert not (d / "raw-gpt.md").exists()                 # non-web model → no raw file
+    assert (base / ".gitignore").read_text().strip() == "*"  # self-ignoring
+
+
+def test_prune_bundles_keeps_last_n(tmp_path):
+    base = tmp_path / ".bulldozer"
+    base.mkdir()
+    for i in range(13):
+        (base / f"consult-202606{i:02d}").mkdir()
+    panel._prune_bundles(base, keep=10)
+    left = sorted(p.name for p in base.glob("consult-*"))
+    assert len(left) == 10 and left[-1] == "consult-20260612"  # newest kept
+
+
+def test_run_panel_web_writes_bundle_with_precompress_raw(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        panel, "_write_web_bundle",
+        lambda base, ts, synth, raw, webd: (calls.append((raw, webd)) or base / f"consult-{ts}"),
+    )
+    panel.run_panel("Q", models=["codex"], web_models={"codex"}, runner=_digest_or_raw_runner)
+    assert len(calls) == 1
+    raw, webd = calls[0]
+    assert raw.get("GPT") == "RAW-RESEARCH-BLOB"   # bundle gets the PRE-compress raw
+    assert "GPT" in webd
+
+
+def test_run_panel_nonweb_writes_no_bundle(monkeypatch):
+    calls = []
+    monkeypatch.setattr(panel, "_write_web_bundle", lambda *a, **k: calls.append(1))
+    panel.run_panel("Q", models=["codex"], runner=_digest_or_raw_runner)  # no web
+    assert calls == []
+
+
+# ── --web timeout default (plan Task 7) ──
+
+
+def test_web_raises_default_timeout_to_600():
+    seen = []
+    def runner(cmd, env, cwd, timeout):
+        seen.append(timeout)
+        return panel.ModelResult(True, "ok", None)
+    panel.main(["--codex", "--web=codex", "Q"], runner=runner)
+    assert seen and seen[0] == 600
+
+
+def test_no_web_keeps_180_default():
+    seen = []
+    def runner(cmd, env, cwd, timeout):
+        seen.append(timeout)
+        return panel.ModelResult(True, "ok", None)
+    panel.main(["--codex", "Q"], runner=runner)
+    assert seen and seen[0] == 180
+
+
+def test_explicit_timeout_overrides_web_default():
+    seen = []
+    def runner(cmd, env, cwd, timeout):
+        seen.append(timeout)
+        return panel.ModelResult(True, "ok", None)
+    panel.main(["--codex", "--web=codex", "--timeout", "90", "Q"], runner=runner)
+    assert seen and seen[0] == 90
+
+
+def test_wrap_web_verdict_keeps_verdict_tail_last():
+    """--web + --verdict must NOT append the cite directive after _VERDICT_TAIL — it would
+    corrupt the standalone verdict line classify_verdict matches (codex_review P2)."""
+    w = panel.wrap("Q", verdict=True, web=True)
+    assert w.rstrip().endswith("VERDICT: MINOR-FIXES")   # anchored verdict line intact
+    assert "search the web" in w.lower()                  # still invites research
+    assert "cite" in w.lower()                            # still asks to cite (moved to header)

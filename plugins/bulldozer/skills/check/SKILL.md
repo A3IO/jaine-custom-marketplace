@@ -298,7 +298,7 @@ LEDGER_PATCH:
         commands: ["grep -n 'check_acl' src/a.py"]
 ```
 
-**4. Verify each finding** — use `/receiving-code-review` discipline. Read `${REVIEW_DIR}/parsed-r${ROUND}.json` (the wrapper wrote it; one entry per finding with `id`, `severity`, `files`, `original_verdict_excerpt`, `required_recheck.commands`). For each finding:
+**4. Verify each finding** — use `/receiving-code-review` discipline. Read `${REVIEW_DIR}/parsed-r${ROUND}.json` (the wrapper wrote it; one entry per finding with `id`, `severity`, `files`, `original_verdict_excerpt`, `required_recheck.commands`). A `still_open` re-emit (a prior id — #271 routing) may omit `original_verdict_excerpt` / `required_recheck`; those persist in the matching `review-ledger.yml` entry — take its `required_recheck.commands` from there. For each finding:
 
 - Run the `required_recheck.commands` (or the closest equivalent) against the current code
 - Classify: REAL or FALSE_POSITIVE
@@ -313,7 +313,7 @@ LEDGER_PATCH:
 | "Pattern matches false positives" | Test the regex on real data |
 | "Contradicts line N" | Read both lines, compare |
 
-**5. Apply findings to the ledger** — append each verified finding from `parsed-r${ROUND}.json` to `${REVIEW_DIR}/review-ledger.yml`, mark status (`verified` / `still_open` / `false_positive` / `wontfix`) based on Step 4's evidence. JSON→YAML transcription is a Claude task (extraction is deterministic via the wrapper; ledger curation is judgment).
+**5. Apply findings to the ledger** — reconcile each finding from `parsed-r${ROUND}.json` into `${REVIEW_DIR}/review-ledger.yml`. **Upsert by id, do NOT blindly append:** if the finding's `id` is NEW, append it; if its `id` ALREADY exists in the ledger (a re-emitted `still_open` recheck keeps its original id — #271), UPDATE that existing entry in place (set `status`, bump `last_seen_round`, append a `history` note) rather than appending a duplicate. The parser only rejects duplicate ids WITHIN a block, so cross-round repeats reach you here. Terminal rechecks (`verified` / `false_positive` / `wontfix`) are NOT in `parsed-r${ROUND}.json` — they live in the verdict PROSE (#271 routing); read them from `${REVIEW_DIR}/verdict-r${ROUND}.txt`, then **re-verify each one with the same Step 4 discipline before closing it** — re-run the matching ledger entry's `required_recheck.commands` against current code and confirm the evidence (a `verified` claim must actually reproduce as fixed; a `false_positive` / `wontfix` must hold up). A reviewer's prose recheck is a CLAIM, not proof — never close a finding on the reviewer's word alone. Only on confirmation, apply the terminal status to the matching ledger entry. Mark status (`verified` / `still_open` / `false_positive` / `wontfix`) based on Step 4's evidence. JSON→YAML transcription is a Claude task (extraction is deterministic via the wrapper; ledger curation is judgment).
 
 **6. Fix confirmed issues** — edit the artifact, commit with finding counts:
 
@@ -339,8 +339,8 @@ Unset them after the round (`unset BULLDOZER_FIXED BULLDOZER_FP`) so they don't 
 - Wrapper exited 10 (pivot signal) → act on the user's AskUserQuestion choice from Step 3. Fires on EITHER the flat `ROUND >= max_rounds && verdict != GO` trigger OR the B6 calibrated trigger (`depth == exhaustive` AND `ROUND >= 5` AND NO-GO AND avg-last-3 findings `>= 3.0`), so exit 10 can occur at `round < max_rounds` on exhaustive runs. The wrapper always writes `pivot-rN.json` before exiting 10; if exit 10 ever arrives without a readable pivot file, treat it as a wrapper-state bug and report it.
 - **Wrapper exited 11 (manual-extraction branch) — REQUIRED PROTOCOL:**
   1. Read `${REVIEW_DIR}/verdict-r${ROUND}.txt` — reviewer wrote prose but skipped the structured LEDGER_PATCH block
-  2. Extract findings from prose: count `K` (number of real findings) and determine `VERDICT` (GO if no real findings; NO-GO if K > 0 OR reviewer narrated problems without enumerating cleanly)
-  3. Append the extracted findings to `${REVIEW_DIR}/review-ledger.yml` with status `open` (use IDs `R${ROUND}-F${M}` matching wrapper convention)
+  2. Extract findings from prose and route them by the #271 rules — Round-N prose can carry rechecks AND new findings: a terminal recheck (`verified` / `false_positive` / `wontfix`) of a prior id updates that ledger entry's status and is NOT a finding; a `still_open` recheck keeps its ORIGINAL id; only genuinely new problems get fresh `R${ROUND}-F${M}` ids. Count `K` = open findings = `still_open + new` (terminal rechecks are EXCLUDED). Determine `VERDICT` (GO if K == 0 and no problems narrated; NO-GO if K > 0 OR reviewer narrated problems without enumerating cleanly)
+  3. Apply to `${REVIEW_DIR}/review-ledger.yml` with the Step 5 upsert rule: UPDATE the existing entry in place when the id already exists (a terminal recheck, or a `still_open` re-open under its original id — set `status`, bump `last_seen_round`, append a `history` note); append ONLY genuinely new ids with status `open` (`R${ROUND}-F${M}` matching wrapper convention). Do NOT blind-append a still_open recheck as a duplicate new id. Before applying a terminal recheck from prose, re-verify it (re-run that ledger entry's `required_recheck.commands`) — same Step 5 discipline; never close a finding on the reviewer's prose alone.
   4. Reconcile state: `python3 <plugin>/skills/check/scripts/update-state.py --review-dir "${REVIEW_DIR}" --mode=replace-extraction ${ROUND} ${K} ${VERDICT}` — this updates `history[round=${ROUND}].findings`, `verdict`, and clears `manual_extraction_pending`; deltas `findings_total` correctly (`update-state.py` is NOT on PATH — invoke via `python3` + full script path). **IMPORTANT:** use the ABSOLUTE path the wrapper prints in the exit-11 stderr recovery command — it appears as the `--review-dir <path>` argument, with `REVIEW_DIR` already canonicalized to absolute (the wrapper runs `REVIEW_DIR="$(cd "$REVIEW_DIR" && pwd)"` before any diagnostic is emitted), NOT a relative path inferred from your Bash tool's current cwd. Claude's Bash tool invocations may run with different cwd across messages; the absolute path from stderr survives. `update-state.py` canonicalizes via `.resolve()` defensively, but the safest contract is to copy the absolute `--review-dir` value the wrapper printed.
   5. **Pivot check (REQUIRED):** the manual-extraction path exits 11 BEFORE the wrapper's Step 9, so the wrapper's pivot triggers never run — the caller MUST replicate BOTH here. Fire the AskUserQuestion pivot dialog if EITHER trigger holds:
       - **Terminal:** `ROUND >= max_rounds` AND `VERDICT == NO-GO` (use `>=`, not `==`, to mirror the wrapper's flat pivot — a user-continued over-max manual round, e.g. standard round 4, must still pivot); or
@@ -438,10 +438,15 @@ APPENDIX B — previous verdict:
 <FULL verdict-r{N-1}.txt CONTENT>
 
 For each open/fixed finding, decide: verified, still_open, false_positive, or wontfix.
-If a claimed-fixed issue still reproduces, keep the original ID and explain why.
+If a claimed-fixed issue still reproduces (including one previously marked terminal),
+keep its original ID and re-open it as a still_open finding.
 New findings use IDs R{N}-FN.
-End with the LEDGER_PATCH block covering both recheck results and new findings — see LEDGER_PATCH Protocol below.
-GO only when all material findings are terminal AND fresh review found nothing new.
+Route the recheck results per the LEDGER_PATCH Protocol below — terminal rechecks
+(verified / false_positive / wontfix) go in PROSE above the block; still_open rechecks
+are re-emitted as FULL findings inside the block; new findings go in the block.
+End with the LEDGER_PATCH block — see LEDGER_PATCH Protocol below.
+GO only when all material findings are terminal AND fresh review found nothing new
+(then the block is `verdict: go` + `findings: []`).
 ```
 
 ### LEDGER_PATCH Protocol
@@ -470,6 +475,31 @@ LEDGER_PATCH:
 LEDGER_PATCH:
   verdict: go
   findings: []
+```
+
+**Round-N recheck routing (#271).** A Round-N reviewer rechecks prior findings AND does a fresh review. Route the results by what each finding's status becomes — the `findings:` list must end up holding exactly the CURRENTLY-OPEN findings (still_open + new), because the wrapper computes `findings_count = len(findings)` and feeds that count to the trajectory display, the B6 calibrated pivot, and the GO/NO-GO inference:
+
+- **Terminal rechecks** (`verified` / `false_positive` / `wontfix`) → put in PROSE, in a short recheck section ABOVE the block, one line each (`R{n}-F{m}: <status> — <note>`). Do NOT place them in `findings:` — a terminal recheck is naturally just `id`+`status`+`note` (no `severity`/`title`), so the parser rejects the whole patch (exit 3), AND a resolved finding counted as open would inflate `findings_count` and corrupt the pivot/verdict. Keep prose limited to terminal rechecks (never list a still_open or new finding there).
+- **still_open rechecks** (a prior finding that still reproduces, including one previously marked terminal) → RE-EMIT as a FULL finding INSIDE `findings:` under its ORIGINAL id, with full `severity` / `title` / `files` and `status: still_open`. It is open, so it must be parsed AND counted. (`original_verdict_excerpt` / `required_recheck` MAY be omitted — they persist in the existing ledger entry, and Step 4 re-verifies a still_open finding using that entry's `required_recheck.commands`.)
+- **New findings** → full entries in `findings:` with fresh `R{N}-F{n}` ids.
+- **GO** → only when nothing is open: `verdict: go` + `findings: []`. Never write `verdict: go` while `findings:` is non-empty (that yields a GO round with a positive open-count — an inconsistent state).
+
+Round-N example — one terminal recheck (prose), one still_open re-emit, one new finding:
+```yaml
+# Recheck (prose, above the block):
+#   R1-F2: verified — fix confirmed, ACL now precedes write.
+LEDGER_PATCH:
+  findings:
+    - id: R1-F1                              # still_open re-emit — ORIGINAL id (recheck cmds persist in the ledger entry)
+      severity: high
+      status: still_open
+      title: "side effect before permission check"
+      files: [{path: "src/a.py", lines: "120-148"}]
+    - id: R3-F1                              # new finding this round
+      severity: medium
+      status: open
+      title: "missing timeout on fetch"
+      files: [{path: "src/b.py", lines: "20-22"}]
 ```
 
 A bare `GO` line (without the LEDGER_PATCH block) is auto-synthesized by the parser as `{verdict: go, findings: []}` with `source: synthesized_bare_go` and a warning — it still works, the parser exits 0. The synthesis is suppressed if any `NO-GO` variant also appears in the verdict (exit 1 wins so real findings aren't lost). Still: prefer the explicit structured block above. Synthesis is a graceful fallback, not a green light to skip the protocol — `source: synthesized_bare_go` is a code smell in audit logs, and any time a reviewer needed to write `GO` AND a `NO-GO` example (e.g. inline documentation), synthesis flips off and the consumer ends up in manual extraction anyway.

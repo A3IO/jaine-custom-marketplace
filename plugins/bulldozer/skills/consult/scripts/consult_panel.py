@@ -28,6 +28,7 @@ import time
 import urllib.parse
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -94,6 +95,17 @@ _INFORMED_NO_WRITE = (
     "do NOT create or save any file, do NOT defer your findings to a plan or report document."
 )
 
+# --web only: the isolated wrappers below forbid tool use ("Do not inspect files or run
+# tools"), which suppresses web search even when --web enables the tool (dogfood 2026-06-21:
+# grok answered "(text only, no tool use)"). When web is on, INVITE research and ask for
+# source URLs instead. READ-side only — never asks the model to write.
+_WEB_HEADER = (
+    "SKIP SKILLS. Search the web (and use subagents) to research this — ground your answer "
+    "in CURRENT real-world practice, not only prior knowledge."
+)
+_WEB_RESEARCH = "Also search the web to ground this in current real-world practice."
+_WEB_CITE = "CITE specific source URLs for every claim drawn from the web."
+
 # (verdict, repo) -> (header, footer)
 _WRAP_TABLE: dict[tuple[bool, bool], tuple[str, str]] = {
     (False, False): (  # find-holes, isolated
@@ -129,12 +141,23 @@ _WRAP_TABLE: dict[tuple[bool, bool], tuple[str, str]] = {
 }
 
 
-def wrap(question: str, *, verdict: bool = False, repo: bool = False) -> str:
+def wrap(question: str, *, verdict: bool = False, repo: bool = False,
+         web: bool = False) -> str:
     """Wrap a question with the (mode × access) header+footer around the shared
     skeleton. ``verdict`` selects find-holes↔verdict; ``repo`` selects
-    isolated↔informed (read the real code in cwd). Single source for all four
-    variants — the named wrappers below are thin views over it."""
+    isolated↔informed (read the real code in cwd). ``web`` swaps the isolated
+    no-tools header for a web-research header (or augments the informed header)
+    and appends a cite-URLs directive — enabling the web tool is not enough, the
+    prompt must invite its use (dogfood 2026-06-21). Single source for all variants."""
     header, footer = _WRAP_TABLE[(verdict, repo)]
+    if web:
+        header = f"{_INFORMED_HEADER} {_WEB_RESEARCH}" if repo else _WEB_HEADER
+        if verdict:
+            # the verdict footer MUST end with the anchored _VERDICT_TAIL line — put the
+            # cite directive in the HEADER so classify_verdict still matches (codex_review P2).
+            header = f"{header} {_WEB_CITE}"
+        else:
+            footer = f"{footer} {_WEB_CITE}"
     return f"{header}\n---\n{question}\n---\n{footer}"
 
 
@@ -535,29 +558,34 @@ def render_panel(
 # on normal questions (R1 canary + 2026-06-02 re-confirm).
 
 
-def build_codex_cmd(wrapped: str, effort: str = "medium") -> list[str]:
-    """codex: full isolation via flags, no HOME override."""
-    return [
+def build_codex_cmd(wrapped: str, effort: str = "medium", web: bool = False) -> list[str]:
+    """codex: full isolation via flags, no HOME override. ``web`` adds the canonical
+    live web-search config (``-c web_search="live"``; NOT the deprecated
+    ``tools.web_search``). Read-only is preserved — web_search needs no write."""
+    cmd = [
         "codex", "exec",
         "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
         "--ephemeral", "-s", "read-only",
         "-c", f"model_reasoning_effort={effort}",
-        wrapped,
     ]
+    if web:
+        cmd += ["-c", 'web_search="live"']
+    cmd.append(wrapped)
+    return cmd
 
 
-def build_grok_cmd(wrapped: str) -> tuple[list[str], dict[str, str]]:
-    """grok on the REAL HOME (no override) + no-memory/subagents/web + plan
-    (no-write), JSON out. A HOME-sandbox broke grok's informed-mode tool-worker
-    auth — it cancelled on every `--repo` run (real HOME → survives 3/3 through the
-    panel, sandbox → 0/3). Env override is empty so run_model's allowlist passes the
-    real HOME through; isolation rests on --no-memory/--no-subagents, not a sandbox."""
-    cmd = [
-        "grok", "-p", wrapped,
-        "--no-memory", "--no-subagents", "--disable-web-search",
-        "--permission-mode", "plan",
-        "--output-format", "json",
-    ]
+def build_grok_cmd(wrapped: str, web: bool = False) -> tuple[list[str], dict[str, str]]:
+    """grok on the REAL HOME (no override) + JSON out, ALWAYS ``--permission-mode plan``
+    (read-only — plan blocks write tools). A HOME-sandbox broke grok's informed-mode
+    tool-worker auth — it cancelled on every `--repo` run (real HOME → survives 3/3
+    through the panel, sandbox → 0/3). Env override is empty so run_model's allowlist
+    passes the real HOME through. Isolated (default): also ``--no-subagents
+    --disable-web-search``. ``web``: drop those two → web search/fetch + parallel
+    subagents, still read-only (plan). ``--no-memory`` always."""
+    cmd = ["grok", "-p", wrapped, "--no-memory"]
+    if not web:
+        cmd += ["--no-subagents", "--disable-web-search"]
+    cmd += ["--permission-mode", "plan", "--output-format", "json"]
     return cmd, {}
 
 
@@ -609,31 +637,47 @@ def build_agy_cmd(
 # command-exec tools are deliberately excluded (a generic shell tool could pass a mutating
 # command). The hook does NOT capture the conversationId — cleanup is nonce-based (see
 # _agy_clean_new_by_nonce), so the hook has a single job: read-only enforcement.
-_AGY_READONLY_HOOK = '''#!/usr/bin/env python3
-import json, sys
-ALLOW = {  # LOCAL-code reads only — no network tools (read_url_content/web_*) → no egress/exfil
+# Allowlist is built per-call by _agy_readonly_hook_src(web): always the LOCAL-code read
+# tools; with web=True ALSO the two web READ tools — NEVER any write/command-exec tool, so
+# --web grants READ-side egress only (#219).
+_AGY_ALLOW_BASE = (  # LOCAL-code reads only
     "read_file", "view_file", "view_code_item", "list_dir", "glob",
-    "grep_search", "code_search", "codebase_search", "search_file_content",
-    "find_by_name",
-}
-try:
-    name = json.load(sys.stdin)["toolCall"]["name"]
-    ok = isinstance(name, str) and name.lower() in ALLOW
-except Exception:
-    ok = False
-print('{"decision":"allow"}' if ok
-      else '{"decision":"deny","reason":"bulldozer consult: read-only review, mutation blocked"}')
-'''
+    "grep_search", "code_search", "codebase_search", "search_file_content", "find_by_name",
+)
+# Added ONLY under --web — agy's web READ tools (names confirmed via the deny-log, #219). No
+# write/exec tool is ever added here, so the read-only guarantee holds even with web on.
+_AGY_ALLOW_WEB = ("search_web", "read_url_content")
 
 
-def _seed_readonly_hook(workdir: Path) -> None:
+def _agy_readonly_hook_src(web: bool = False) -> str:
+    """Source of the fail-closed PreToolUse deny hook. EXACT-name read allowlist → allow;
+    EVERYTHING else (writes, run_command, unknown, malformed) → deny. ``web`` adds the two
+    web READ tools (search_web/read_url_content), never any write/exec tool (#189, #219)."""
+    allow = list(_AGY_ALLOW_BASE) + (list(_AGY_ALLOW_WEB) if web else [])
+    allow_literal = "{" + ", ".join(repr(a) for a in allow) + "}"
+    return (
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"ALLOW = {allow_literal}\n"
+        "try:\n"
+        '    name = json.load(sys.stdin)["toolCall"]["name"]\n'
+        "    ok = isinstance(name, str) and name.lower() in ALLOW\n"
+        "except Exception:\n"
+        "    ok = False\n"
+        "print('{\"decision\":\"allow\"}' if ok\n"
+        "      else '{\"decision\":\"deny\",\"reason\":\"bulldozer consult: read-only review, mutation blocked\"}')\n"
+    )
+
+
+def _seed_readonly_hook(workdir: Path, web: bool = False) -> None:
     """Seed ``workdir/.agents/hooks.json`` with a fail-closed PreToolUse deny hook so an
     agy leg run with this dir as cwd is read-only (the repo is read via --add-dir). This is
-    the only deterministic read-only enforcement for `agy --print` (#189, F3)."""
+    the only deterministic read-only enforcement for `agy --print` (#189, F3). ``web`` widens
+    the allowlist to agy's web READ tools (search_web/read_url_content; still no write/exec, #219)."""
     agents = workdir / ".agents"
     agents.mkdir(parents=True, exist_ok=True)
     script = agents / "readonly-hook.py"
-    script.write_text(_AGY_READONLY_HOOK)
+    script.write_text(_agy_readonly_hook_src(web))
     script.chmod(0o755)
     hooks = {
         "bulldozer-readonly": {
@@ -754,10 +798,10 @@ class ModelSpec:
 
     display: str
     parser: Callable[[str], str | None]
-    prepare: Callable[[str, "Path | None", int], tuple[list[str], dict[str, str]]]
+    prepare: Callable[[str, "Path | None", int, bool], tuple[list[str], dict[str, str]]]
     # readonly_hook: run this leg in a temp cwd seeded with a PreToolUse deny hook so it is
     # read-only — required for agy, whose `--print` mode auto-accepts every tool (#189). The
-    # mechanism (read-only enforcement + transcript cleanup) lives at _AGY_READONLY_HOOK /
+    # mechanism (read-only enforcement + transcript cleanup) lives at _agy_readonly_hook_src /
     # _agy_clean_new_by_nonce — the single source of truth; not restated here (drift-prone).
     readonly_hook: bool = False
     # session_clean(result, cwd, owned): post-run cleanup of a leg's leaked session artifacts
@@ -771,13 +815,15 @@ class ModelSpec:
 # summarizer attribution stable across the gemini-CLI → agy transport swap (#189). Only
 # agy needs ``readonly_hook`` (its print mode auto-accepts tools).
 _MODEL_SPECS: dict[str, ModelSpec] = {
-    "codex": ModelSpec("GPT", parse_codex, lambda w, repo, t: (build_codex_cmd(w), {})),
+    "codex": ModelSpec("GPT", parse_codex, lambda w, repo, t, web: (build_codex_cmd(w, web=web), {})),
     "grok": ModelSpec(
-        "Grok", parse_grok, lambda w, repo, t: build_grok_cmd(w),
+        "Grok", parse_grok, lambda w, repo, t, web: build_grok_cmd(w, web=web),
         session_clean=_grok_post_run_clean,
     ),
     "agy": ModelSpec(
-        "Gemini", parse_agy, lambda w, repo, t: build_agy_cmd(w, repo, t),
+        # web is enforced via the read-only hook ALLOW-set (_seed_readonly_hook in _run_one),
+        # not via argv — so agy's prepare ignores ``web`` here.
+        "Gemini", parse_agy, lambda w, repo, t, web: build_agy_cmd(w, repo, t),
         readonly_hook=True,
     ),
 }
@@ -806,6 +852,7 @@ class LegResult:
 
 def _run_one(
     name: str, wrapped: str, repo: Path | None, timeout: int, runner: Runner,
+    web: bool = False,
 ) -> LegResult:
     """Build one model's cmd, run it in an isolated cwd (its own tempdir for the
     isolated mode; the repo for informed mode), parse → a :class:`LegResult`.
@@ -822,24 +869,24 @@ def _run_one(
             # visual/IDE session's), inject a unique nonce into the prompt and afterward
             # remove only the new brain dir whose transcript carries it (#189, F2).
             nonce = f"{_AGY_NONCE_TAG}:{secrets.token_hex(16)}"
-            cmd, env = spec.prepare(f"[{nonce}]\n{wrapped}", repo, timeout)
+            cmd, env = spec.prepare(f"[{nonce}]\n{wrapped}", repo, timeout, web)
             before = _agy_brain_ids()
             with tempfile.TemporaryDirectory(prefix=f"panel-{name}-") as mt:
-                _seed_readonly_hook(Path(mt))
+                _seed_readonly_hook(Path(mt), web)
                 try:
                     result = runner(cmd, env, mt, timeout)
                 finally:
                     _agy_clean_new_by_nonce(before, nonce)
         elif repo is not None:
             # informed: run in the repo; no throwaway tempdir needed (dogfood Grok)
-            cmd, env = spec.prepare(wrapped, repo, timeout)
+            cmd, env = spec.prepare(wrapped, repo, timeout, web)
             result = runner(cmd, env, str(repo), timeout)
             if spec.session_clean is not None:
                 # informed: cwd is the user's SHARED repo → scoped cleanup only (owned=False)
                 spec.session_clean(result, str(repo), False)  # grok: drop its leaked session (#192)
         else:
             # isolated: run in a throwaway EMPTY cwd so the model can't read anything
-            cmd, env = spec.prepare(wrapped, repo, timeout)
+            cmd, env = spec.prepare(wrapped, repo, timeout, web)
             with tempfile.TemporaryDirectory(prefix=f"panel-{name}-") as mt:
                 empty = Path(mt) / "cwd"
                 empty.mkdir()
@@ -884,6 +931,28 @@ def _run_summarizer(
     return parse_codex(result.output or "")
 
 
+_COMPRESS_PROMPT = (
+    "Condense the following web-research notes into a tight briefing: the key findings as "
+    "bullets, then a '## Sources' list of every URL cited. Preserve all URLs. Drop filler "
+    "and any duplicated or garbled fragments. Output markdown only.\n\n---\n"
+)
+
+
+def _compress_research(raw: str, timeout: int, runner: Runner) -> str:
+    """Per-model --web pre-compress: an isolated codex pass turning a large/possibly-garbled
+    raw research dump into findings + a URL index. Degrades to the raw text on ANY failure
+    (never crashes the panel) — so a compress hiccup never loses the survivor."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="panel-compress-") as mt:
+            cmd = build_codex_cmd(_COMPRESS_PROMPT + raw)  # no web — just summarize
+            result = runner(cmd, {}, mt, timeout)
+    except Exception:
+        return raw
+    if not result.ok:
+        return raw
+    return parse_codex(result.output or "") or raw
+
+
 def _render_verdict(
     survivors: list[tuple[str, str]], failures: list[tuple[str, str]],
 ) -> str:
@@ -902,9 +971,114 @@ def _render_error(failures: list[tuple[str, str]]) -> str:
     return f"All models failed — no panel output.\n\n{blocks}"
 
 
+# Where --web raw bundles are persisted (cwd-relative → the consumer project root, resolved
+# at write time). Module-level so tests redirect it (autouse fixture) instead of writing into
+# the real project.
+BUNDLE_BASE = Path(".bulldozer")
+
+
+def _prune_bundles(base: Path, keep: int = 10) -> None:
+    """Keep only the newest ``keep`` ``consult-<ts>`` dirs (sortable ts → lexical sort)."""
+    dirs = sorted((p for p in base.glob("consult-*") if p.is_dir()), key=lambda p: p.name)
+    for old in dirs[:-keep]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def _write_web_bundle(
+    base: Path, ts: str, synthesis: str,
+    raw_by_display: dict[str, str], web_displays: set[str],
+) -> Path:
+    """Persist a --web research bundle: ``research.md`` (synthesis, also shown inline) +
+    ``raw-<model>.md`` for each web model's PRE-compress raw. Ensures a self-ignoring
+    ``.bulldozer/.gitignore`` ('*') so contents never enter the consumer's git (same pattern
+    as check/.remember), then keeps the last 10 bundles. Best-effort: never raises (a write
+    failure warns on stderr and the panel output is unaffected)."""
+    target = base / f"consult-{ts}"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        gi = base / ".gitignore"
+        if not gi.exists():
+            gi.write_text("*\n")
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "research.md").write_text(synthesis)
+        for display, raw in raw_by_display.items():
+            if display in web_displays:
+                (target / f"raw-{display.lower()}.md").write_text(raw)
+        _prune_bundles(base)  # after writing the new one → keep-last-10 includes it
+    except Exception as e:
+        print(f"warning: could not write consult bundle: {e}", file=sys.stderr)
+    return target
+
+
+# ── completion logging ──
+# Stable path (survives plugin-cache wipes on update — the house convention for plugin logs);
+# env override for test isolation. Module-level so tests redirect it via the autouse fixture.
+# Metadata ONLY — no question, no findings, no verdict bodies (the privacy property shared
+# with the inline single-codex flow). Distinct from the UserPromptSubmit hook's lean
+# ``event=consult-invoke`` start-marker: this is the substantive completion line.
+CONSULT_LOG = Path(
+    os.environ.get("BULLDOZER_CONSULT_LOG")
+    or Path.home() / ".claude" / "hooks" / "bulldozer-consult.log"
+)
+
+
+def _project_root() -> str:
+    """The consumer project root (git toplevel), else the invoking cwd — mirrors the hook's
+    ``git rev-parse --show-toplevel 2>/dev/null || pwd``."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return os.getcwd()
+
+
+def _verdict_label(ok: bool, verdict_mode: bool, survivors: list[tuple[str, str]]) -> str:
+    """Coarse single-token outcome for the log: ``ERROR`` (no survivors); in --verdict mode
+    the collapsed per-model verdict, or ``mixed`` when they disagree; else ``find-holes`` (a
+    find-holes panel has no GO/NO-GO)."""
+    if not ok or not survivors:
+        return "ERROR"
+    if verdict_mode:
+        verdicts = {classify_verdict(o) for _, o in survivors}
+        return next(iter(verdicts)) if len(verdicts) == 1 else "mixed"
+    return "find-holes"
+
+
+def _log_completion(
+    t0: float, selected: list[str], web_set: set[str],
+    verdict_mode: bool, survivors: list[tuple[str, str]], ok: bool,
+) -> None:
+    """Append ONE completion line to CONSULT_LOG. Best-effort: a logging failure NEVER blocks
+    the panel. Panel-shape (``models=``/``web=``) — distinct from the inline single-codex
+    line (``model=``); a reader keys on the field names. tokens=NA (the panel does not yet
+    capture per-model token usage)."""
+    try:
+        elapsed = time.perf_counter() - t0
+        session = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "")[:8] or "NA"
+        web = ",".join(m for m in selected if m in web_set)
+        line = (
+            f"{datetime.now().astimezone().isoformat(timespec='seconds')}"
+            f" | session={session} | round=1"
+            f" | verdict={_verdict_label(ok, verdict_mode, survivors)}"
+            f" | tokens=NA | time={elapsed:.1f}s | models={','.join(selected)}"
+            f" | web={web} | project={_project_root()}"
+        )
+        CONSULT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with CONSULT_LOG.open("a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass  # observability, never a blocker
+
+
 def run_panel(
-    question: str, *, verdict_mode: bool = False, repo: Path | None = None,
-    timeout: int = 180, runner: Runner = run_model,
+    question: str, *, models: "list[str] | None" = None,
+    web_models: "set[str] | None" = None, verdict_mode: bool = False,
+    repo: Path | None = None, timeout: int = 180, runner: Runner = run_model,
 ) -> tuple[str, bool]:
     """Run codex + grok + agy in parallel; return ``(rendered_output, ok)``
     where ``ok`` is False iff every model failed (total failure).
@@ -915,6 +1089,7 @@ def run_panel(
     tests. The agy leg persists the prompt+response in a per-call session dir; _run_one
     deletes it by nonce afterward (consult statelessness, visual-safe, #189).
     """
+    t0 = time.perf_counter()
     if repo is not None:
         repo = Path(repo)
         if not repo.is_dir():
@@ -922,12 +1097,19 @@ def run_panel(
         # Resolve ONCE so every leg's cwd matches agy's resolved --add-dir — no
         # symlink/canonical divergence across the three legs (code-review C9).
         repo = repo.resolve()
-    wrapped = wrap(question, verdict=verdict_mode, repo=repo is not None)
-    # Each model runs in its own cwd (built inside _run_one): isolated → a throwaway
-    # tempdir; informed → the repo (codex/grok) or a read-only-hook tempdir (agy, which
-    # reaches the repo via --add-dir and cleans its own transcript by id, inside _run_one).
-    with ThreadPoolExecutor(max_workers=len(_MODEL_SPECS)) as ex:
-        results = list(ex.map(lambda n: _run_one(n, wrapped, repo, timeout, runner), _MODEL_SPECS))
+    selected = list(models) if models else list(_MODEL_SPECS)
+    webset = set(web_models or ())
+    # Wrap PER MODEL: a web leg gets a research-inviting prompt (tool use + cite URLs); a
+    # non-web leg keeps the isolation/text-only framing. Enabling the web tool at the CLI is
+    # NOT enough — the prompt must invite its use (dogfood 2026-06-21). Each model then runs in
+    # its own cwd (built inside _run_one): isolated → a throwaway tempdir; informed → the repo
+    # (codex/grok) or a read-only-hook tempdir (agy, which reaches the repo via --add-dir).
+    def _leg(n: str) -> LegResult:
+        web = n in webset
+        wrapped_n = wrap(question, verdict=verdict_mode, repo=repo is not None, web=web)
+        return _run_one(n, wrapped_n, repo, timeout, runner, web)
+    with ThreadPoolExecutor(max_workers=max(1, len(selected))) as ex:
+        results = list(ex.map(_leg, selected))
     survivors: list[tuple[str, str]] = [
         (r.display, r.output) for r in results if r.output is not None
     ]
@@ -936,13 +1118,35 @@ def run_panel(
     ]
     ok = len(survivors) > 0
     if verdict_mode:
+        _log_completion(t0, selected, webset, verdict_mode, survivors, ok)
         return _render_verdict(survivors, failures), ok
+    raw_by_display: dict[str, str] = {}
+    web_displays: set[str] = set()
+    if webset:
+        # --web: pre-compress each web leg's (large, possibly-garbled) raw research into a
+        # findings+URL digest BEFORE the merge — tames volume and re-synthesizes corrupted
+        # subagent output. Non-web survivors pass through untouched. Keep the PRE-compress
+        # raw for the drill-down bundle below.
+        web_displays = {_MODEL_SPECS[n].display for n in webset if n in selected}
+        raw_by_display = {d: o for d, o in survivors}
+        survivors = [
+            (d, _compress_research(o, timeout, runner) if d in web_displays else o)
+            for d, o in survivors
+        ]
     strategy = decide_merge(survivors)
     if strategy == "error":
+        _log_completion(t0, selected, webset, verdict_mode, survivors, ok)
         return _render_error(failures), ok
     merged = _run_summarizer(survivors, timeout, runner) if strategy == "summarize" else None
     merge_failed = strategy == "summarize" and merged is None
-    return render_panel(merged, survivors, failures, merge_failed=merge_failed), ok
+    output = render_panel(merged, survivors, failures, merge_failed=merge_failed)
+    if webset:
+        # Persist the full raw research for drill-down; inline output keeps the digests only.
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        bundle = _write_web_bundle(BUNDLE_BASE, ts, output, raw_by_display, web_displays)
+        output = f"{output}\n\n_Raw research bundle: {bundle}/_"
+    _log_completion(t0, selected, webset, verdict_mode, survivors, ok)
+    return output, ok
 
 
 # ── CLI entrypoint ──
@@ -954,20 +1158,49 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Multi-model find-holes panel (codex + grok + agy) for /bulldozer:consult.",
     )
     p.add_argument("question", help="The design question, or a question about the codebase with --repo")
+    p.add_argument("--codex", action="store_true", help="Run codex")
+    p.add_argument("--grok", action="store_true", help="Run grok")
+    p.add_argument("--agy", action="store_true", help="Run agy (Gemini)")
+    p.add_argument("--panel", action="store_true", help="Run all three models (alias)")
+    p.add_argument("--web", nargs="?", const="__ALL__", default=None,
+                   help="Opt-in deep web research; --web=grok,agy (scoped) or bare --web "
+                        "(blanket; place LAST so it can't eat the question)")
     p.add_argument("--verdict", action="store_true",
                    help="Verdict mode: per-model GO/NO-GO/MINOR-FIXES instead of find-holes")
     p.add_argument("--repo", type=Path, default=None,
                    help="Informed mode: run the models in this repo so they read the real code")
-    p.add_argument("--timeout", type=int, default=180, help="Per-model timeout in seconds")
+    p.add_argument("--timeout", type=int, default=None,
+                   help="Per-model timeout in seconds (default 180; 600 when --web is set)")
     return p
 
 
 def main(argv: list[str] | None = None, runner: Runner = run_model) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    selected = [m for m in ("codex", "grok", "agy") if getattr(args, m)]
+    if not selected:
+        selected = ["codex", "grok", "agy"]   # --panel or no model flag → all three
+    if args.web is None:
+        web_models: set[str] = set()
+    elif args.web == "__ALL__":
+        web_models = set(selected)
+    else:
+        req = [s.strip() for s in args.web.split(",") if s.strip()]
+        bad = [r for r in req if r not in ("codex", "grok", "agy")]
+        if bad:
+            parser.error(f"--web: unknown model(s): {', '.join(bad)}")
+        not_sel = [r for r in req if r not in selected]
+        if not_sel:
+            parser.error(f"--web names non-selected model(s): {', '.join(not_sel)}")
+        web_models = set(req)
+    # --web research runs long (subagent swarms ~3 min); raise the default unless the caller
+    # set --timeout explicitly. Non-web default stays 180.
+    timeout = args.timeout if args.timeout is not None else (600 if web_models else 180)
     try:
         output, ok = run_panel(
-            args.question, verdict_mode=args.verdict, repo=args.repo,
-            timeout=args.timeout, runner=runner,
+            args.question, models=selected, web_models=web_models,
+            verdict_mode=args.verdict, repo=args.repo,
+            timeout=timeout, runner=runner,
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
