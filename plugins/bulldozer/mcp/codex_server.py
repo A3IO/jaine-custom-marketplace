@@ -91,7 +91,7 @@ def _codex_bin_available(bin_path: str | None = None) -> bool:
 # mid-session codex install/upgrade is picked up (#227).
 CODEX = _resolve_codex_bin()
 PROTO = "2025-06-18"
-LAST_VERIFIED_CODEX_VERSION = "0.141"   # last codex app-server version this bridge was verified against
+LAST_VERIFIED_CODEX_VERSION = "0.142"   # last codex app-server version this bridge was verified against
 
 REVIEW_SCHEMA = {
     "type": "object",
@@ -124,6 +124,10 @@ TOOLS = [
             "Pass thread_id to resume an existing thread (cross-session). "
             "Interactive approvals (command/file-change/permissions) are forwarded to "
             "Claude Code via MCP elicitation — approval_policy=on-request enables them. "
+            "If UNATTENDED approval is armed, instead of a human dialog this returns "
+            "{status:'awaiting_approval', park_token, approval:{kind, decisions:[{id,label}], "
+            "evidence}} — YOU decide from the evidence and call codex_approve(park_token, "
+            "decision_id) to resume (decision_id = an approval.decisions[].id, or 'decline'). "
             "REQUIRED mcp arg selects which MCP servers codex sees: 'isolated'/'all'/"
             "'list'/[subset] (call mcp='list' first to discover servers). "
             "Returns a _drift array if upstream codex protocol drift is detected."
@@ -203,7 +207,8 @@ TOOLS = [
             "Read codex app-server state (connection-level — no cold-start, fast). "
             "query: models (model catalog) | auth (login status) | config (current codex "
             "config) | limits (rate limits) | usage (token usage) | servers (MCP servers "
-            "codex sees) | features (experimental flags) | profiles (permission profiles). "
+            "codex sees) | features (experimental flags) | profiles (permission profiles) | "
+            "approval (the #277 unattended/park knobs + their source — purely local, no codex). "
             "Returns {query, result}."
         ),
         "inputSchema": {
@@ -213,7 +218,7 @@ TOOLS = [
                 "query": {
                     "type": "string",
                     "enum": ["models", "auth", "config", "limits", "usage",
-                             "servers", "features", "profiles"],
+                             "servers", "features", "profiles", "approval"],
                     "description": "Which read to perform.",
                 },
             },
@@ -250,6 +255,27 @@ TOOLS = [
                            "enum": ["low", "medium", "high", "xhigh"], "default": "medium"},
                 "timeout": {"type": "number",
                             "description": "Optional work-duration cap in seconds."},
+            },
+        },
+    },
+    {
+        "name": "codex_approve",
+        "description": (
+            "Resume a codex turn that PARKED at an approval (unattended model-in-the-loop, #277). "
+            "When codex_run returns {status:'awaiting_approval', park_token, approval:{decisions:[…]}}, "
+            "the orchestrating model decides and calls codex_approve to resume the parked turn. "
+            "Single-use park_token; decision_id is one of the approval's decisions[].id (or 'decline'). "
+            "NOT a codex_run overload — no prompt/mcp. Returns the turn's final result, the next "
+            "awaiting_approval payload (multi-approval turn), or {error:'parked turn expired'}."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["park_token", "decision_id"],
+            "properties": {
+                "park_token": {"type": "string",
+                               "description": "The park_token from the awaiting_approval payload."},
+                "decision_id": {"type": "string",
+                                "description": "Chosen decisions[].id (or 'decline')."},
             },
         },
     },
@@ -327,6 +353,10 @@ SERVER_INSTRUCTIONS = (
     "| `commit:<sha>` | `custom:<instructions>`).\n"
     "- Autonomous coding/research task in isolation → `codex_run` (mode `review` | `implement`).\n"
     "- Check codex availability / models / config / auth / usage → `codex_info` (no cold start).\n"
+    "- If unattended approval is armed, `codex_run` may return `{status:awaiting_approval, "
+    "park_token, approval:{kind, decisions:[{id,label}], …evidence…}}` INSTEAD of prompting a human "
+    "— YOU decide from the evidence and call `codex_approve(park_token, decision_id)` to resume the "
+    "parked turn (decision_id = one of approval.decisions[].id, or 'decline').\n"
     "Pass `mcp:'isolated'` unless cross-server tools are needed."
 )
 
@@ -369,7 +399,13 @@ def main():
         return None              # 'none' — timeout / blank / bad JSON (JsonRpcStream dropped it)
 
     while True:
-        kind, req = _cc_stream.next_frame(None)   # block between turns
+        if _v2_state_machine.is_parked():
+            # #277 §7: a turn is parked — DON'T block forever (the model may never resume). Run a
+            # finite cap-bounded wait that also watches the child (CCStream is blind to it); on
+            # cap/EOF/child-death it tears the park down. A CC frame is handed back to dispatch below.
+            kind, req = _parked_wait(_get_manager(), _v2_state_machine, cc_write_fn)
+        else:
+            kind, req = _cc_stream.next_frame(None)   # block between turns
         if kind == "eof":
             break  # CC stdin closed
         if req is None:
@@ -391,10 +427,17 @@ def main():
                 args = params.get("arguments") or {}  # `arguments: null` → {} (not None)
                 args["_cc_id"] = mid  # inject for busy/eof framing
                 tool_name = params.get("name")
-                if tool_name == "codex_info":
+                if _parked_busy_block(tool_name, _v2_state_machine):
+                    # #277 C12: a turn is parked — every non-approve tool busy-blocks, park PRESERVED.
+                    res = _v2_state_machine.busy_error()
+                elif tool_name == "codex_info":
                     res = codex_info_v2(args)
                 elif tool_name == "codex_review":
                     res = codex_review_v2(args, cc_write_fn=cc_write_fn, cc_read_fn=cc_read_fn)
+                elif tool_name == "codex_approve":
+                    # #277: resume a parked turn — routed BY NAME before the codex_run fallback and
+                    # before any validation/ensure() (codex_approve needs no prompt/mcp/codex binary).
+                    res = codex_approve_v2(args, cc_write_fn=cc_write_fn, cc_read_fn=cc_read_fn)
                 else:
                     res = codex_run_v2(args, cc_write_fn=cc_write_fn, cc_read_fn=cc_read_fn)
                 tool_result: dict = {"content": [{"type": "text", "text": json.dumps(res, indent=2)}]}
@@ -874,6 +917,10 @@ class AppServerManager:
         self._codex_version = None
         self._isolation_sig = None   # tuple(isolation_argv); None forces first spawn
         self._last_thread_meta = {}
+        # #277 return-and-resume: the parked-turn record while a turn is suspended at a
+        # park_for_model approval — {park_token, thread_id, inner_gen, isolation_sig, started_at,
+        # request_frame, decision_ids}. None when no turn is parked.
+        self._parked = None
 
     def _next_id(self) -> int:
         with self._next_id_lock:
@@ -1506,31 +1553,287 @@ def _translate_cached(lang, endpoint, model, texts_tuple):
     return tuple(arr)
 
 
-def _translate_texts(texts, lang):
-    """Translate each string to `lang` via LiteLLM (opt-in, fail-open, batched).
+# ── literal masking — protect paths/commands/identifiers from MT mangling ──
+# Empirically a translator MANGLES file paths and shell commands ("check"->"keck",
+# "git apply patch.diff"->"git applect.diff"). Swap each literal for a [N] placeholder
+# (proven to survive OPUS-MT 3/3 and Google), translate only the prose, restore the
+# literals verbatim. Side benefits: redacts the literals from any REMOTE egress (the
+# translator sees only the prose skeleton), and raises the cache hit-rate (unique
+# paths/UUIDs collapse to the same [N], so two narratives differing only in a path
+# share a cache entry yet each restores its own path).
+_MASK_SPAN_RE = re.compile(
+    r"(`[^`]+`"                # backtick code span
+    r"|[\w.+-]+/[\w./+-]+"     # RELATIVE path incl. leading segment (mcp/codex_server.py, src/a.py)
+    r"|~?/[^\s\"'`),;]+"       # absolute / home path (/tmp/x, ~/foo)
+    r"|\"[^\"]+\""             # double-quoted literal
+    r"|(?<![A-Za-z])'[^']+'"   # single-quoted literal; lookbehind skips apostrophes (don't, user's)
+    r"|\b\w+(?:[._]\w+)+\b)"   # dotted/snake identifier (test_parse_ledger, foo.bar)
+)
 
-    Returns a list (same length/order). lang-off, no key, or ANY failure → originals.
-    None / blank entries pass through untouched (kept in position).
-    """
+
+def _mask_literals(text):
+    """Return (masked_text, pairs): each protected literal replaced by a [N] placeholder.
+
+    pairs is a list of (placeholder_token, original) — pass both to _unmask_literals.
+    Placeholder numbering starts ABOVE any [d] already present in `text` so a generated
+    placeholder can never collide with the input's own bracketed tokens (list indices,
+    citations, foo[1].txt) — without that, _unmask's replace would corrupt both (#review-P2)."""
+    existing = [int(m) for m in re.findall(r"\[(\d+)\]", text)]
+    base = (max(existing) + 1) if existing else 0
+    pairs = []
+
+    def _repl(m):
+        tok = f"[{base + len(pairs)}]"
+        pairs.append((tok, m.group(0)))
+        return tok
+
+    return _MASK_SPAN_RE.sub(_repl, text), pairs
+
+
+def _unmask_literals(text, pairs):
+    """Restore generated [N] placeholders with their original literals (verbatim). Only the
+    tokens THIS masking generated are replaced — the input's own [d] tokens are untouched."""
+    for tok, original in pairs:
+        text = text.replace(tok, original)
+    return text
+
+
+def _placeholders_intact(translated, pairs):
+    """True iff `translated` is a string in which every generated placeholder token appears
+    EXACTLY once. A translator that DROPPED a [N] would silently lose the literal (an approval
+    dialog missing its path/command), one that DUPLICATED it would repeat the literal, and a
+    NON-STRING element (buggy provider) must not crash the validation — all are rejected so the
+    dispatcher falls through to the next provider / English."""
+    if not isinstance(translated, str):
+        return False
+    return all(translated.count(tok) == 1 for tok, _ in pairs)
+
+
+# ── google provider — keyless unofficial client=gtx endpoint ──────────────────
+# No API key, zero new deps (stdlib urllib). Per-string, 1 retry on a transient
+# failure, hard per-call timeout (the dialog is synchronous — a human waits). Best
+# prose quality of the lightweight options; the masking layer above keeps paths/
+# commands LOCAL so only the prose skeleton egresses. UNOFFICIAL: violates Google's
+# robots.txt/ToS and can be rate-limited (429) on bursts — fine for the tiny opt-in
+# volume here; failure falls through to the next provider, ultimately English.
+_GOOGLE_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
+_GOOGLE_TIMEOUT = 1.5     # hard per-call ceiling (s)
+_GOOGLE_BACKOFF = 0.2     # short pause before the single retry (s)
+
+
+def _google_http(text, lang, timeout):
+    """Translate ONE string via the keyless Google client=gtx endpoint. Raises on error.
+
+    Isolated so tests can monkeypatch the transport."""
+    q = urllib.parse.urlencode({"client": "gtx", "sl": "auto", "tl": lang, "dt": "t", "q": text})
+    req = urllib.request.Request(_GOOGLE_ENDPOINT + "?" + q,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.load(r)
+    # data[0] is a list of [translated_segment, original_segment, ...] chunks
+    return "".join(seg[0] for seg in data[0] if seg and seg[0])
+
+
+def _translate_google(texts, lang):
+    """Translate each string via the keyless Google endpoint (per-string, 1 retry).
+
+    Returns a list (same length/order) on success, or None on persistent failure so
+    the dispatcher falls through to the next provider. No API key needed."""
+    out = []
+    for t in texts:
+        got = None
+        for attempt in range(2):  # initial try + one retry
+            try:
+                got = _google_http(t, lang, _GOOGLE_TIMEOUT)
+                break
+            except Exception:
+                if attempt == 0:
+                    time.sleep(_GOOGLE_BACKOFF)
+                else:
+                    return None
+        if not got or not got.strip():
+            return None
+        out.append(got)
+    return out
+
+
+# ── opus provider — offline OPUS-MT via CTranslate2 (lazy, optional) ───────────
+# Privacy-first ON-DEVICE fallback: ZERO egress, ~70-80MB int8 model, runtime needs
+# only `ctranslate2` + `sentencepiece` (NO torch/transformers). OPT-IN: the plugin
+# does NOT install these deps or ship the model — set BULLDOZER_OPUS_MODEL_DIR to a
+# CTranslate2 OPUS-MT model dir (e.g. a pre-converted ordois/opus-mt-en-ru-ctranslate2-int8)
+# containing model.bin + source.spm (+ target.spm). Unavailable -> returns None and the
+# dispatcher falls through. Prose is rougher than Google/LLM, but the masking layer keeps
+# every path/command verbatim — which is exactly what an approval dialog requires.
+_OPUS_ENGINE = None  # cached (Translator, sp_source, sp_target) once loaded
+
+
+def _opus_model_dir():
+    return (os.environ.get("BULLDOZER_OPUS_MODEL_DIR") or "").strip()
+
+
+def _opus_available():
+    """True iff the model dir holds a loadable CT2 model (model.bin) AND ctranslate2 +
+    sentencepiece import. The model.bin check rejects a raw HF snapshot that still holds
+    only a .zip — so 'available' means the engine can actually load, not just that a dir
+    and the deps exist (a missing model.bin would otherwise fail-open silently)."""
+    d = _opus_model_dir()
+    if not d or not os.path.isfile(os.path.join(d, "model.bin")):
+        return False
+    import importlib.util
+    return all(importlib.util.find_spec(m) for m in ("ctranslate2", "sentencepiece"))
+
+
+def _opus_load(d):
+    """Load (Translator, sp_source, sp_target) from CT2 model dir `d`. Raises on failure.
+    Isolated so tests can monkeypatch the heavy ctranslate2/sentencepiece load."""
+    import ctranslate2
+    import sentencepiece as spm
+    tr = ctranslate2.Translator(d, device="cpu")
+    src = spm.SentencePieceProcessor(model_file=os.path.join(d, "source.spm"))
+    tgt_path = os.path.join(d, "target.spm")
+    tgt = (spm.SentencePieceProcessor(model_file=tgt_path)
+           if os.path.isfile(tgt_path) else src)
+    return (tr, src, tgt)
+
+
+def _opus_engine():
+    """Lazily load + cache (Translator, sp_source, sp_target), KEYED on the model dir so a
+    mid-process BULLDOZER_OPUS_MODEL_DIR change reloads instead of returning a stale engine
+    (module-singleton + context-param = stale-data trap). Raises on failure."""
+    global _OPUS_ENGINE
+    d = _opus_model_dir()
+    if _OPUS_ENGINE is None or _OPUS_ENGINE[0] != d:
+        _OPUS_ENGINE = (d,) + tuple(_opus_load(d))
+    return _OPUS_ENGINE[1], _OPUS_ENGINE[2], _OPUS_ENGINE[3]
+
+
+def _opus_translate_one(text, lang):
+    """Translate ONE string offline via OPUS-MT/CTranslate2. Raises on error.
+
+    `lang` is accepted for signature parity; the model dir IS the target language
+    (OPUS-MT models are language-pair-specific)."""
+    tr, src, tgt = _opus_engine()
+    # Marian/OPUS REQUIRES the </s> end token on the source — without it the decoder
+    # never terminates cleanly and degenerates into a repetition loop that also mangles
+    # the [N] placeholders (verified empirically against ordois/opus-mt-en-ru CT2).
+    tokens = src.encode(text, out_type=str) + ["</s>"]
+    res = tr.translate_batch([tokens])
+    return tgt.decode(res[0].hypotheses[0])
+
+
+def _translate_opus(texts, lang):
+    """Offline OPUS-MT translation. Returns a list (same length/order), or None if
+    unavailable or on any failure (so the dispatcher falls through). Lazy/optional."""
+    if not _opus_available():
+        return None
+    out = []
+    for t in texts:
+        try:
+            got = _opus_translate_one(t, lang)
+        except Exception:
+            return None
+        if not got or not got.strip():
+            return None
+        out.append(got)
+    return out
+
+
+def _translate_openai(texts, lang):
+    """LLM / OpenAI-compatible provider (the original #247 path; also drives a local
+    Ollama endpoint). Returns a list (same length/order), or None on no-key / failure
+    so the dispatcher falls through. Batched JSON + lru-cached (successes only)."""
+    if not _translate_key():
+        return None
+    try:
+        out = _translate_cached(lang, _translate_endpoint(), _translate_model(), tuple(texts))
+    except Exception as e:
+        _drift_warn(None, "TRANSLATE_FAILED", f"openai: {type(e).__name__}: {str(e)[:100]}")
+        return None
+    return list(out) if out and len(out) == len(texts) else None
+
+
+# Provider registry — name -> function attribute name (resolved via globals() at call
+# time, NOT captured function objects, so monkeypatch/hot-swap of a provider takes effect).
+# The dispatcher tries the configured chain in order; each provider returns a list
+# (success) or None (unavailable/failed -> try the next). Failures are NEVER cached —
+# each provider's own cache memoizes successes only.
+_PROVIDERS = {
+    "openai": "_translate_openai",
+    "google": "_translate_google",
+    "opus": "_translate_opus",
+}
+
+
+def _translate_providers():
+    """Parse BULLDOZER_TRANSLATE_PROVIDER into an ordered chain. Unset -> ['openai']
+    (#247 back-compat); 'off' -> [] (disabled); else a comma-list, e.g. 'google,opus'
+    (Google primary, OPUS-MT on-device fallback)."""
+    raw = (os.environ.get("BULLDOZER_TRANSLATE_PROVIDER") or "").strip().lower()
+    if not raw:
+        return ["openai"]
+    if raw == "off":
+        return []
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _translate_texts(texts, lang):
+    """Translate each string to `lang` (opt-in, fail-open).
+
+    Pipeline: MASK literals (paths/commands/identifiers -> [N] placeholders) -> try the
+    configured provider chain in order -> RESTORE the literals verbatim. lang-off,
+    provider 'off', or ALL providers failing -> originals (English). None/blank entries
+    pass through untouched (kept in position). Masking keeps every literal byte-exact AND
+    out of any remote provider's egress, and raises the cache hit-rate (paths -> [N])."""
     texts = list(texts)
-    if not lang or not _translate_key():
+    if not lang:
+        return texts
+    providers = _translate_providers()
+    if not providers:
         return texts
     idxs = [i for i, t in enumerate(texts) if t and str(t).strip()]
     if not idxs:
         return texts
-    payload = tuple(str(texts[i])[:2000] for i in idxs)  # bound input size
-    try:
-        out = _translate_cached(lang, _translate_endpoint(), _translate_model(), payload)
-    except Exception as e:
-        # fail-open on ANY failure (TranslateError, HTTP/timeout, weird return); log best-effort
-        # so a silent English fallback is diagnosable (why localization isn't working).
-        _drift_warn(None, "TRANSLATE_FAILED", f"{type(e).__name__}: {str(e)[:120]}")
-        return texts
-    if not out or len(out) != len(idxs):
+    masked, spans = [], []
+    for i in idxs:
+        m, sp = _mask_literals(str(texts[i])[:2000])  # bound input size
+        masked.append(m)
+        spans.append(sp)
+    out = None
+    for name in providers:
+        fn = globals().get(_PROVIDERS.get(name, ""))  # resolve fresh (monkeypatch-friendly)
+        if fn is None:
+            continue
+        try:
+            res = fn(masked, lang)
+        except Exception as e:
+            _drift_warn(None, "TRANSLATE_FAILED", f"{name}: {type(e).__name__}: {str(e)[:100]}")
+            res = None
+        if (isinstance(res, list) and len(res) == len(masked)
+                and all(isinstance(x, str) for x in res)
+                and all(_placeholders_intact(res[k], spans[k]) for k in range(len(masked)))):
+            out = res
+            break
+        # any malformed shape (non-list, wrong length, non-string element) or a dropped/
+        # duplicated placeholder is rejected → try the next provider, ultimately English
+        # (never accept a corrupted literal, never crash the dialog on a buggy provider).
+    if out is None:
         return texts
     for j, i in enumerate(idxs):
-        texts[i] = out[j]
+        texts[i] = _unmask_literals(out[j], spans[j])
     return texts
+
+
+def _approval_narrative_max() -> int:
+    """Max chars for codex's narrative in an approval dialog / park payload (#224). codex
+    routinely writes pre-tool-call explanations longer than the old hardcoded 500, so the
+    default is raised to 2000 and made tunable via BULLDOZER_APPROVAL_NARRATIVE_MAX. Clamped
+    [200, 8000]; the park's _bound_evidence total-budget guard remains the hard backstop."""
+    try:
+        v = int(os.environ.get("BULLDOZER_APPROVAL_NARRATIVE_MAX") or "2000")
+    except (TypeError, ValueError):
+        return 2000
+    return max(200, min(v, 8000))
 
 
 def _narrative_line(narrative, label="Codex explained") -> str:
@@ -1540,18 +1843,20 @@ def _narrative_line(narrative, label="Codex explained") -> str:
     agentMessage deltas just before the approval, NOT part of the approval request
     protocol-wise. Context only, never authoritative for the action. `narrative` is
     already translated (if a language is configured) by the caller; `label` is localized.
-    """
+    Cap is _approval_narrative_max() chars / 12 lines (raised from 6/500 — codex narratives
+    are often larger; tune via BULLDOZER_APPROVAL_NARRATIVE_MAX)."""
     if not narrative:
         return ""
-    text = _truncate_for_display(str(narrative).strip(), max_lines=6, max_chars=500)
+    text = _truncate_for_display(str(narrative).strip(), max_lines=12, max_chars=_approval_narrative_max())
     return f"{label}: {text}" if text else ""
 
 
 def _build_command_approval_message(params: dict, narrative=None) -> str:
     """Compose the commandExecution approval dialog (#239 truncation + #224 context).
 
-    Order: authoritative command (head+tail truncated) + cwd first, then optional
-    context (reason / friendly actions / network host / codex narrative). EVERY
+    Order: codex narrative (intent) LEADS — read what codex means to do before the raw,
+    often-truncated command — then authoritative command + cwd, then optional
+    context (reason / friendly actions / network host). EVERY
     variable-length field is individually bounded so a huge reason / actions / cwd
     can't reintroduce the #239 wall in spite of command truncation. When a language is
     configured (#247) the DYNAMIC content (reason + narrative) is translated and the
@@ -1562,8 +1867,11 @@ def _build_command_approval_message(params: dict, narrative=None) -> str:
     reason_t, narr_t = params.get("reason"), narrative
     if lang:
         reason_t, narr_t = _translate_texts([params.get("reason"), narrative], lang)
-    lines = [
-        L["approval_request"],
+    lines = [L["approval_request"]]
+    nar = _narrative_line(narr_t, L["explained"])
+    if nar:                          # codex's intent LEADS — before the raw, often-truncated command
+        lines.append(nar)
+    lines += [
         # head+tail: keep the executable head AND tail of a long command visible.
         f"{L['command']}: {_truncate_for_display(params.get('command') or '(none)', tail_lines=4)}",
         f"{L['cwd']}: {_truncate_for_display(str(params.get('cwd') or '(unknown)'), max_lines=1, max_chars=200)}",
@@ -1578,9 +1886,6 @@ def _build_command_approval_message(params: dict, narrative=None) -> str:
         proto = nac.get("protocol") or "network"
         host = _truncate_for_display(str(nac["host"]), max_lines=1, max_chars=100)
         lines.append(L["network"].format(proto=proto, host=host))
-    nar = _narrative_line(narr_t, L["explained"])
-    if nar:
-        lines.append(nar)
     return "\n".join(lines)
 
 
@@ -1615,6 +1920,9 @@ def _summarize_permissions(perms) -> str:
             v = fs.get(k)
             if isinstance(v, list):
                 items += ["{}:{}".format(k, x) for x in v]
+        if len(items) > _PAYLOAD_MAX_ITEMS:           # R1-F6: cap the joined list (a 1000-entry profile
+            extra = len(items) - _PAYLOAD_MAX_ITEMS   # otherwise produced a ~15KB summary string)
+            items = items[:_PAYLOAD_MAX_ITEMS] + ["(+{} more)".format(extra)]
         if items:
             fs_part = "fileSystem " + ", ".join(items)
     net_part = ""
@@ -1623,7 +1931,17 @@ def _summarize_permissions(perms) -> str:
         if net.get("enabled"):
             net_part = "network: enabled"
         else:
-            net_part = "network: " + ", ".join("{}={}".format(k, v) for k, v in net.items())
+            parts = []
+            for k, v in net.items():                  # R1-F6: bound list values (e.g. a 2000-host list)
+                if isinstance(v, list):
+                    shown = [str(x) for x in v[:_PAYLOAD_MAX_ITEMS]]
+                    if len(v) > _PAYLOAD_MAX_ITEMS:
+                        shown.append("+{} more".format(len(v) - _PAYLOAD_MAX_ITEMS))
+                    vs = "[" + ", ".join(shown) + "]"
+                else:
+                    vs = str(v)
+                parts.append("{}={}".format(k, vs))
+            net_part = "network: " + ", ".join(parts)
     # network FIRST, one part per line (review B): the security-sensitive egress grant stays
     # visible even when a large fileSystem list is truncated head-only — and a newline-joined
     # summary lets the caller's head+tail char cap keep BOTH ends instead of dropping the tail.
@@ -1652,6 +1970,9 @@ def _build_simple_approval_message(kind: str, reason, narrative=None, details=No
     # approval path (every other path here is fail-open).
     header = L.get(kind) or _DIALOG_LABELS_EN.get(kind) or kind
     lines = [header]
+    nar = _narrative_line(narr_t, L["explained"])
+    if nar:                          # narrative LEADS — after the header, before details/reason
+        lines.append(nar)
     if details:  # authoritative (paths/hosts) — bounded, never translated; tail_lines keeps
         # BOTH ends so the security-sensitive network grant (rendered first) AND the fileSystem
         # tail survive truncation of a large profile (review B).
@@ -1659,9 +1980,6 @@ def _build_simple_approval_message(kind: str, reason, narrative=None, details=No
     lines.append(
         f"{L['reason']}: {_truncate_for_display(str(reason_t) if reason_t else '(none)', max_lines=3, max_chars=300)}",
     )
-    nar = _narrative_line(narr_t, L["explained"])
-    if nar:
-        lines.append(nar)
     return "\n".join(lines)
 
 
@@ -1686,11 +2004,13 @@ def _approval_decision_label(decision) -> str:
     return "other"
 
 
-def _log_approval_event(method, decision, wait_ms, timed_out) -> None:
+def _log_approval_event(method, decision, wait_ms, timed_out, unattended=False, rule=None) -> None:
     """Best-effort one-line record of a completed approval (#251 step-0).
 
     Reuses the stable codex log channel (BULLDOZER_CODEX_LOG / bulldozer-codex.log).
-    NEVER raises — logging must never break an approval.
+    NEVER raises — logging must never break an approval. When the unattended judge (#251)
+    decided in-process, appends `| unattended=true | rule=<verdict>` so the operator can
+    review what was auto-decided while away (attended lines keep the original format).
     """
     def _san(v):
         # Keep the line greppable for the #251 miner: a CC-controlled value (e.g. the
@@ -1701,13 +2021,551 @@ def _log_approval_event(method, decision, wait_ms, timed_out) -> None:
         path = os.environ.get("BULLDOZER_CODEX_LOG") or os.path.expanduser(
             "~/.claude/hooks/bulldozer-codex.log")
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        extra = f" | unattended=true | rule={_san(rule)}" if unattended else ""
         with open(path, "a") as f:
             f.write(
                 f"{_now_iso()} | APPROVAL | method={_san(method)} | "
                 f"decision={_san(_approval_decision_label(decision))} | "
-                f"wait_ms={wait_ms} | timed_out={'true' if timed_out else 'false'}\n")
+                f"wait_ms={wait_ms} | timed_out={'true' if timed_out else 'false'}{extra}\n")
     except Exception:
         pass
+
+
+def _log_unattended_decision(method, decision, rule) -> None:
+    """#280 C: best-effort APPROVAL audit line for an AUTOMATED (non-attended) decision — inline
+    fast_accept / fail_closed_decline, the model-resumed parked decision, and _teardown_park's
+    auto-decline. Before #280 only attended bridge_approval logged, so unattended runs left NO audit
+    trail for exactly the decisions an operator most wants to review. wait_ms=0 (no human wait);
+    unattended=True + the rule that fired. _log_approval_event is itself never-raising."""
+    _log_approval_event(method, decision, 0, False, unattended=True, rule=rule)
+
+
+# ── #251: unattended approval judge ──────────────────────────────────────────
+# When the operator ARMS unattended mode (env or sentinel file), a deterministic
+# capability-judge answers approvals in-process — accepting routine in-sandbox work,
+# gating escalations (permissions / network / catastrophic-destructive). Default OFF →
+# today's human dialog. Empirical basis + posture rationale:
+#   docs/superpowers/specs/2026-06-24-codex-unattended-approval-policy-design.md
+# The safety FLOOR is codex's own sandbox + this escalation gate, NOT the string denylist
+# (which is target-anchored defense-in-depth). 27,873 real codex commands studied: ~90%+
+# reads, 0 real destructive escalations (every loose-regex "destructive" hit was an FP —
+# grep-for-pattern, trap-cleanup-of-own-mktemp, in-project __pycache__). The classifier is
+# tuned to reproduce that: those three shapes ACCEPT; real catastrophes DECLINE.
+
+_UNATTENDED_SENTINEL_DEFAULT = "~/.claude/bulldozer-unattended"
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _unattended_active() -> bool:
+    """True iff unattended approval mode is armed — env truthy OR sentinel file present.
+    Resolved FRESH per approval so arming/disarming mid-run takes effect immediately."""
+    if os.environ.get("BULLDOZER_APPROVAL_UNATTENDED", "").strip().lower() in _TRUTHY:
+        return True
+    sentinel = os.environ.get("BULLDOZER_APPROVAL_UNATTENDED_FILE") or os.path.expanduser(
+        _UNATTENDED_SENTINEL_DEFAULT)
+    try:
+        return bool(sentinel) and os.path.exists(sentinel)
+    except Exception:
+        return False
+
+
+# read/search tools that, as the LEADING verb, make destructive/network-looking ARGS harmless
+# (`rg "rm -rf /"` / `grep "curl …"` are SEARCHING for the text, not running it — the study's
+# dominant FP). Checked BEFORE the network/destructive scans by deliberate design.
+# ── #277 ALLOW-LIST posture: DECLINE-by-default; ACCEPT only forms provably in these sets. ──
+# Network / arbitrary-execution / destructive verbs need NO denylist — absent from the allow-list,
+# they DECLINE by default (this is what converges; the denylist treadmill is gone).
+
+# absolute-path roots that are catastrophic when not under the project
+_SYS_ROOTS = ("/etc", "/usr", "/bin", "/sbin", "/var", "/System", "/Library",
+              "/Users", "/opt", "/private", "/dev", "/boot", "/root", "/Applications")
+
+
+def _safe_tokens(s: str) -> list:
+    try:
+        import shlex
+        return shlex.split(s, posix=True)
+    except Exception:
+        return s.split()
+
+
+def _is_catastrophic_target(s: str, project_root) -> bool:
+    """A destructive verb's argument is catastrophic if it targets ~ / $HOME / a system root /
+    bare / — or an absolute path OUTSIDE the project. Relative paths, $vars (mktemp temps), and
+    in-project absolute paths are NOT catastrophic (dodges the study's FPs)."""
+    pr = (project_root or "").rstrip("/")
+    for t in _safe_tokens(s):
+        if t in ("~", "/") or t.startswith("~/") or t.startswith("$HOME") or t.startswith("${HOME}"):
+            return True
+        if re.search(r'(^|/)\.\.(/|$)', t):    # `..` path traversal — may escape the project
+            return True
+        if t.startswith("/"):
+            if pr and (t == pr or t.startswith(pr + "/")):
+                continue                       # in-project absolute → safe
+            root = "/" + t.lstrip("/").split("/", 1)[0]
+            if t == "/" or root in _SYS_ROOTS:
+                return True
+            return True                        # any absolute path outside the project → gate
+    return False
+
+
+def _split_segments(cmd: str) -> list:
+    """Split a command line on shell separators (`&&` `||` `;` `|` newline) that are NOT inside
+    quotes. A naive re.split breaks on separators inside quoted args — `rg "a|b"`, `sh -c 'x && y'`
+    — fragmenting the command into bogus 'verbs' that an allow-list then wrongly DECLINES."""
+    segs, buf, i, n, q = [], [], 0, len(cmd), None
+    while i < n:
+        c = cmd[i]
+        if q:                                    # inside a quote — copy verbatim until it closes
+            buf.append(c)
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            q = c; buf.append(c); i += 1; continue
+        if c in (";", "\n"):
+            segs.append("".join(buf)); buf = []; i += 1; continue
+        if c == "&" and i + 1 < n and cmd[i + 1] == "&":
+            segs.append("".join(buf)); buf = []; i += 2; continue
+        if c == "|" and i + 1 < n and cmd[i + 1] == "|":
+            segs.append("".join(buf)); buf = []; i += 2; continue
+        if c == "|":
+            segs.append("".join(buf)); buf = []; i += 1; continue
+        buf.append(c); i += 1
+    segs.append("".join(buf))
+    return segs
+
+
+def _all_read_actions(actions) -> bool:
+    if not isinstance(actions, list) or not actions:
+        return False
+    return all(isinstance(a, dict) and a.get("type") in ("read", "listFiles", "search")
+               for a in actions)
+
+
+def _has_escalation_amendment(params: dict) -> bool:
+    """codex structured escalation signals → gate (network host, proposed network/exec amendments)."""
+    nac = params.get("networkApprovalContext")
+    if isinstance(nac, dict) and nac.get("host"):
+        return True
+    if params.get("proposedNetworkPolicyAmendments"):
+        return True
+    if params.get("proposedExecpolicyAmendment"):
+        return True
+    for d in (params.get("availableDecisions") or []):
+        # A dict decision is an amendment-bearing escalation OFFER (acceptWithExecpolicyAmendment,
+        # applyNetworkPolicyAmendment, …) — codex only offers it when the command needs to escalate.
+        if isinstance(d, dict) and any("Amendment" in k or k.startswith("acceptWith") for k in d):
+            return True
+    return False
+
+
+# ── #277 model-in-the-loop routing: the 3-way fast-path that REPLACES the classify_approval verdict ──
+# route_approval / _is_trivially_safe / _fast_path_scope are the SURVIVING approval logic; the
+# classify_approval verdict + the whack-a-mole gates below it are deleted at switchover (Task 7). The
+# fast-path is deliberately NARROW: anything not provably trivial → "park_for_model" (the model decides).
+# It NEVER parses git subcommands / wrappers / rm-targets to safely-accept (that treadmill is the
+# non-convergent trap the design rejects — parking is always safe).
+_TRIVIAL_READS = frozenset({
+    "cat", "ls", "pwd", "grep", "egrep", "fgrep", "rg", "nl", "head", "tail", "wc", "cut",
+    "sort", "uniq", "tr", "column", "diff", "comm", "stat", "file", "basename", "dirname",
+    "realpath", "which", "type", "echo", "printf", "true", "date", "tree", "ps", "df", "du",
+    "uname", "whoami", "hostname",
+})
+# Trivial in-project writes: purely ADDITIVE only. rm/cp/mv/ln/tee PARK (distinguishing a safe
+# `rm <file>` from `rm -rf .` without _rm_target_too_broad — deleted in Task 7 — is the whack-a-mole
+# the design rejects; parking them is the convergent, always-safe choice).
+_TRIVIAL_WRITES = frozenset({"mkdir", "touch"})
+# Opt-in "local-work" scope: a few PLAIN bare build/test verbs (npm/cargo gated to safe subcommands).
+_LOCALWORK_BARE = frozenset({"pytest", "make"})
+# Any shell-complexity marker disqualifies the fast-path: ANY `$` (cmd-subst $(…), $VAR/${VAR}/$1,
+# AND special params $@/$*/$?/$$/$!/$# — R1-F1: the old `\$[\w({]` missed $@/$* which a read verb
+# would then fast-accept), `…` cmd-subst, process-subst <(…)/>(…), or a leading-position ~ expansion.
+# (write-redirects + root-glob are checked per-segment below.)
+_TRIVIAL_COMPLEXITY = re.compile(r'\$|`|<\(|>\(|(?:^|\s)~')
+# A trivial segment may contain ONLY these chars (positive allow-list — ends the operator whack-a-mole:
+# any shell metachar OUTSIDE this set → park). Word chars, whitespace, common path/flag punctuation, globs
+# (*?[]), and quotes are allowed; EXCLUDED (→ park): redirects < >, background/subshell/group & ( ) { },
+# pipes/seps | ; (also split earlier), expansions $ ` ~, escape \, history !, comment #. (R6-F1/R7-F1.)
+_TRIVIAL_SEG_RE = re.compile(r"^[\w\s./\-_=,:@%+*?\[\]'\"]*$")
+
+
+def _fast_path_scope() -> str:
+    """'reads' (default) | 'local-work'. Env BULLDOZER_FAST_PATH_SCOPE, read FRESH per approval.
+    Any unrecognized value behaves as 'reads' (the local-work branch simply never fires)."""
+    return os.environ.get("BULLDOZER_FAST_PATH_SCOPE") or "reads"
+
+
+# #280 A: per-VERB flags/operands that turn a _TRIVIAL_READS verb into EXEC, arbitrary-WRITE, or state
+# mutation — the CVE-2025-66032 (`sort -o`) bypass class. PER-VERB because the same flag differs by verb
+# (`ls -o` = long listing [safe] vs `sort -o` = write [dangerous]), so a global flag denylist would
+# wrongly park `ls -o`. Bounded by these verbs' stable documented flag sets — an explicit small map, NOT
+# the open-ended shell-operator space _TRIVIAL_SEG_RE guards. (Broad-READ flags `grep -R` /
+# `wc --files0-from` are finding-D — handled by read-path-bounding, not here.)
+_DANGEROUS_READ_VERB_FLAGS = {
+    "sort": frozenset({"-o", "--output", "--compress-program"}),   # -o/--output WRITE; --compress-program EXECs
+    "rg": frozenset({"--pre", "--pre-glob", "--hostname-bin"}),     # --pre[-glob]/--hostname-bin run a command
+    "tree": frozenset({"-o"}),                                      # -o writes the listing to a file
+    "date": frozenset({"-s", "--set"}),                            # sets the system clock (mutation)
+    "hostname": frozenset({"-F", "--file"}),                       # sets hostname from a file (mutation)
+}
+
+
+def _read_verb_subverts_to_exec_or_write(verb: str, toks: list) -> bool:
+    """#280 A: True iff a _TRIVIAL_READS verb carries a flag/operand that turns it into EXEC, an
+    arbitrary file WRITE, or a state mutation — so it must PARK, not fast-accept. Covers the flag forms
+    (incl. `--flag=value` and glued GNU short `-ofile`) AND the positional-output writers
+    (`uniq INPUT OUTPUT` writes the 2nd operand; a bare operand to `hostname` sets the name)."""
+    bad = _DANGEROUS_READ_VERB_FLAGS.get(verb)
+    if bad:
+        for t in toks[1:]:
+            base = t.split("=", 1)[0]                       # --output=/p → --output
+            if base in bad:
+                return True
+            for b in bad:                                   # glued GNU short flag: sort -ofile, tree -o<x>
+                if len(b) == 2 and b[0] == "-" and b[1] != "-" \
+                        and not base.startswith("--") and base.startswith(b) and base != b:
+                    return True
+    operands = [t for t in toks[1:] if not t.startswith("-")]
+    if verb == "uniq" and len(operands) >= 2:               # `uniq INPUT OUTPUT` → 2nd operand WRITES
+        return True
+    if verb == "hostname" and operands:                     # `hostname NEWNAME` → sets the hostname
+        return True
+    return False
+
+
+def _is_trivially_safe(command, project_root=None) -> bool:
+    """True iff EVERY segment of `command` is a plain read (or trivial in-project write) with NO
+    shell-complexity marker — the narrow fast-path predicate. What it cannot PROVE trivial → False
+    (→ park_for_model; the model decides with context). Honors _fast_path_scope(): 'local-work' also
+    accepts a few PLAIN bare build/test forms. Reuses the simple tokenizers only — never the deleted
+    parse-to-accept gates."""
+    if not isinstance(command, str) or not command.strip():
+        return False
+    if _TRIVIAL_COMPLEXITY.search(command):          # any $ / `…` / <(…) / >(…) / ~ → not trivial
+        return False
+    scope = _fast_path_scope()
+    for seg in _split_segments(command):
+        if not seg.strip():
+            continue                                 # blank piece (e.g. a trailing pipe) — skip
+        # ANY shell metachar OUTSIDE quotes → park (redirects < >, background/subshell/group & ( ) { },
+        # expansions $ ` ~, escape \, history ! — R1-F1/R6-F1/R7-F1: a positive allow-list, not a one-off
+        # blocklist, so a novel operator form can never silently fast-accept). Quote-aware (R8-F2): inert
+        # regex punctuation INSIDE quotes (rg "a|b") is fine — strip quoted spans before the check.
+        bare = re.sub(r'"[^"]*"|\'[^\']*\'', "", seg)
+        if not _TRIVIAL_SEG_RE.match(bare):
+            return False
+        toks = _safe_tokens(seg)                      # NO prefix-strip: env/time/FOO=bar stay the verb → park (R1-F1)
+        if not toks:
+            return False
+        if any(t.startswith("/") and any(c in t for c in "*?[") for t in toks):
+            return False                             # root-level glob → not trivial
+        if "/" in toks[0]:                            # R8-F1: a path-qualified executable (./cat, /tmp/cat,
+            return False                             # scripts/rg) is NOT a trusted bare verb → park
+        verb = toks[0]
+        if verb in _TRIVIAL_READS:
+            if _read_verb_subverts_to_exec_or_write(verb, toks):
+                return False                          # #280 A: read verb w/ exec/write/mutation flag → park
+            if _is_catastrophic_target(seg, project_root):
+                return False                          # #280 D: path-bound reads to the project (an
+            continue                                  # absolute/~/.. target outside → park, model decides)
+        if verb in _TRIVIAL_WRITES:
+            if _is_catastrophic_target(seg, project_root):
+                return False
+            continue
+        if scope == "local-work":
+            # PLAIN forms only — reject options (-x) and variable assignments (FOO=bar): `pytest -p
+            # evilplugin` loads a plugin, `make CC=/bad` overrides the compiler → both PARK (R1-F1).
+            if not any(t.startswith("-") or "=" in t for t in toks[1:]):
+                if verb in _LOCALWORK_BARE:
+                    continue
+                if verb == "npm" and len(toks) >= 2 and toks[1] == "test":
+                    continue
+                if verb == "cargo" and len(toks) >= 2 and toks[1] in ("build", "test"):
+                    continue
+        return False                                 # unknown / non-trivial verb → park
+    return True
+
+
+_WRAP_SHELLS = frozenset({"sh", "bash", "zsh"})
+# Absolute shell paths are unwrapped ONLY from these known-good system locations (codex_review P2): an
+# arbitrary absolute path like /tmp/sh is an untrusted executable — unwrapping it would let its trivial
+# inner fast-accept while the real binary run is /tmp/sh. Bare basenames (PATH-resolved) stay allowed.
+_TRUSTED_SHELL_DIRS = frozenset({"/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"})
+
+
+def _unwrap_shell_wrapper(command):
+    """#281: the codex app-server runs every command as `<shell> -lc '<script>'` (or `-c`). route_approval
+    must evaluate the INNER script — else _is_trivially_safe parks on the path-qualified shell verb
+    (`/bin/zsh`) at the R8-F1 check before any per-verb gate runs, so the fast-path (and the #280 A/D
+    gates) is DEAD live. Return the inner script for the EXACT app-server shape; else `command` unchanged
+    (fail-closed → the caller's predicate then parks the wrapper). Exact shape ONLY: basename ∈
+    {sh,bash,zsh} (bare or absolute-path), exactly ONE option `-c`/`-lc`, exactly ONE script token, NO
+    positional $0/args after it. `env zsh -lc` / `time sh -c` / multiple `-c` / `-s` / `--` / interactive
+    `-ic` / relative-path shell / UNTRUSTED absolute shell path (/tmp/sh) / nested wrappers → NOT unwrapped.
+    Absolute shells unwrap ONLY from _TRUSTED_SHELL_DIRS; bare basenames are PATH-resolved and allowed. The
+    inner then runs the SAME predicate as a bare command (codex itself unwraps `bash -lc` — codex/rules)."""
+    if not isinstance(command, str):
+        return command
+    toks = _safe_tokens(command)
+    if len(toks) != 3:                       # EXACTLY shell, -c/-lc, script — any arg after script → park
+        return command
+    shell, opt, script = toks
+    if shell.rsplit("/", 1)[-1] not in _WRAP_SHELLS:
+        return command                       # basename not a known shell (incl. python3 -c) → no unwrap
+    if "/" in shell:                         # has a path component (not a bare PATH-resolved basename)
+        if not shell.startswith("/"):
+            return command                   # relative-path shell (./zsh, scripts/sh) → no unwrap
+        if shell.rsplit("/", 1)[0] not in _TRUSTED_SHELL_DIRS:
+            return command                   # untrusted absolute shell (/tmp/sh) → don't trust inner (P2)
+    if opt not in ("-c", "-lc"):             # exactly one -c/-lc; -ic/-s/--/combined → no unwrap
+        return command
+    if not isinstance(script, str) or not script.strip():
+        return command
+    return script
+
+
+def route_approval(method, params, project_root=None):
+    """3-way routing for a codex approval request (#277): "fast_accept" (answer inline, no model
+    round-trip) | "park_for_model" (return to the orchestrating session model) | "fail_closed_decline"
+    (only a malformed/unrepresentable request). Consulted ONLY for the five approval methods;
+    requestUserInput / mcpServer-elicitation are NEVER passed here (they keep their human path)."""
+    params = params if isinstance(params, dict) else {}   # handle_server_request keeps truthy non-dict;
+    if _has_escalation_amendment(params):                 # normalize BEFORE any .get()/helper call (F5)
+        return "park_for_model"                           # structured escalation → the model decides
+    if method == "item/permissions/requestApproval":
+        return "park_for_model"
+    if method in ("item/fileChange/requestApproval", "applyPatchApproval"):
+        return "park_for_model"
+    cmd = params.get("command")
+    if method == "execCommandApproval":          # R9-F1: legacy → ALWAYS park (spec §4); never fast-accept
+        return "park_for_model"
+    inner = _unwrap_shell_wrapper(cmd)           # #281: evaluate the INNER script, not the /bin/zsh wrapper
+    if method == "item/commandExecution/requestApproval" and isinstance(cmd, str) and cmd.strip():
+        return "fast_accept" if _is_trivially_safe(inner, project_root) else "park_for_model"
+    if _all_read_actions(params.get("commandActions")) and isinstance(cmd, str) and cmd.strip():
+        return "fast_accept" if _is_trivially_safe(inner, project_root) else "park_for_model"
+    return "fail_closed_decline"
+
+
+# ── #277 park_for_model: the awaiting-payload (model-facing) + decision-response (codex-facing) builders ──
+# Both call _approval_decision_table on the SAME params → identical option order → identical opaque ids
+# (d0,d1,…), so the model's chosen id re-maps deterministically WITHOUT shared state. The per-method
+# result payloads MIRROR _bridge_approval_dispatch exactly (verified vs codex 0.142 schema), so a parked
+# resume produces the byte-identical reply a human dialog would.
+_APPROVAL_KIND = {
+    "item/commandExecution/requestApproval": "commandExecution",
+    "execCommandApproval": "commandExecution",
+    "item/fileChange/requestApproval": "fileChange",
+    "applyPatchApproval": "applyPatch",
+    "item/permissions/requestApproval": "permissions",
+}
+
+
+def _approval_decline_payload(method: str) -> dict:
+    """The method's safe-decline `result` payload (the literal 'decline' id + the fail-closed default)."""
+    if method == "item/permissions/requestApproval":
+        return PERM_DECLINE
+    if method in ("execCommandApproval", "applyPatchApproval"):
+        return {"decision": "denied"}
+    return {"decision": "decline"}          # command + fileChange
+
+
+def _approval_accept_payload(method: str) -> dict:
+    """The method's PLAIN-accept `result` payload for the `fast_accept` loop-body fast-path (#277). Only
+    the command methods ever fast-accept (route_approval parks permissions/fileChange), but the legacy
+    execCommandApproval uses the review-decision shape — so map it correctly."""
+    if method == "execCommandApproval":
+        return {"decision": "approved"}
+    return {"decision": "accept"}           # item/commandExecution/requestApproval (+ any other → bare accept)
+
+
+def _approval_decision_table(method: str, params: dict, acc=None) -> list:
+    """[(opaque_id, display_label, result_payload), …] — the bounded options the model picks from, each
+    mapped to the EXACT `result` payload codex expects. Deterministic order ⇒ stable d-ids across both
+    builders. Mirrors _bridge_approval_dispatch per method."""
+    params = params if isinstance(params, dict) else {}
+    if method == "item/commandExecution/requestApproval":
+        pairs = [(lbl, {"decision": dec}) for lbl, dec in build_command_approval_labels(params, acc=acc)]
+    elif method == "item/fileChange/requestApproval":
+        pairs = [(LBL_ALLOW_ONCE, {"decision": "accept"}),
+                 (LBL_ALLOW_SESSION, {"decision": "acceptForSession"}),
+                 (LBL_DONT_ALLOW, {"decision": "decline"}),
+                 (LBL_CANCEL, {"decision": "cancel"})]
+    elif method == "item/permissions/requestApproval":
+        requested = params.get("permissions")
+        requested = requested if isinstance(requested, dict) else {}
+        pairs = [(LBL_GRANT_TURN, {"permissions": requested, "scope": "turn"}),
+                 (LBL_GRANT_SESSION, {"permissions": requested, "scope": "session"}),
+                 (LBL_DONT_GRANT, PERM_DECLINE)]
+    elif method in ("execCommandApproval", "applyPatchApproval"):
+        pairs = [(LBL_ALLOW_ONCE, {"decision": "approved"}),
+                 (LBL_ALLOW_SESSION, {"decision": "approved_for_session"}),
+                 (LBL_DONT_ALLOW, {"decision": "denied"})]
+    else:
+        pairs = []
+    return [(f"d{i}", lbl, payload) for i, (lbl, payload) in enumerate(pairs)]
+
+
+_PAYLOAD_MAX_ITEMS = 40          # R1-F6: default max list entries / dict keys in a payload
+_PAYLOAD_MAX_STR = 4000          # R1-F6: default max chars for any single string field in a payload
+_PAYLOAD_MAX_TOTAL = 16000       # R1-F6: HARD byte budget for the whole model-facing awaiting payload
+
+
+def _bound_evidence(obj, _depth=0, max_str=_PAYLOAD_MAX_STR, max_items=_PAYLOAD_MAX_ITEMS):
+    """Recursively bound model-facing evidence (R1-F6): cap string length, list length (+N-more marker),
+    dict KEY count, and nesting depth. Parametrized so build_awaiting_payload can tighten the caps until
+    the WHOLE payload fits the total budget — no single field (network host list, unknown key, long
+    path/diff/scalar) can blow the MCP token limit. The UNBOUNDED original is what build_decision_response
+    echoes to codex on accept — only the evidence shown to the model is bounded."""
+    if _depth > 6:
+        return "… [nested too deep]"
+    if isinstance(obj, str):
+        return obj if len(obj) <= max_str else obj[:max_str] + "… [+{} chars]".format(len(obj) - max_str)
+    if isinstance(obj, list):
+        out = [_bound_evidence(x, _depth + 1, max_str, max_items) for x in obj[:max_items]]
+        if len(obj) > max_items:
+            out.append("… [+{} more]".format(len(obj) - max_items))
+        return out
+    if isinstance(obj, dict):
+        items = list(obj.items())
+        capped = {}
+        for k, v in items[:max_items]:
+            key = k if isinstance(k, str) else str(k)
+            if len(key) > max_str:                            # cap pathological dict KEYS too (R1-F6)
+                key = key[:max_str] + "…[+{} chars]".format(len(key) - max_str)
+            while key in capped:                              # deterministic collision resolution
+                key += "_"
+            capped[key] = _bound_evidence(v, _depth + 1, max_str, max_items)
+        if len(items) > max_items:
+            capped["_omitted_keys"] = len(items) - max_items
+        return capped
+    return obj
+
+
+def _bound_permissions(perms):
+    """Reorder a permission profile network-FIRST (egress is the security-load-bearing grant — must
+    survive truncation) for the model-facing payload. BOUNDING itself is applied by the final
+    _bound_evidence pass in build_awaiting_payload (which preserves this key order). The UNBOUNDED
+    original is what build_decision_response echoes to codex on accept."""
+    if not isinstance(perms, dict) or "network" not in perms:
+        return perms
+    return {"network": perms["network"], **{k: v for k, v in perms.items() if k != "network"}}
+
+
+def build_awaiting_payload(method: str, params, ts, narrative, park_token):
+    """Build the {status:'awaiting_approval', …} payload returned to the orchestrating session model
+    when a park_for_model approval suspends the turn (#277). Returns (payload, decision_ids). All
+    variable-size evidence (permission profiles, file-change diffs) is BOUNDED (R1-F6) so a huge
+    request can't blow the MCP token limit; build_decision_response still echoes the ORIGINAL to codex."""
+    params = params if isinstance(params, dict) else {}
+    ts = ts or {}
+    table = _approval_decision_table(method, params, acc=ts.get("acc"))
+    decisions = [{"id": d_id, "label": label} for d_id, label, _ in table]
+    decision_ids = {d_id for d_id, _, _ in table} | {"decline"}
+    kind = _APPROVAL_KIND.get(method, "unknown")
+    approval = {"kind": kind, "decisions": decisions}
+    if narrative:
+        approval["narrative"] = _truncate_for_display(
+            narrative, max_lines=12, max_chars=_approval_narrative_max())
+    if params.get("reason"):
+        approval["reason"] = params.get("reason")
+    if kind == "commandExecution":
+        cmd = params.get("command")
+        if isinstance(cmd, str):
+            approval["command"] = _truncate_for_display(cmd, tail_lines=6)
+        elif isinstance(cmd, list):                  # R10-F1: legacy argv-list shape (["ls","-la"]) → render it
+            approval["command"] = _truncate_for_display(" ".join(str(x) for x in cmd), tail_lines=6)
+        nac = params.get("networkApprovalContext")   # #280 B: surface the egress destination the human
+        if isinstance(nac, dict) and nac.get("host"):  # dialog shows — added BEFORE cwd/actions so the
+            approval["network"] = {                   # security-critical destination survives bounding
+                "host": _truncate_for_display(str(nac["host"]), max_lines=1, max_chars=100),
+                "protocol": nac.get("protocol") or "network"}
+        approval["cwd"] = params.get("cwd")
+        ca = _summarize_command_actions(params.get("commandActions"))
+        if ca:
+            approval["command_actions"] = ca
+    elif kind == "permissions":
+        requested = params.get("permissions")
+        requested = requested if isinstance(requested, dict) else {}
+        approval["permissions"] = _bound_permissions(requested)   # network-FIRST; bounding below
+        approval["summary"] = _summarize_permissions(requested)
+        approval["cwd"] = params.get("cwd")
+        if params.get("environmentId") is not None:
+            approval["environmentId"] = params.get("environmentId")
+    elif kind == "applyPatch":                  # legacy patch — the diff is ON the request
+        approval["file_changes"] = params.get("fileChanges")
+    elif kind == "fileChange":                  # modern — the diff comes from the Task-4 patch buffer
+        item_id = params.get("itemId")
+        fc = ts.get("file_changes", {}).get(item_id) if item_id else None
+        if fc and fc.get("changes"):
+            approval["changes"] = fc["changes"]          # [{diff, kind, path}] (path+kind even for add/delete)
+        else:
+            # No captured patch yet (rare — patchUpdated not seen before the approval). Surface the
+            # VALIDATED request fields (itemId/reason/grantRoot) instead of blind-declining (R2-F4) —
+            # the model still decides (and can decline if the evidence is too thin).
+            approval["item_id"] = item_id
+            if params.get("grantRoot") is not None:
+                approval["grantRoot"] = params.get("grantRoot")
+            approval["note"] = "no diff captured yet — decide from reason, or decline if unsure"
+    # R1-F6: ONE bounded pass over the ENTIRE approval evidence (every field — summary, raw scalar
+    # reason/cwd/environmentId, unknown keys, long fs paths/diffs), then TIGHTEN the caps until the whole
+    # payload fits the HARD total byte budget (per-field caps alone can't guarantee a total — 40 items ×
+    # 4000 chars = 160KB). The UNBOUNDED original is still what build_decision_response echoes to codex.
+    tid = ts.get("thread_id")
+    for max_str, max_items in ((_PAYLOAD_MAX_STR, _PAYLOAD_MAX_ITEMS), (800, 20), (200, 10), (60, 5)):
+        payload = {"status": "awaiting_approval", "park_token": park_token,
+                   "approval": _bound_evidence(approval, max_str=max_str, max_items=max_items),
+                   "thread_id": _bound_evidence(tid, max_str=max_str, max_items=max_items)}  # R1-F6: thread_id too
+        if len(json.dumps(payload, default=str)) <= _PAYLOAD_MAX_TOTAL:
+            break
+    else:
+        # HARD fallback (R1-F6): even the tightest caps still exceeded the budget → a minimal payload that
+        # ALWAYS fits (kind + decisions + a decline-if-unsure note + bounded thread_id). The model can
+        # still decide or decline.
+        payload = {"status": "awaiting_approval", "park_token": park_token,
+                   "approval": _bound_evidence(
+                       {"kind": kind, "decisions": decisions,
+                        "note": "evidence too large to display safely — decide conservatively or decline"},
+                       max_str=200, max_items=10),
+                   "thread_id": _bound_evidence(tid, max_str=200, max_items=10)}
+    return payload, decision_ids
+
+
+def build_decision_response(parked_request_frame, decision_id):
+    """Build the EXACT jsonrpc-lite reply ({id, result}) for the model's chosen decision_id, reusing the
+    parked request's ORIGINAL id (#277). Receives an ALREADY-VALID id (codex_approve_v2 pre-validates
+    against the stored decision_ids BEFORE gen.send — F3). 'decline' → the method's safe decline. The
+    unknown-id arm is a DEFENSIVE backstop: it returns an {"error":…} (NOT a written decline frame), so
+    a bad id can never be written to the child as a permanent decline."""
+    frame = parked_request_frame or {}
+    mid = frame.get("id")
+    method = frame.get("method", "")
+    params = frame.get("params") or {}
+    if decision_id == "decline":
+        return {"id": mid, "result": _approval_decline_payload(method)}
+    if decision_id == "accept":   # #277 fast_accept literal (loop-body fast-path; not a model choice)
+        return {"id": mid, "result": _approval_accept_payload(method)}
+    payload_map = {d_id: payload for d_id, _, payload in _approval_decision_table(method, params)}
+    if decision_id in payload_map:
+        return {"id": mid, "result": payload_map[decision_id]}
+    return {"error": f"unknown decision_id: {decision_id!r}"}   # defensive-unreachable (pre-validated, F3)
+
+
+# The five codex approval methods route_approval / the park-route gate apply to (#277). A
+# non-approval server request (requestUserInput / mcpServer-elicitation) is NEVER routed/parked.
+_APPROVAL_METHODS = frozenset({
+    "item/commandExecution/requestApproval", "execCommandApproval",
+    "item/fileChange/requestApproval", "applyPatchApproval",
+    "item/permissions/requestApproval",
+})
+
+
+def _park_token() -> str:
+    """A single-use opaque park token (#277). `uuid` is not imported; os.urandom is unique enough to
+    reject a stale/double-resume token (the park is also cleared after use, the real guard)."""
+    return "park-" + os.urandom(8).hex()
 
 
 def bridge_approval(method: str, params: dict, cc_write_fn, cc_read_fn,
@@ -1717,6 +2575,11 @@ def bridge_approval(method: str, params: dict, cc_write_fn, cc_read_fn,
     Thin wrapper over _bridge_approval_dispatch: records one best-effort approval-event
     log line (method / decision / wait_ms / timed_out, #251 step-0) at every exit, then
     returns the dispatch decision unchanged. drain_ctx (#252) is threaded through to the wait.
+
+    ATTENDED-ONLY (#277): the unattended in-process judge is GONE — when unattended mode is armed,
+    the turn-pump loop body routes approvals via route_approval (fast_accept / park_for_model /
+    fail_closed_decline) BEFORE this function is ever reached, so bridge_approval now only computes
+    the human elicitation (unarmed approvals + non-approval requests). Default OFF → unchanged.
     """
     t0 = time.time()
     wait_state = {"timed_out": False}
@@ -2200,6 +3063,10 @@ class TurnStateMachine:
     def __init__(self):
         self._in_flight = False
         self._pending_cc_id = None
+        # #277 parked state: a turn suspended at a park_for_model approval, awaiting a codex_approve
+        # resume. Holds the park token only (the live generator + frame live in manager._parked).
+        # None when not parked. is_busy() stays True while parked.
+        self._parked = None
 
     def turn_started(self, cc_id):
         self._in_flight = True
@@ -2208,9 +3075,25 @@ class TurnStateMachine:
     def turn_completed(self):
         self._in_flight = False
         self._pending_cc_id = None
+        self._parked = None                          # final completion clears any park (#277)
+
+    def park(self, park_token, thread_id=None):
+        """Mark the in-flight turn PARKED (suspended at a park_for_model approval, #277)."""
+        self._parked = {"token": park_token, "thread_id": thread_id}
+
+    def is_parked(self) -> bool:
+        return self._parked is not None
+
+    def parked_token(self):
+        return self._parked["token"] if self._parked else None
+
+    def unpark(self):
+        """Clear ONLY the parked marker (the turn may resume in-flight or complete).
+        NOTE: this does NOT clear _in_flight — final completion must call turn_completed()."""
+        self._parked = None
 
     def is_busy(self) -> bool:
-        return self._in_flight
+        return self._in_flight or self._parked is not None
 
     def busy_error(self) -> dict:
         """Return an error dict for a second concurrent tools/call.
@@ -2220,7 +3103,10 @@ class TurnStateMachine:
         normal MCP tool-error result (consistent with the 11 other {"error":...}
         returns).  The serial dispatcher loop is the primary concurrency guard;
         this method is defense-in-depth and is rarely/never hit in production.
+        A PARKED turn returns a distinct, actionable message (#277).
         """
+        if self._parked is not None:
+            return {"error": "codex turn parked — resume with codex_approve or wait"}
         return {"error": "codex turn already in flight"}
 
     def eof_error(self) -> dict:
@@ -2231,6 +3117,7 @@ class TurnStateMachine:
         """
         self._in_flight = False
         self._pending_cc_id = None
+        self._parked = None                          # child died → no park survives (#277)
         return {"error": "codex app-server exited mid-turn (child will respawn on next call)"}
 
 
@@ -2346,6 +3233,8 @@ def codex_info_v2(args: dict, manager: "AppServerManager | None" = None) -> dict
     independent). Returns {query, result}."""
     acc: list = []
     query = args.get("query")
+    if query == "approval":   # #277 §8: purely-local knob read-out — no app-server, no cold-start, no spawn
+        return {"query": "approval", "result": _approval_knobs()}
     mapping = _INFO_QUERY_MAP.get(query) if isinstance(query, str) else None
     if mapping is None:
         return {"error": f"unknown query {query!r}; expected one of {sorted(_INFO_QUERY_MAP)}"}
@@ -2544,9 +3433,13 @@ def _handle_child_frame(frame: dict, ts: dict):
         return None
     if method == "turn/completed":
         t = frame.get("params", {}).get("turn", {}) or {}
-        # #218: an interrupt WE initiated terminates as status="interrupted" — route it to the
-        # graceful result, bypassing the generic terminal-failure arm below.
-        if ts.get("interrupting") and t.get("status") == "interrupted" and not t.get("error"):
+        # An interrupted turn (no error) is GRACEFUL, not a failure — route it to the graceful
+        # result, bypassing the generic terminal-failure arm below. Two sources, both deliberate:
+        #   - #218: an interrupt WE initiated (Esc / opt-in timeout) — ts["interrupting"] set;
+        #   - #287: the user picked "Cancel the turn" in an approval → codex cancels →
+        #     status="interrupted" with ts["interrupting"] still False.
+        # ("decline" CONTINUES the turn, so interrupted-without-error always means a deliberate stop.)
+        if t.get("status") == "interrupted" and not t.get("error"):
             return _build_interrupted_result(ts, interrupted_by=ts.get("interrupted_by", "cancel"))
         if t.get("status") != "completed" or t.get("error"):  # TurnStatus has no "success" (codex 0.141: completed/interrupted/failed/inProgress)
             meta = _build_result_meta(ts["manager"], ts["usage_snapshot"], ts["turn_start_t"],
@@ -2571,6 +3464,33 @@ def _handle_child_frame(frame: dict, ts: dict):
                                   ts["effort_val"], ts["model_val"], "failed")
         return {"error": f"codex error: {emsg or 'unknown error'}",
                 "thread_id": ts["thread_id"], **meta}
+    if method == "item/started":
+        # #279: a fileChange item's diff arrives HERE — item={type:'fileChange', id, changes:[{path,
+        # kind, diff}], status} — BEFORE the item/fileChange/requestApproval, and codex 0.142 does NOT
+        # emit item/fileChange/patchUpdated before the park (empirically proven, bd279_probe). Capture it
+        # keyed by item.id (== the parked approval's itemId) into the SAME store build_awaiting_payload
+        # reads, so a parked fileChange shows the diff instead of the 'no diff captured' note. Other item
+        # types (userMessage/reasoning/command) → no-op. A later patchUpdated (if any) OVERWRITES (full set).
+        it = (frame.get("params") or {}).get("item")
+        if isinstance(it, dict) and it.get("type") == "fileChange" and it.get("id"):
+            ts.setdefault("file_changes", {})[it["id"]] = {
+                "changes": it.get("changes") or [], "turn_id": (frame.get("params") or {}).get("turnId")}
+        return None
+    if method == "item/fileChange/patchUpdated":
+        # #277 (C16): capture the file-change diff so a PARKED item/fileChange approval can show it
+        # to the model. The REQUEST (FileChangeRequestApprovalParams, codex 0.142) carries NO patch —
+        # only itemId/reason/grantRoot/threadId/turnId — so the diff MUST come from this notification.
+        # Verified shape (R2-F4, generate-json-schema 0.142): params = {changes:[{diff, kind:{type:
+        # add|delete|update}, path}], itemId, threadId, turnId}. patchUpdated carries the FULL current
+        # change set → OVERWRITE (not append). A create/delete carries path+kind+diff too, so there is
+        # no separate "no-patch" gap. (item/fileChange/outputDelta is DEPRECATED — codex 0.142 "no
+        # longer emits" it — so it is NOT accumulated; it falls through to the known-ignored no-op.)
+        p = frame.get("params", {}) or {}
+        item_id = p.get("itemId")
+        if item_id:
+            ts.setdefault("file_changes", {})[item_id] = {
+                "changes": p.get("changes") or [], "turn_id": p.get("turnId")}
+        return None
     if method not in _KNOWN_NOTIFICATIONS:
         _drift_warn(ts.get("acc"), "UNKNOWN_NOTIFICATION", method)
     # known-but-ignored (turn/started, item/completed non-review, ...) → no-op
@@ -2638,6 +3558,441 @@ def _log_kill_switch_once() -> None:
             f.write(f"{_now_iso()} | INTERRUPT_DISABLED | BULLDOZER_CODEX_NO_INTERRUPT set\n")
     except Exception:
         pass
+
+
+def codex_approve_v2(args: dict, manager: "AppServerManager | None" = None,
+                     cc_write_fn=None, cc_read_fn=None,
+                     state_machine: "TurnStateMachine | None" = None) -> dict:
+    """Resume a turn parked at a park_for_model approval (#277). THIN (spec §5.2):
+      1. validate park_token == manager._parked["park_token"] (else 'parked turn expired', park UNCHANGED);
+      2. validate decision_id ∈ the parked payload's decisions[].id (or 'decline') BEFORE gen.send — an
+         unknown id → a RETRYABLE error, park UNCHANGED, NO gen.send/child write (F3);
+      3. gen.send(decision_id); generator yields again → RE-PARK; StopIteration → turn_completed()
+         (clears _in_flight AND _parked, NOT unpark() alone — F1) + manager._parked=None + final dict.
+    All the heavy resume work (drain / credit / build / write) lives INSIDE the generator (Task 6)."""
+    if manager is None:
+        manager = _get_manager()
+    if state_machine is None:
+        state_machine = _v2_state_machine
+    parked = manager._parked
+    token = args.get("park_token")
+    if not isinstance(parked, dict) or token != parked.get("park_token"):
+        return {"error": "parked turn expired"}        # stale/absent/double-resume → park UNCHANGED
+    decision_id = args.get("decision_id")
+    valid = set(parked.get("decision_ids") or ()) | {"decline"}
+    if decision_id not in valid:                        # hallucinated id → retryable, park UNCHANGED (F3)
+        return {"error": f"unknown decision_id: {decision_id!r}"}
+    gen = parked["inner_gen"]
+    ctx = parked.get("ctx") or {}
+    acc = ctx.get("acc")
+    # Rebind the active _cc_id to THIS resume call so an Esc during the resume leg is matched (C6).
+    if isinstance(ctx.get("args"), dict):
+        ctx["args"]["_cc_id"] = args.get("_cc_id")
+    try:
+        payload = gen.send(decision_id)
+    except StopIteration as e:
+        state_machine.turn_completed()                 # clears _in_flight AND _parked (F1)
+        manager._parked = None
+        return e.value                                 # already _stamp_drift'd inside the generator
+    except Exception as e:                             # defensive — a resume crash must not strand the park
+        state_machine.turn_completed()
+        manager._parked = None
+        return _stamp_drift({"error": f"resume error: {e}"}, acc)
+    # generator yielded AGAIN (multi-approval turn) → RE-PARK (new request_frame/decision_ids/park_token
+    # were set into ctx by the generator's second yield).
+    manager._parked = {
+        "park_token": ctx.get("park_token"), "thread_id": parked.get("thread_id"), "inner_gen": gen,
+        "isolation_sig": manager._isolation_sig, "started_at": time.monotonic(),
+        "request_frame": ctx.get("request_frame"), "decision_ids": ctx.get("decision_ids"),
+        "ctx": ctx,
+    }
+    state_machine.park(ctx.get("park_token"), parked.get("thread_id"))
+    return _stamp_drift(payload, acc)
+
+
+def _parked_busy_block(tool_name, state_machine) -> bool:
+    """#277 C12 — the global parked guard. While a turn is PARKED, every tool EXCEPT codex_approve
+    busy-blocks (park PRESERVED): a fresh codex_run / codex_info / codex_review would otherwise touch
+    the parked child and steal the frames the suspended generator needs. codex_approve is routed by
+    NAME to codex_approve_v2, which validates the token (a stale token → 'parked turn expired', not
+    the busy path), so it is the ONLY tool allowed through while parked."""
+    return state_machine.is_parked() and tool_name != "codex_approve"
+
+
+_PARK_CAP_S_DEFAULT = 1800.0   # #277 §8: wall-clock cap on a parked turn (30 min)
+
+
+def _park_cap_s() -> float:
+    """The parked-turn wall-clock cap in seconds (#277 §7). Env BULLDOZER_PARK_CAP_S, read fresh per
+    park; malformed → default; clamped to a sane range."""
+    try:
+        v = float(os.environ.get("BULLDOZER_PARK_CAP_S") or _PARK_CAP_S_DEFAULT)
+    except (TypeError, ValueError):
+        v = _PARK_CAP_S_DEFAULT
+    return max(1.0, min(v, 86400.0))
+
+
+def _approval_knobs() -> dict:
+    """The effective #277 unattended/approval knobs + their source — computed by CALLING the live
+    accessors (still fresh-per-call), for codex_info(query='approval') discoverability (§8). Knobs:
+    BULLDOZER_APPROVAL_UNATTENDED (truthy) / *_FILE sentinel arm the model-in-the-loop;
+    BULLDOZER_PARK_CAP_S (default 1800) is the parked wall-clock cap; BULLDOZER_FAST_PATH_SCOPE
+    ('reads' | 'local-work') is the trivial fast-accept breadth. All resolved FRESH per approval."""
+    env = os.environ.get("BULLDOZER_APPROVAL_UNATTENDED")
+    sentinel = os.environ.get("BULLDOZER_APPROVAL_UNATTENDED_FILE") or os.path.expanduser(
+        _UNATTENDED_SENTINEL_DEFAULT)
+    active = _unattended_active()
+    if env is not None and env.strip().lower() in _TRUTHY:
+        source = "env"
+    elif active:
+        source = "sentinel-file"
+    else:
+        source = "off"
+    # R1-F8 / R2-F2: each knob reports its EFFECTIVE (normalized) value + whether a VALID env value drove
+    # it. An INVALID env (FAST_PATH_SCOPE=garbage / PARK_CAP_S=notanumber) falls back → source 'default',
+    # and the reported value is the effective one (not the raw invalid string).
+    raw_scope = os.environ.get("BULLDOZER_FAST_PATH_SCOPE")
+    effective_scope = "local-work" if _fast_path_scope() == "local-work" else "reads"
+    fast_path_scope_source = "env" if raw_scope in ("reads", "local-work") else "default"
+    try:
+        float(os.environ.get("BULLDOZER_PARK_CAP_S"))
+        park_cap_source = "env"
+    except (TypeError, ValueError):
+        park_cap_source = "default"                  # absent / malformed → _park_cap_s fell back
+    try:
+        int(os.environ.get("BULLDOZER_APPROVAL_NARRATIVE_MAX"))
+        narrative_max_source = "env"                 # a clamped-but-valid env still counts as env-driven
+    except (TypeError, ValueError):
+        narrative_max_source = "default"             # absent / malformed → _approval_narrative_max fell back
+    return {
+        "unattended": active,
+        "unattended_source": source,
+        "park_cap_s": _park_cap_s(),
+        "park_cap_source": park_cap_source,
+        "fast_path_scope": effective_scope,
+        "fast_path_scope_source": fast_path_scope_source,
+        "narrative_max_chars": _approval_narrative_max(),
+        "narrative_max_source": narrative_max_source,
+        "sentinel_path": sentinel,
+        # dialog localization (#247 + provider selector): language + the provider chain.
+        "translate_lang": _approval_lang(),
+        "translate_provider": _translate_providers(),
+    }
+
+
+def _teardown_park(manager, state_machine, reason: str) -> None:
+    """Tear down a parked turn (#277 C7/C8). The parked child is BLOCKED awaiting the approval reply,
+    so turn/interrupt alone is useless — AUTO-DECLINE the pending approval FIRST (unblocks the child),
+    THEN kill the child (respawn next call), THEN clear state via turn_completed() (NOT unpark() alone —
+    else _in_flight stays True forever and deadlocks the next tool). Best-effort: NEVER raises (main()'s
+    parked wait has no tool-call try/except; a dead-child decline write is BrokenPipe-guarded, C8b)."""
+    parked = manager._parked if isinstance(getattr(manager, "_parked", None), dict) else None
+    if parked is not None:
+        req = parked.get("request_frame")
+        if isinstance(req, dict):
+            try:
+                manager._write(build_decision_response(req, "decline"))   # unblock the child first
+            except Exception:
+                pass                                                       # dead child / broken pipe → ignore
+            _log_unattended_decision(req.get("method"), "decline", "teardown:" + reason)   # #280 C: audit
+    try:
+        if manager._child is not None:
+            manager._child.kill()
+    except Exception:
+        pass
+    manager._child = None
+    state_machine.turn_completed()      # clears _in_flight AND _parked on the state machine
+    manager._parked = None              # clear the manager record too
+
+
+def _parked_wait(manager, state_machine, cc_write_fn=None):
+    """main()'s between-calls read WHILE a turn is parked (#277 §7). CCStream.next_frame selects ONLY on
+    sys.stdin — it is BLIND to the child — so each iteration ALSO pumps the child + polls it. CC-EOF /
+    child-death / a terminal child frame WIN over the cap (don't mislabel a death as a timeout). On
+    cap/EOF/death/terminal with no resume → _teardown_park. Returns (kind, req) like next_frame: a CC
+    frame ('frame', req) is handed back to main() with the park PRESERVED (the codex_approve resume is
+    incoming — or a wrong-token approve / other tool, handled by codex_approve_v2 / the parked guard);
+    a teardown returns ('eof', None) on EOF, else ('none', None) so main()'s loop simply continues."""
+    # R1-F2: the cap is anchored to the park's STORED started_at (recomputed each iteration from
+    # monotonic) so an unrelated frame returning to main() + re-entering _parked_wait can NOT reset it.
+    parked = manager._parked if isinstance(getattr(manager, "_parked", None), dict) else None
+    ctx = (parked or {}).get("ctx") or {}
+    ts = ctx.get("ts")                                        # the parked turn's turn-state (for terminal detection)
+    owner_cc_id = (ctx.get("args") or {}).get("_cc_id")       # the codex_run tools/call id that owns this park
+    started = (parked or {}).get("started_at")
+    if not isinstance(started, (int, float)):
+        started = time.monotonic()                            # defensive fallback (record missing started_at)
+    cap = _park_cap_s()
+    while True:
+        reactor = getattr(manager, "_reactor", None)          # re-read LIVE (a respawn may swap it)
+        # child-death / terminal child frame WIN over the cap (R2-F1) — pump the child non-blocking first.
+        # R1-F4: route EVERY child notification through _handle_child_frame so a terminal `error` (not just
+        # turn/completed) tears down; non-terminal frames (deltas) buffer into ts harmlessly.
+        if reactor is not None:
+            try:
+                for cf in reactor.pump(timeout=0.0):
+                    if not isinstance(cf, dict) or "__cc__" in cf:
+                        continue
+                    if classify(cf) != "notification":
+                        # #278: a non-notification child frame (the turn/start ACK, another server
+                        # request) that lands while parked must be BUFFERED for the resumed turn loop —
+                        # dropping it would falsely time out a pre-ACK approval (parity with the attended
+                        # drain at handle_server_request). The resume block re-feeds these survivors.
+                        if ts is not None:
+                            ts.setdefault("drained_frames", []).append(cf)
+                        continue
+                    terminal = (_handle_child_frame(cf, ts) if ts is not None
+                                else ({} if cf.get("method") == "turn/completed" else None))
+                    if terminal is not None:
+                        _teardown_park(manager, state_machine, "child-terminal")
+                        return ("none", None)
+            except Exception:
+                pass
+        if manager._child is not None and manager._child.poll() is not None:
+            _teardown_park(manager, state_machine, "child-death")
+            return ("none", None)
+        remaining = (started + cap) - time.monotonic()
+        if remaining <= 0:
+            _teardown_park(manager, state_machine, "cap")     # cap with no resume → graceful decline+kill
+            return ("none", None)
+        kind, req = _cc_stream.next_frame(min(remaining, 0.2))
+        if kind == "eof":
+            _teardown_park(manager, state_machine, "eof")     # CC channel closed → tear down
+            return ("eof", None)
+        if kind == "frame":
+            # R1-F3: a parked cancel is a NOTIFICATION main() would drop — handle it HERE. An our-turn
+            # cancel (requestId == the parked turn's cc_id) tears down; an UNRELATED cancel is preserved
+            # (loop — never returned to main(), never resets the cap).
+            if isinstance(req, dict) and req.get("method") == "notifications/cancelled":
+                if (req.get("params") or {}).get("requestId") == owner_cc_id:
+                    _teardown_park(manager, state_machine, "cancel")
+                    return ("none", None)
+                continue
+            return (kind, req)                                # codex_approve / other tool → main() dispatches it
+        # 'none' (timeout slice / partial frame) → loop until cap
+
+
+def _drive_turn(ctx):
+    """#277: the turn-pump loop as an INNER generator (spec §5.1). `codex_run_v2` builds `ctx` and drives
+    this with next()/send(). At a park_for_model approval the loop body YIELDS build_awaiting_payload(...)
+    and resumes when codex_approve_v2 sends the chosen decision_id back (return-and-resume); on completion
+    it RETURNS the final dict (→ StopIteration.value). The review path never reaches a park (read-only).
+
+    Control locals (deadline/ack_deadline/turn_acked/turn_id/cancel_pending/narrative_shown) are
+    GENERATOR-locals — a generator frame persists them across the yield natively, so there is NO
+    UnboundLocalError (this is a full-block move; the spec's ctx-attr note guards a PARTIAL move where
+    setup stays in codex_run_v2 — we don't do that, and a near-verbatim move is the lowest-risk way to
+    preserve the intricate #218/#252 logic). `ctx` carries the loop inputs + the cross-boundary park
+    outputs (request_frame / decision_ids / park_token) codex_run_v2 reads after a yield. Deadlines use
+    time.monotonic so a wall-clock shift can't trip them (spec §5.2). Every #218/#252 branch is verbatim."""
+    manager = ctx["manager"]
+    ts = ctx["ts"]
+    args = ctx["args"]
+    acc = ctx["acc"]
+    cc_write_fn = ctx["cc_write_fn"]
+    cc_read_fn = ctx["cc_read_fn"]
+    state_machine = ctx["state_machine"]
+    thread_id = ctx["thread_id"]
+    review_target = ctx["review_target"]
+    turn_params = ctx["turn_params"]
+    reactor = manager._reactor
+    narrative_shown = 0   # #224: char offset into the joined narrative already shown in a prior approval
+
+    try:
+        # Send turn/start; then run a unified pump loop (Phase 1 = ACK wait, Phase 2 = event stream).
+        # CRITICAL: do NOT use _pump_until for turn/start — it discards same-chunk frames after the
+        # matching response (the fake/real codex can flush ACK + delta + turn/completed together).
+        mid = manager._next_id()
+        start_method = "review/start" if review_target is not None else "turn/start"
+        if review_target is not None:
+            manager._write({"id": mid, "method": "review/start", "params": {
+                "threadId": thread_id, "target": review_target, "delivery": "inline"}})
+        else:
+            manager._write({"id": mid, "method": "turn/start", "params": turn_params})
+
+        # No work-duration cap by default (match stock; opt-in `timeout` re-imposes one). The ACK
+        # timeout is a SETUP check (the engine must answer turn/start), distinct from limiting WORK.
+        turn_acked = False
+        turn_timeout = args.get("timeout")
+        deadline = (time.monotonic() + turn_timeout) if turn_timeout else None
+        ack_deadline = time.monotonic() + _ACK_TIMEOUT
+        _log_kill_switch_once()                  # F8: note once if the kill-switch disabled interrupts
+        watch = _interrupts_enabled() and args.get("_cc_id") is not None
+        turn_id = None
+        cancel_pending = False
+
+        while deadline is None or time.monotonic() < deadline:
+            frames = reactor.pump(timeout=0.2, watch_cc=watch)
+            if ts.get("drained_frames"):
+                frames = ts.pop("drained_frames") + frames
+            if any(isinstance(f, dict) and isinstance(f.get("__cc__"), dict) and f["__cc__"].get("__eof__")
+                   for f in frames):
+                return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
+            for frame in frames:
+                if not isinstance(frame, dict):
+                    continue                                   # bare non-dict JSON line from the child (F3)
+                if "__cc__" in frame:                          # CC-side frame (cancel/other; EOF handled above)
+                    if _route_cc_frame(frame["__cc__"], cc_id=args.get("_cc_id"), reply_fn=reply) == "interrupt":
+                        cancel_pending = True                  # defer to END-OF-BATCH (capture same-batch work)
+                    continue
+                kind = classify(frame)
+                method = frame.get("method", "")
+
+                if kind == "request":
+                    # #277: route the FIVE approval methods when armed (or test-forced). The decision is
+                    # taken HERE in the loop body — the only place `yield` is legal and the sole
+                    # handle_server_request call site. park_for_model BYPASSES handle_server_request (no
+                    # child reply; yields); fast_accept / fail_closed_decline answer inline via
+                    # build_decision_response (NOT bridge_approval — R5-F1); an unarmed approval or a
+                    # non-approval request falls through to the UNCHANGED attended path below.
+                    _route = None
+                    if method in _APPROVAL_METHODS and (ctx.get("_force_park_route") or _unattended_active()):
+                        if ctx.get("_force_park_route"):
+                            _route = "park_for_model"          # Task 6 test override — force a park
+                        else:
+                            _rp = frame.get("params")
+                            _route = route_approval(
+                                method, _rp, (_rp or {}).get("cwd") if isinstance(_rp, dict) else None)
+                    if _route == "fast_accept":                # trivial command → inline accept, no model
+                        manager._write(build_decision_response(frame, "accept"))
+                        _log_unattended_decision(method, "accept", "fast_path")    # #280 C: audit
+                        continue
+                    if _route == "fail_closed_decline":        # malformed/unrepresentable → inline decline
+                        manager._write(build_decision_response(frame, "decline"))
+                        _log_unattended_decision(method, "decline", "fail_closed")  # #280 C: audit
+                        continue
+                    if _route == "park_for_model":
+                        _pt0 = time.monotonic()
+                        _pnarr = None
+                        if method in _NARRATIVE_APPROVAL_METHODS:
+                            _pfull = "".join(ts["final_message_parts"])
+                            _pnarr = _pfull[narrative_shown:]
+                            narrative_shown = len(_pfull)
+                        _payload, _dids = build_awaiting_payload(
+                            method, frame.get("params"), ts, _pnarr, _park_token())
+                        ctx["request_frame"] = frame
+                        ctx["decision_ids"] = _dids
+                        ctx["park_token"] = _payload["park_token"]
+                        decision_id = yield _payload
+                        # ── RESUME (codex_approve_v2 sent decision_id) — generator owns it (spec §5.2) ──
+                        reactor = manager._reactor             # re-read LIVE (child may have respawned)
+                        _drained = list(ts.pop("drained_frames", [])) + reactor.pump(timeout=0.0)
+                        _term = None
+                        _survivors = []                        # #278: non-notification frames (turn/start
+                        for _cf in _drained:                   # ACK, server request) buffered during the
+                            if not (isinstance(_cf, dict) and "__cc__" not in _cf):           # park — must be
+                                continue                                                      # re-fed, not
+                            if classify(_cf) == "notification":                               # dropped, or a
+                                _r = _handle_child_frame(_cf, ts)        # surface a terminal/EOF that landed
+                                if _r is not None:                       # during the park BEFORE writing
+                                    _term = _r                           # (lost-terminal guard)
+                            else:
+                                _survivors.append(_cf)         # pre-ACK ACK / server request → re-feed in order
+                        if _term is not None:
+                            state_machine.turn_completed()
+                            return _stamp_drift(_term, acc)
+                        if _survivors:                         # #278: preserve for the loop-top re-prepend so
+                            ts.setdefault("drained_frames", []).extend(_survivors)   # turn_acked gets set
+                        _pelapsed = time.monotonic() - _pt0    # credit the park duration to the deadlines
+                        if deadline is not None:
+                            deadline += _pelapsed
+                        ack_deadline += _pelapsed
+                        _resp = build_decision_response(ctx.get("request_frame"), decision_id)
+                        try:
+                            if "error" not in _resp:           # pre-validated id (F3); error = defensive skip
+                                manager._write(_resp)
+                        except BrokenPipeError:                # child died mid-park (C8b) → graceful, no crash
+                            state_machine.turn_completed()
+                            return _stamp_drift(
+                                {"error": "codex child exited during park (decision undeliverable)"}, acc)
+                        # #280 C audit (codex_review P3): log the RESOLVED grant from the built response
+                        # (accept / acceptForSession / perm:* — what was GRANTED), NOT the opaque d-id the
+                        # model picked. Mirrors the attended path, which passes the decision payload too.
+                        _logged = _resp.get("result") if "error" not in _resp else decision_id
+                        _log_unattended_decision(method, _logged, "model_resume")
+                        continue
+                    # ── attended / non-approval request → today's synchronous path (UNCHANGED) ──
+                    _t0 = time.monotonic()
+                    _new_narr = None
+                    if frame.get("method") in _NARRATIVE_APPROVAL_METHODS:
+                        _full_narr = "".join(ts["final_message_parts"])
+                        _new_narr = _full_narr[narrative_shown:]
+                        narrative_shown = len(_full_narr)
+                    manager._write(handle_server_request(
+                        frame, cc_write_fn, cc_read_fn, acc=acc, narrative=_new_narr,
+                        drain_ctx={"reactor": reactor, "ts": ts, "cc_id": args.get("_cc_id")}))
+                    if ts.pop("eof_during_approval", False):
+                        return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
+                    if ts.get("terminal_during_approval") is not None:
+                        state_machine.turn_completed()
+                        return _stamp_drift(ts.pop("terminal_during_approval"), acc)
+                    if ts.pop("cancel_during_approval", False):
+                        if turn_id:
+                            return _stamp_drift(_finish_interrupt(manager, ts, turn_id, "cancel", state_machine), acc)
+                        elif turn_acked:
+                            return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
+                        else:
+                            cancel_pending = True   # pre-ACK approval cancel → defer to the ACK branch
+                    _elapsed = time.monotonic() - _t0
+                    if deadline is not None:
+                        deadline += _elapsed
+                    ack_deadline += _elapsed   # F6: pre-ACK approval is human time, not a setup stall
+                    continue
+
+                if not turn_acked:
+                    # Phase 1: looking for the start ACK (response to our review/turn-start id)
+                    if kind == "response" and frame.get("id") == mid:
+                        if "error" in frame:
+                            state_machine.turn_completed()
+                            return _stamp_drift({"error": f"{start_method} error: {frame['error']}"}, acc)
+                        turn_acked = True
+                        turn_id = ((frame.get("result") or {}).get("turn") or {}).get("id")
+                    elif method == "error":
+                        is_terminal, emsg = _classify_error_notification(frame.get("params", {}) or {})
+                        if is_terminal:
+                            state_machine.turn_completed()
+                            return _stamp_drift({"error": f"codex error: {emsg or 'unknown error'}"}, acc)
+                    continue
+
+                # Phase 2: event stream — delegate to the shared child-frame handler.
+                if kind == "notification":
+                    _res = _handle_child_frame(frame, ts)
+                    if _res is not None:
+                        state_machine.turn_completed()
+                        return _stamp_drift(_res, acc)
+                    continue
+
+            # EOF check AFTER draining the batch: a child that wrote turn/completed then exited had its
+            # completion consumed above. Only a child that died WITHOUT completing reaches here.
+            if manager._child is not None and manager._child.poll() is not None:
+                if cancel_pending:                   # R1-F2: cancel pending + child died → graceful COLD
+                    return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
+                eof_err = state_machine.eof_error()
+                manager._child = None
+                return _stamp_drift(eof_err, acc)
+
+            if cancel_pending and turn_acked:        # AFTER the batch → same-batch ACK + deltas captured
+                return _stamp_drift(_finish_interrupt(manager, ts, turn_id, "cancel", state_machine), acc)
+
+            if not turn_acked and not ts.get("drained_frames") and time.monotonic() > ack_deadline:
+                # #278: do NOT declare a setup timeout while buffered frames are pending replay — a pre-ACK
+                # turn/start ACK re-buffered by the parked-resume drain is consumed at the next loop-top and
+                # may carry the ACK. The park path's `continue` stays inside the for-loop, so this end-of-batch
+                # check would otherwise fire before the next iteration replays drained_frames.
+                if cancel_pending:                   # R1-F2: cancel pending, ACK never arrived → graceful COLD
+                    return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
+                state_machine.turn_completed()
+                return _stamp_drift({"error": f"{start_method} response timed out"}, acc)
+
+        # Opt-in work-duration deadline exceeded (only reachable when timeout was set).
+        if _interrupts_enabled():                    # #218: graceful interrupt + resumable partial
+            return _stamp_drift(_finish_interrupt(manager, ts, turn_id, "timeout", state_machine), acc)
+        state_machine.turn_completed()               # kill-switch: legacy bare error
+        return _stamp_drift({"error": f"turn timed out after {turn_timeout} s"}, acc)
+
+    except Exception as e:
+        state_machine.turn_completed()
+        return _stamp_drift({"error": f"turn execution error: {e}"}, acc)
 
 
 def codex_run_v2(
@@ -2884,8 +4239,6 @@ def codex_run_v2(
     # ── Turn execution loop ─────────────────────────────────────────────────
     turn_start_t = time.time()
     state_machine.turn_started(cc_id)
-    reactor = manager._reactor
-    narrative_shown = 0   # #224: char offset into the joined narrative already shown in a prior approval
     # Shared turn-state: _handle_child_frame (+ the #218 interrupt routine / #252 approval drain)
     # read/mutate these so a child frame is handled identically wherever it is read.
     ts = {
@@ -2895,178 +4248,39 @@ def codex_run_v2(
         "mcp_servers_enabled": mcp_servers_enabled, "effort_val": effort_val,
         "model_val": model_val, "mode": mode, "thread_id": thread_id,
         "review_target": review_target,
+        "file_changes": {},   # #277 (C16): itemId → {changes:[{diff,kind,path}], turn_id} from patchUpdated
     }
 
+    # #277: the turn-pump loop is an INNER generator (_drive_turn). codex_run_v2 stays dict-returning
+    # (codex_review_v2 json.dumps-es its result). Build ctx, drive the generator: a yielded payload =
+    # the turn PARKED at a park_for_model approval → store the park record + RETURN the payload; a
+    # StopIteration = the turn completed → RETURN its final dict (already _stamp_drift'd inside).
+    ctx = {
+        "manager": manager, "ts": ts, "args": args, "acc": acc,
+        "cc_write_fn": cc_write_fn, "cc_read_fn": cc_read_fn,
+        "state_machine": state_machine, "thread_id": thread_id,
+        "review_target": review_target, "turn_params": turn_params, "mode": mode,
+        # R2-F1: _force_park_route is NOT copied from args — it is a TEST-ONLY ctx seam (a direct
+        # _drive_turn caller sets it), never reachable from public MCP args; armed routing is the only
+        # public park trigger (the gate also consults _unattended_active()).
+        # cross-boundary park outputs (the generator sets these at a yield):
+        "request_frame": None, "decision_ids": None, "park_token": None,
+    }
+    gen = _drive_turn(ctx)
     try:
-        # Send turn/start; then run a unified pump loop that:
-        #   Phase 1 — awaits the TurnStartResponse (response to our turn/start id)
-        #   Phase 2 — processes events (delta, turn/completed) and server→client
-        #             requests (approvals) until turn/completed arrives.
-        #
-        # CRITICAL: do NOT use _pump_until for turn/start because it discards all
-        # frames in the same chunk that arrive after the matching response.  The
-        # fake (and real codex) can send TurnStartResponse + delta + turn/completed
-        # in a single flush → _pump_until would drop the notifications.
-        mid = manager._next_id()
-        start_method = "review/start" if review_target is not None else "turn/start"
-        if review_target is not None:
-            # Native review: review/start kicks off a turn on this thread. The
-            # ReviewStartResponse carries our id (Phase 1 ACK works unchanged).
-            manager._write({"id": mid, "method": "review/start", "params": {
-                "threadId": thread_id, "target": review_target, "delivery": "inline"}})
-        else:
-            manager._write({"id": mid, "method": "turn/start", "params": turn_params})
-
-        # Unified pump: Phase 1 = waiting for turn/start ACK; Phase 2 = event stream.
-        # No work-duration cap by default (match stock — stock has none; codex's own
-        # stream_idle_timeout_ms handles a genuinely hung model). Opt-in `timeout`
-        # re-imposes a work cap. The turn/start ACK timeout is a SETUP check (the
-        # engine must answer turn/start), distinct from limiting WORK duration.
-        turn_acked = False
-        turn_timeout = args.get("timeout")
-        deadline = (time.time() + turn_timeout) if turn_timeout else None
-        ack_deadline = time.time() + _ACK_TIMEOUT   # SETUP check (engine must answer turn/start)
-        # #218: watch CC stdin for a mid-turn cancel only when interrupts are enabled AND we have
-        # a cc_id to correlate it against (R5-F1: a direct unit test without _cc_id must not read
-        # global sys.stdin). turn_id is captured at the ACK; cancel_pending bridges a pre-ACK cancel.
-        _log_kill_switch_once()                  # F8: note once if the kill-switch disabled interrupts
-        watch = _interrupts_enabled() and args.get("_cc_id") is not None
-        turn_id = None
-        cancel_pending = False
-
-        while deadline is None or time.time() < deadline:
-            frames = reactor.pump(timeout=0.2, watch_cc=watch)
-            # codex P1: re-process any non-notification child frames the approval drain buffered
-            # (e.g. a turn/start ACK that arrived while an approval was pending) — prepend so they
-            # are handled before this batch (otherwise a pre-ACK approval would falsely time out).
-            if ts.get("drained_frames"):
-                frames = ts.pop("drained_frames") + frames
-            # CC stdin EOF has BATCH PRIORITY (R1-F1): a closed CC channel can't receive ANY
-            # result, so a same-batch child completion is undeliverable → force cold teardown.
-            # (isinstance guard: a child may emit a bare non-dict JSON line — reviewer F3.)
-            if any(isinstance(f, dict) and isinstance(f.get("__cc__"), dict) and f["__cc__"].get("__eof__")
-                   for f in frames):
-                return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
-            for frame in frames:
-                if not isinstance(frame, dict):
-                    continue                                   # bare non-dict JSON line from the child — ignore (reviewer F3)
-                if "__cc__" in frame:                          # CC-side frame (cancel/other; EOF handled by the scan)
-                    if _route_cc_frame(frame["__cc__"], cc_id=args.get("_cc_id"), reply_fn=reply) == "interrupt":
-                        # Defer the interrupt to END-OF-BATCH so a same-batch ACK + deltas are
-                        # captured first → a real cancel returns the partial work produced so far.
-                        cancel_pending = True
-                    continue
-                kind = classify(frame)
-                method = frame.get("method", "")
-
-                # Server→client requests (approvals) are bridged in EITHER phase: an
-                # approval can in principle arrive before the TurnStartResponse, and
-                # dropping it would hang the app-server until the outer deadline.
-                if kind == "request":
-                    # An approval blocks on a HUMAN reply (up to the elicitation
-                    # timeout). That wall-clock is the user's thinking time, not codex
-                    # working — credit it back so a slow human approval doesn't trip the
-                    # opt-in turn timeout (if set) nor the turn/start ACK setup window.
-                    _t0 = time.time()
-                    # #224: thread the narrative codex streamed SINCE the last approval into
-                    # the dialog. final_message_parts already holds the deltas flushed before
-                    # this request (same-batch frames are processed in wire order). Advance the
-                    # offset ONLY for narrative-bearing approvals (Grok#2) — a non-narrative
-                    # request must not consume narrative a following command approval should show.
-                    _new_narr = None
-                    if frame.get("method") in _NARRATIVE_APPROVAL_METHODS:
-                        _full_narr = "".join(ts["final_message_parts"])
-                        _new_narr = _full_narr[narrative_shown:]
-                        narrative_shown = len(_full_narr)
-                    manager._write(handle_server_request(
-                        frame, cc_write_fn, cc_read_fn, acc=acc, narrative=_new_narr,
-                        drain_ctx={"reactor": reactor, "ts": ts, "cc_id": args.get("_cc_id")}))
-                    # #218/#252 post-approval-write checks, in priority order. EOF first: a closed
-                    # CC channel makes any result undeliverable → cold teardown (R6-F1). Then a
-                    # terminal turn that ended during the approval. Then a cancel — phase-aware,
-                    # mirroring the turn pump (warm / cold / pre-ACK defer).
-                    if ts.pop("eof_during_approval", False):
-                        return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
-                    if ts.get("terminal_during_approval") is not None:
-                        state_machine.turn_completed()
-                        return _stamp_drift(ts.pop("terminal_during_approval"), acc)
-                    if ts.pop("cancel_during_approval", False):
-                        if turn_id:
-                            return _stamp_drift(_finish_interrupt(manager, ts, turn_id, "cancel", state_machine), acc)
-                        elif turn_acked:
-                            return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
-                        else:
-                            cancel_pending = True   # pre-ACK approval cancel → defer to the ACK branch
-                    _elapsed = time.time() - _t0
-                    if deadline is not None:
-                        deadline += _elapsed
-                    ack_deadline += _elapsed   # F6: pre-ACK approval is human time, not a setup stall
-                    continue
-
-                if not turn_acked:
-                    # Phase 1: looking for the start ACK (response to our review/turn-start id)
-                    if kind == "response" and frame.get("id") == mid:
-                        if "error" in frame:
-                            state_machine.turn_completed()
-                            return _stamp_drift({"error": f"{start_method} error: {frame['error']}"}, acc)
-                        turn_acked = True
-                        # turnId from the start ACK (TurnStartResponse.turn.id); may be None for a
-                        # review/start ACK without a turn id → a later interrupt routes to teardown.
-                        # A pending cancel is acted on at end-of-batch (after same-batch deltas).
-                        turn_id = ((frame.get("result") or {}).get("turn") or {}).get("id")
-                    elif method == "error":
-                        # A TERMINAL error can arrive BEFORE the ACK (e.g. during the
-                        # cold-start setup window). Surface it instead of dropping it →
-                        # which would mask it as a generic ACK timeout (#4). Transient
-                        # willRetry errors are ignored here — keep waiting for the ACK.
-                        is_terminal, emsg = _classify_error_notification(frame.get("params", {}) or {})
-                        if is_terminal:
-                            state_machine.turn_completed()
-                            return _stamp_drift({"error": f"codex error: {emsg or 'unknown error'}"}, acc)
-                    # Any other pre-ack frame (stray notification) is ignored.
-                    continue
-
-                # Phase 2: event stream — delegate to the shared child-frame handler
-                # (so a frame is processed identically here and in the #252 approval drain).
-                if kind == "notification":
-                    _res = _handle_child_frame(frame, ts)
-                    if _res is not None:
-                        state_machine.turn_completed()
-                        return _stamp_drift(_res, acc)
-                    continue
-
-            # EOF check AFTER draining this batch: a child that wrote turn/completed
-            # then exited has its completion consumed by the pump above (→ returns
-            # success). Only a child that died WITHOUT completing reaches here.
-            if manager._child is not None and manager._child.poll() is not None:
-                if cancel_pending:                   # R1-F2: cancel pending + child died → graceful COLD
-                    return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
-                eof_err = state_machine.eof_error()
-                manager._child = None
-                return _stamp_drift(eof_err, acc)
-
-            # Pending cancel + turn ACKed + child alive → interrupt now (warm if turn_id known,
-            # else cold for a review/start ACK without a turn id). Runs AFTER the batch so a
-            # same-batch ACK + deltas were captured → the partial work is returned (R1-F2).
-            if cancel_pending and turn_acked:
-                return _stamp_drift(_finish_interrupt(manager, ts, turn_id, "cancel", state_machine), acc)
-
-            # Phase 1 timeout check (after each pump batch)
-            if not turn_acked and time.time() > ack_deadline:
-                if cancel_pending:                   # R1-F2: cancel pending, ACK never arrived → graceful COLD
-                    return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
-                state_machine.turn_completed()
-                return _stamp_drift({"error": f"{start_method} response timed out"}, acc)
-
-        # Opt-in work-duration deadline exceeded (only reachable when timeout was set).
-        if _interrupts_enabled():                    # #218: graceful interrupt + resumable partial
-            return _stamp_drift(_finish_interrupt(manager, ts, turn_id, "timeout", state_machine), acc)
-        state_machine.turn_completed()               # kill-switch: legacy bare error
-        return _stamp_drift({"error": f"turn timed out after {turn_timeout} s"}, acc)
-
-    except Exception as e:
-        state_machine.turn_completed()
-        return _stamp_drift({"error": f"turn execution error: {e}"}, acc)
+        payload = next(gen)
+    except StopIteration as e:
+        return e.value                       # turn completed (or errored) without parking — the common case
+    # The generator YIELDED → the turn is PARKED at a park_for_model approval (#277). Store the record so
+    # codex_approve_v2 can resume it, mark the state machine parked, and return the awaiting payload.
+    manager._parked = {
+        "park_token": ctx["park_token"], "thread_id": thread_id, "inner_gen": gen,
+        "isolation_sig": manager._isolation_sig, "started_at": time.monotonic(),
+        "request_frame": ctx["request_frame"], "decision_ids": ctx["decision_ids"],
+        "ctx": ctx,   # codex_approve_v2 reads ctx after gen.send to RE-PARK a multi-approval turn (§5.2)
+    }
+    state_machine.park(ctx["park_token"], thread_id)
+    return _stamp_drift(payload, acc)
 
 
 def _classify_error_notification(params: dict) -> tuple:

@@ -1,7 +1,7 @@
 {
   "name": "guards",
-  "version": "0.1.0",
-  "description": "Interactive Allow/Deny/Объясни gate on destructive Bash operations — git work-loss & hook-bypass + risky process kills — built on one shared confirm-dialog engine (fix once, every guard benefits)",
+  "version": "2026.06.28.1",
+  "description": "Interactive Allow/Deny/Объясни gate on destructive Bash operations — git work-loss & hook-bypass + risky process kills — built on one shared confirm-dialog engine; plus a Stop/SubagentStop guard that detects Opus-4.8 dropped (namespaceless) tool calls and forces one clean re-emit",
   "author": {
     "name": "JAINE",
     "email": "jaine@local"

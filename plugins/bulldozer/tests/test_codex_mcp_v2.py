@@ -66,6 +66,16 @@ def _redirect_codex_log(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logdir / "bulldozer-codex.log"))
 
 
+@pytest.fixture(autouse=True)
+def _disarm_unattended(monkeypatch):
+    """#251 hermeticity: ensure unattended approval mode is OFF for every test unless the
+    test arms it in-body. Otherwise a stray real sentinel (~/.claude/bulldozer-unattended) or
+    an exported env var would silently route bridge tests through the judge. A test that wants
+    it ON sets BULLDOZER_APPROVAL_UNATTENDED in its body (runs after fixtures → wins)."""
+    monkeypatch.delenv("BULLDOZER_APPROVAL_UNATTENDED", raising=False)
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UNATTENDED_FILE", "/nonexistent/bulldozer-unattended-xyz")
+
+
 def test_real_codex_log_is_never_touched_by_tests(tmp_path_factory):
     """Hygiene guard: the autouse redirect must point BULLDOZER_CODEX_LOG OFF the real
     monitoring log for EVERY test (offline + slow), so the suite never pollutes it
@@ -410,7 +420,8 @@ def _mk_ts(**over):
           "interrupting": False, "interrupted_by": "cancel", "acc": [],
           "manager": None, "turn_start_t": 0.0, "mcp_mode": "isolated",
           "mcp_servers_enabled": [], "effort_val": None, "model_val": None,
-          "mode": "implement", "thread_id": "t1", "review_target": None}
+          "mode": "implement", "thread_id": "t1", "review_target": None,
+          "file_changes": {}}
     ts.update(over)
     return ts
 
@@ -437,6 +448,1039 @@ def test_handle_child_frame_failed_status_returns_error():
     out = cs._handle_child_frame(
         {"method": "turn/completed", "params": {"turn": {"status": "failed"}}}, ts)
     assert out is not None and "error" in out
+
+
+def test_handle_child_frame_user_cancel_interrupted_is_graceful():
+    """#287: a user 'Cancel the turn' approval decision → codex cancels → turn/completed
+    status=interrupted, but NOT via our Esc/timeout interrupt (ts['interrupting'] is False).
+    Must surface as a GRACEFUL interrupted result (no 'error' key), not a turn-failed error."""
+    import codex_server as cs
+    ts = _mk_ts()                                  # interrupting=False — the user-decision cancel case
+    out = cs._handle_child_frame(
+        {"method": "turn/completed", "params": {"turn": {"status": "interrupted"}}}, ts)
+    assert out is not None
+    assert "error" not in out, f"user-cancel surfaced as error: {out}"
+    assert out["status"] == "interrupted"
+
+
+def test_handle_child_frame_interrupted_with_error_still_errors():
+    """Guard: an interrupted turn that ALSO carries an error is a real failure → error arm,
+    not the graceful path (the `not error` guard must hold)."""
+    import codex_server as cs
+    ts = _mk_ts()
+    out = cs._handle_child_frame(
+        {"method": "turn/completed",
+         "params": {"turn": {"status": "interrupted", "error": "boom"}}}, ts)
+    assert out is not None and "error" in out
+
+
+def test_handle_child_frame_captures_filechange_patch():
+    """#277 Task 4 (R2-F4 real 0.142 shape): item/fileChange/patchUpdated → ts['file_changes'][itemId]."""
+    import codex_server as cs
+    ts = _mk_ts()
+    frame = {"method": "item/fileChange/patchUpdated", "params": {
+        "itemId": "fc-1", "threadId": "t", "turnId": "u",
+        "changes": [{"diff": "@@ -1 +1 @@\n-old\n+new", "kind": {"type": "update"}, "path": "src/x.py"}]}}
+    assert cs._handle_child_frame(frame, ts) is None
+    fc = ts["file_changes"]["fc-1"]
+    assert fc["changes"][0]["path"] == "src/x.py"
+    assert "old" in fc["changes"][0]["diff"]
+    assert fc["changes"][0]["kind"]["type"] == "update"
+    assert fc["turn_id"] == "u"
+
+
+def test_handle_child_frame_filechange_create_carries_path_kind():
+    """A CREATE (kind=add) carries path+kind+diff — codex 0.142 patchUpdated has no 'no-patch' gap."""
+    import codex_server as cs
+    ts = _mk_ts()
+    frame = {"method": "item/fileChange/patchUpdated", "params": {
+        "itemId": "fc-2", "threadId": "t", "turnId": "u",
+        "changes": [{"diff": "@@ -0,0 +1 @@\n+hello", "kind": {"type": "add"}, "path": "new.txt"}]}}
+    cs._handle_child_frame(frame, ts)
+    ch = ts["file_changes"]["fc-2"]["changes"][0]
+    assert ch["kind"]["type"] == "add" and ch["path"] == "new.txt"
+
+
+def test_handle_child_frame_filechange_latest_overwrites():
+    """patchUpdated is the FULL change set → a later notification for the same itemId overwrites."""
+    import codex_server as cs
+    ts = _mk_ts()
+    base = {"method": "item/fileChange/patchUpdated", "params": {
+        "itemId": "fc-3", "threadId": "t", "turnId": "u",
+        "changes": [{"diff": "v1", "kind": {"type": "add"}, "path": "a"}]}}
+    cs._handle_child_frame(base, ts)
+    base["params"]["changes"] = [{"diff": "v2", "kind": {"type": "update"}, "path": "a"},
+                                 {"diff": "+b", "kind": {"type": "add"}, "path": "b"}]
+    cs._handle_child_frame(base, ts)
+    chs = ts["file_changes"]["fc-3"]["changes"]
+    assert len(chs) == 2 and chs[0]["diff"] == "v2"
+
+
+def test_handle_child_frame_captures_filechange_from_item_started():
+    """#279: a fileChange item's diff arrives in `item/started` (item.type='fileChange', item.changes)
+    BEFORE the approval — codex 0.142 does NOT emit patchUpdated before the park (empirically proven by
+    bd279_probe). Capture it from item/started too, keyed by item.id, so a PARKED fileChange approval
+    (same itemId) can show the diff instead of the 'no diff captured' note. Non-fileChange item/started
+    (userMessage/reasoning) stays a no-op."""
+    import codex_server as cs
+    ts = _mk_ts()
+    frame = {"method": "item/started", "params": {                  # real 0.142 shape (bd279_probe)
+        "item": {"type": "fileChange", "id": "fc-started-1", "status": "inProgress",
+                 "changes": [{"path": "PROBE.txt", "kind": {"type": "add"}, "diff": "HELLO\n"}]},
+        "threadId": "t", "turnId": "u", "startedAtMs": 1}}
+    assert cs._handle_child_frame(frame, ts) is None
+    fc = ts["file_changes"]["fc-started-1"]
+    assert fc["changes"][0]["path"] == "PROBE.txt"
+    assert fc["changes"][0]["diff"] == "HELLO\n"
+    assert fc["changes"][0]["kind"]["type"] == "add"
+    assert fc["turn_id"] == "u"
+    # a NON-fileChange item/started must NOT create a file_changes entry (no over-capture)
+    ts2 = _mk_ts()
+    cs._handle_child_frame({"method": "item/started", "params": {
+        "item": {"type": "reasoning", "id": "rs-1", "content": []}, "turnId": "u"}}, ts2)
+    assert ts2["file_changes"] == {}
+
+
+# --- #277 Task 5: build_awaiting_payload + build_decision_response ---
+def test_build_awaiting_payload_command_evidence():
+    import codex_server as cs
+    ts = _mk_ts(thread_id="thr-9")
+    params = {"command": "rm -rf /etc", "cwd": "/proj", "reason": "cleanup"}
+    payload, dids = cs.build_awaiting_payload(
+        "item/commandExecution/requestApproval", params, ts, "the narrative", "tok")
+    assert payload["status"] == "awaiting_approval" and payload["park_token"] == "tok"
+    assert payload["thread_id"] == "thr-9"
+    ap = payload["approval"]
+    assert ap["kind"] == "commandExecution"
+    assert "rm -rf /etc" in ap["command"] and ap["cwd"] == "/proj" and ap["reason"] == "cleanup"
+    assert ap["narrative"] == "the narrative"
+    assert ap["decisions"] and all("id" in d and "label" in d for d in ap["decisions"])
+    assert "decline" in dids and all(d["id"] in dids for d in ap["decisions"])
+
+
+def test_build_awaiting_payload_permissions_evidence():
+    import codex_server as cs
+    params = {"permissions": {"network": {"allow": True}}, "cwd": "/proj", "environmentId": "env-1"}
+    payload, dids = cs.build_awaiting_payload(
+        "item/permissions/requestApproval", params, _mk_ts(), None, "tok")
+    ap = payload["approval"]
+    assert ap["kind"] == "permissions"
+    assert ap["permissions"] == {"network": {"allow": True}}
+    assert ap["cwd"] == "/proj" and ap["environmentId"] == "env-1"
+    assert "summary" in ap
+
+
+def test_build_awaiting_payload_filechange_attaches_captured_patch():
+    import codex_server as cs
+    ts = _mk_ts()
+    ts["file_changes"]["it-1"] = {
+        "changes": [{"diff": "@@\n+x", "kind": {"type": "add"}, "path": "n.txt"}], "turn_id": "u"}
+    payload, _ = cs.build_awaiting_payload(
+        "item/fileChange/requestApproval", {"itemId": "it-1", "reason": "write"}, ts, None, "tok")
+    ap = payload["approval"]
+    assert ap["kind"] == "fileChange" and ap["changes"][0]["path"] == "n.txt"
+
+
+def test_build_awaiting_payload_filechange_no_patch_not_blind_decline():
+    import codex_server as cs
+    ts = _mk_ts()  # no captured patch for this itemId
+    payload, _ = cs.build_awaiting_payload(
+        "item/fileChange/requestApproval",
+        {"itemId": "it-x", "reason": "create config", "grantRoot": "/proj"}, ts, None, "tok")
+    ap = payload["approval"]
+    assert ap["kind"] == "fileChange"
+    assert ap.get("reason") == "create config"     # request-level evidence, NOT a blind decline (R2-F4)
+    assert ap.get("item_id") == "it-x"
+    assert ap["decisions"]                          # still offers accept/decline → model decides
+
+
+def test_build_awaiting_payload_legacy_applypatch_filechanges():
+    import codex_server as cs
+    fcs = [{"path": "a.py", "diff": "@@\n-x\n+y"}]
+    payload, _ = cs.build_awaiting_payload(
+        "applyPatchApproval", {"fileChanges": fcs, "reason": "patch"}, _mk_ts(), None, "tok")
+    ap = payload["approval"]
+    assert ap["kind"] == "applyPatch" and ap["file_changes"] == fcs
+
+
+def test_build_decision_response_command_roundtrip():
+    import codex_server as cs
+    params = {"command": "ls", "cwd": "/p"}
+    payload, _ = cs.build_awaiting_payload(
+        "item/commandExecution/requestApproval", params, _mk_ts(), None, "tok")
+    frame = {"id": 42, "method": "item/commandExecution/requestApproval", "params": params}
+    first = payload["approval"]["decisions"][0]["id"]   # "Allow once" → accept
+    assert cs.build_decision_response(frame, first) == {"id": 42, "result": {"decision": "accept"}}
+    assert cs.build_decision_response(frame, "decline") == {"id": 42, "result": {"decision": "decline"}}
+
+
+def test_build_decision_response_permissions_echoes_profile():   # #272 grant-echo
+    import codex_server as cs
+    profile = {"network": {"allow": True}}
+    params = {"permissions": profile, "cwd": "/p"}
+    payload, _ = cs.build_awaiting_payload(
+        "item/permissions/requestApproval", params, _mk_ts(), None, "tok")
+    frame = {"id": 7, "method": "item/permissions/requestApproval", "params": params}
+    grant_turn = payload["approval"]["decisions"][0]["id"]    # LBL_GRANT_TURN
+    assert cs.build_decision_response(frame, grant_turn) == {
+        "id": 7, "result": {"permissions": profile, "scope": "turn"}}
+
+
+def test_build_decision_response_legacy_review_shape():
+    import codex_server as cs
+    frame = {"id": 5, "method": "execCommandApproval", "params": {"command": "ls", "cwd": "/p"}}
+    payload, _ = cs.build_awaiting_payload("execCommandApproval", frame["params"], _mk_ts(), None, "tok")
+    approve = payload["approval"]["decisions"][0]["id"]
+    assert cs.build_decision_response(frame, approve) == {"id": 5, "result": {"decision": "approved"}}
+    assert cs.build_decision_response(frame, "decline") == {"id": 5, "result": {"decision": "denied"}}
+
+
+def test_build_decision_response_unknown_id_errors_not_decline():
+    import codex_server as cs
+    frame = {"id": 1, "method": "item/commandExecution/requestApproval", "params": {"command": "ls"}}
+    resp = cs.build_decision_response(frame, "bogus-id")
+    # defensive backstop: an unknown id must NOT be written as a permanent decline frame (F3)
+    assert "error" in resp and "result" not in resp
+
+
+# --- #277 Task 6: inner generator _drive_turn — park-yield + generator-owned resume ---
+class _ScriptedBackend:
+    """Deterministic manager+reactor double for driving _drive_turn directly (no subprocess/timing).
+    Frame sequence: turn/start ACK → a commandExecution approval request → [](waiting) → turn/completed
+    once the decision reply is written. Real frame transport is covered by the Task 7/11 slow gates."""
+    def __init__(self, command="echo hello", available=None):
+        self._child = self
+        self._reactor = self
+        self._isolation_sig = None
+        self._parked = None
+        self._nid = 100
+        self.writes = []
+        self._acked = False
+        self._approved = False
+        self._command = command
+        self._available = available if available is not None else ["accept", "cancel"]
+
+    # manager surface
+    def _next_id(self):
+        self._nid += 1
+        return self._nid
+
+    def _write(self, msg, child=None):
+        self.writes.append(msg)
+
+    # child surface
+    def poll(self):
+        return None                       # always alive
+
+    # reactor surface
+    def pump(self, timeout=0.2, watch_cc=False):
+        ts_write = next((w for w in self.writes
+                         if isinstance(w, dict) and w.get("method") == "turn/start"), None)
+        if ts_write is None:
+            return []
+        if not self._acked:
+            self._acked = True
+            return [{"id": ts_write["id"], "result": {"turn": {"id": "T1"}}}]
+        if not self._approved:
+            self._approved = True
+            return [{"id": "APPROVAL-1", "method": "item/commandExecution/requestApproval",
+                     "params": {"threadId": "T1", "turnId": "T1", "itemId": "I1",
+                                "command": self._command, "cwd": "/tmp",
+                                "availableDecisions": self._available}}]
+        decided = any(isinstance(w, dict) and "result" in w and w.get("id") == "APPROVAL-1"
+                      for w in self.writes)
+        return [{"method": "turn/completed", "params": {"turn": {"status": "completed"}}}] if decided else []
+
+
+def _drive_turn_ctx(backend, force_park=True):
+    return {
+        "manager": backend,
+        "ts": {"final_message_parts": [], "usage_snapshot": {}, "retries": 0,
+               "interrupting": False, "interrupted_by": "cancel", "acc": [],
+               "manager": backend, "turn_start_t": 0.0, "mcp_mode": "isolated",
+               "mcp_servers_enabled": [], "effort_val": None, "model_val": None,
+               "mode": "implement", "thread_id": "T1", "review_target": None,
+               "file_changes": {}},
+        "args": {"_force_park_route": force_park}, "acc": [],
+        "cc_write_fn": lambda m: None, "cc_read_fn": lambda timeout=10.0: None,
+        "state_machine": None,   # set by the test
+        "thread_id": "T1", "review_target": None,
+        "turn_params": {"threadId": "T1", "input": []}, "mode": "implement",
+        "_force_park_route": force_park,
+        "request_frame": None, "decision_ids": None, "park_token": None,
+    }
+
+
+def test_drive_turn_parks_on_forced_route_then_resumes_to_completion():
+    import codex_server as cs
+    backend = _ScriptedBackend()
+    sm = cs.TurnStateMachine()
+    sm.turn_started(None)
+    ctx = _drive_turn_ctx(backend)
+    ctx["state_machine"] = sm
+    gen = cs._drive_turn(ctx)
+    payload = next(gen)                                   # drives ACK → approval → forced PARK
+    assert payload["status"] == "awaiting_approval"
+    assert payload["approval"]["kind"] == "commandExecution"
+    assert "echo hello" in payload["approval"]["command"]
+    assert payload["park_token"] and ctx["park_token"] == payload["park_token"]
+    assert ctx["request_frame"]["id"] == "APPROVAL-1"
+    assert "decline" in ctx["decision_ids"]
+    # RESUME via the generator (codex_approve_v2 is a stub until Task 7)
+    final = None
+    try:
+        nxt = gen.send("decline")
+        assert False, f"expected StopIteration, generator yielded again: {nxt}"
+    except StopIteration as e:
+        final = e.value
+    assert isinstance(final, dict) and "error" not in final, final
+    # the decision was actually written to the child via build_decision_response
+    assert any(isinstance(w, dict) and w.get("id") == "APPROVAL-1"
+               and w.get("result", {}).get("decision") == "decline" for w in backend.writes)
+    assert not sm.is_busy()                              # turn_completed() ran on StopIteration
+
+
+class _TerminalDuringParkBackend(_ScriptedBackend):
+    """Variant: the child emits turn/completed the moment it's drained on RESUME — i.e. the turn ended
+    DURING the park (before any decision was written)."""
+    def pump(self, timeout=0.2, watch_cc=False):
+        ts_write = next((w for w in self.writes
+                         if isinstance(w, dict) and w.get("method") == "turn/start"), None)
+        if ts_write is None:
+            return []
+        if not self._acked:
+            self._acked = True
+            return [{"id": ts_write["id"], "result": {"turn": {"id": "T1"}}}]
+        if not self._approved:
+            self._approved = True
+            return [{"id": "APPROVAL-1", "method": "item/commandExecution/requestApproval",
+                     "params": {"command": "echo hi", "cwd": "/tmp", "availableDecisions": ["accept"]}}]
+        # any pump AFTER the approval (the resume-drain is the first) → terminal, no decision yet
+        return [{"method": "turn/completed", "params": {"turn": {"status": "completed"}}}]
+
+
+def test_drive_turn_terminal_during_park_surfaces_without_writing_decision():
+    """If the child completes DURING the park (drained on resume), the generator surfaces that terminal
+    result and does NOT write the (now-moot) decision — the lost-terminal guard (#252/§5.2)."""
+    import codex_server as cs
+    backend = _TerminalDuringParkBackend()
+    sm = cs.TurnStateMachine()
+    sm.turn_started(None)
+    ctx = _drive_turn_ctx(backend)
+    ctx["state_machine"] = sm
+    gen = cs._drive_turn(ctx)
+    payload = next(gen)
+    assert payload["status"] == "awaiting_approval"
+    try:
+        gen.send("decline")
+        assert False, "expected StopIteration"
+    except StopIteration as e:
+        final = e.value
+    assert isinstance(final, dict) and "error" not in final
+    # decision was NOT written — the turn already completed during the park (drained-terminal first)
+    assert not any(isinstance(w, dict) and w.get("id") == "APPROVAL-1" and "result" in w
+                   for w in backend.writes), backend.writes
+
+
+class _PreAckApprovalParkBackend(_ScriptedBackend):
+    """#278: emits the commandExecution approval BEFORE the turn/start ACK (pre-ACK race). The ACK is
+    delivered via ts['drained_frames'] during the park (what _parked_wait buffers), NOT via pump — so the
+    resume drain is the only place it can be preserved."""
+    def pump(self, timeout=0.2, watch_cc=False):
+        ts_write = next((w for w in self.writes
+                         if isinstance(w, dict) and w.get("method") == "turn/start"), None)
+        if ts_write is None:
+            return []
+        if not self._approved:
+            self._approved = True
+            return [{"id": "APPROVAL-1", "method": "item/commandExecution/requestApproval",
+                     "params": {"command": "echo hi", "cwd": "/tmp", "availableDecisions": ["accept"]}}]
+        decided = any(isinstance(w, dict) and "result" in w and w.get("id") == "APPROVAL-1"
+                      for w in self.writes)
+        return [{"method": "turn/completed", "params": {"turn": {"status": "completed"}}}] if decided else []
+
+
+def test_drive_turn_pre_ack_approval_park_resume_completes(monkeypatch):
+    """#278: an approval parks pre-ACK; the turn/start ACK arrives DURING the park (buffered into
+    ts['drained_frames'] by _parked_wait). On resume, the drain block must PRESERVE that non-notification
+    ACK back into drained_frames so the loop reprocesses it (turn_acked=True) and the turn COMPLETES —
+    instead of falsely returning 'turn/start response timed out'."""
+    import codex_server as cs
+    monkeypatch.setattr(cs, "_ACK_TIMEOUT", 0.3)        # keep the RED (timeout) path fast
+    backend = _PreAckApprovalParkBackend()
+    sm = cs.TurnStateMachine(); sm.turn_started(None)
+    ctx = _drive_turn_ctx(backend); ctx["state_machine"] = sm
+    gen = cs._drive_turn(ctx)
+    payload = next(gen)                                 # turn/start sent → pre-ACK approval → forced PARK
+    assert payload["status"] == "awaiting_approval"
+    # simulate _parked_wait buffering the turn/start ACK that arrived during the park
+    ts_write = next(w for w in backend.writes if isinstance(w, dict) and w.get("method") == "turn/start")
+    ack = {"jsonrpc": "2.0", "id": ts_write["id"], "result": {"turn": {"id": "T1"}}}
+    ctx["ts"].setdefault("drained_frames", []).append(ack)
+    final = None
+    try:
+        gen.send("accept")
+        assert False, "expected StopIteration"
+    except StopIteration as e:
+        final = e.value
+    assert isinstance(final, dict), final
+    assert "error" not in final, final                  # NOT 'turn/start response timed out'
+    assert not sm.is_busy()
+
+
+class _PreAckApprovalParkDelayedCompletionBackend(_ScriptedBackend):
+    """#278 (codex_review FP-check): pre-ACK approval; after the decision is written the child does NOT
+    emit turn/completed immediately (one empty pump first) — so a post-resume iteration reaches the
+    end-of-batch ACK-timeout check with a bare [ACK] batch. The loop-top re-prepend must set turn_acked
+    BEFORE that check, so even an ALREADY-EXPIRED ack_deadline cannot trip a false timeout."""
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._post_decision_pumps = 0
+
+    def pump(self, timeout=0.2, watch_cc=False):
+        ts_write = next((w for w in self.writes
+                         if isinstance(w, dict) and w.get("method") == "turn/start"), None)
+        if ts_write is None:
+            return []
+        if not self._approved:
+            self._approved = True
+            return [{"id": "APPROVAL-1", "method": "item/commandExecution/requestApproval",
+                     "params": {"command": "echo hi", "cwd": "/tmp", "availableDecisions": ["accept"]}}]
+        decided = any(isinstance(w, dict) and "result" in w and w.get("id") == "APPROVAL-1"
+                      for w in self.writes)
+        if not decided:
+            return []
+        self._post_decision_pumps += 1
+        if self._post_decision_pumps == 1:
+            return []                       # delay: forces a bare-[ACK] batch that reaches the timeout check
+        return [{"method": "turn/completed", "params": {"turn": {"status": "completed"}}}]
+
+
+def test_drive_turn_pre_ack_park_resume_completes_even_past_ack_deadline(monkeypatch):
+    """#278 (adjudicates codex_review's 2nd finding): a pre-ACK approval parks; ack_deadline is ALREADY
+    expired by the time we resume, AND turn/completed is delayed one pump. The replayed ACK must set
+    turn_acked at the loop-top before the end-of-batch ACK-timeout check fires — so the turn STILL
+    completes (no false 'turn/start response timed out'). If this fails, the timeout check beats the
+    replay and the finding is real."""
+    import codex_server as cs
+    monkeypatch.setattr(cs, "_ACK_TIMEOUT", -1.0)       # ack_deadline already in the past at resume
+    backend = _PreAckApprovalParkDelayedCompletionBackend()
+    sm = cs.TurnStateMachine(); sm.turn_started(None)
+    ctx = _drive_turn_ctx(backend); ctx["state_machine"] = sm
+    gen = cs._drive_turn(ctx)
+    payload = next(gen)
+    assert payload["status"] == "awaiting_approval"
+    ts_write = next(w for w in backend.writes if isinstance(w, dict) and w.get("method") == "turn/start")
+    ctx["ts"].setdefault("drained_frames", []).append(
+        {"jsonrpc": "2.0", "id": ts_write["id"], "result": {"turn": {"id": "T1"}}})
+    final = None
+    try:
+        gen.send("accept")
+        assert False, "expected StopIteration"
+    except StopIteration as e:
+        final = e.value
+    assert isinstance(final, dict) and "error" not in final, final
+    assert not sm.is_busy()
+
+
+# --- #277 Task 7: THE SWITCHOVER — real routing in the loop body + thin codex_approve_v2 + parked guard ---
+def _arm(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setattr(cs, "_unattended_active", lambda: True)
+
+
+def test_t7_armed_nontrivial_command_parks(monkeypatch):
+    import codex_server as cs
+    _arm(monkeypatch)
+    backend = _ScriptedBackend(command="python3 build.py")     # non-trivial → route_approval → park
+    sm = cs.TurnStateMachine(); sm.turn_started(None)
+    ctx = _drive_turn_ctx(backend, force_park=False); ctx["state_machine"] = sm
+    payload = next(cs._drive_turn(ctx))
+    assert payload["status"] == "awaiting_approval" and payload["approval"]["kind"] == "commandExecution"
+
+
+def test_t7_armed_trivial_command_fast_accepts_inline(monkeypatch):
+    """g: armed + TRIVIAL command → inline accept written to the child, NO yield, NO awaiting_approval,
+    bridge_approval NEVER consulted (R5-F1)."""
+    import codex_server as cs
+    _arm(monkeypatch)
+    monkeypatch.setattr(cs, "bridge_approval",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("bridge_approval must NOT be consulted")))
+    backend = _ScriptedBackend(command="cat README.md")        # trivial → route_approval → fast_accept
+    sm = cs.TurnStateMachine(); sm.turn_started(None)
+    ctx = _drive_turn_ctx(backend, force_park=False); ctx["state_machine"] = sm
+    gen = cs._drive_turn(ctx)
+    final = None
+    try:
+        nxt = next(gen)
+        assert False, f"expected StopIteration (no park), generator yielded: {nxt}"
+    except StopIteration as e:
+        final = e.value
+    assert isinstance(final, dict) and "error" not in final
+    assert any(isinstance(w, dict) and w.get("id") == "APPROVAL-1"
+               and w.get("result", {}).get("decision") == "accept" for w in backend.writes), backend.writes
+
+
+def test_t7_unarmed_approval_is_not_routed(monkeypatch):
+    """An UNARMED approval must take the attended path (handle_server_request), never route."""
+    import codex_server as cs
+    monkeypatch.setattr(cs, "_unattended_active", lambda: False)
+    # route_approval would park a non-trivial command IF consulted — assert it is NOT (no park, attended).
+    seen = {"routed": False}
+    orig = cs.route_approval
+    monkeypatch.setattr(cs, "route_approval", lambda *a, **k: seen.__setitem__("routed", True) or orig(*a, **k))
+    backend = _ScriptedBackend(command="python3 build.py")
+    # the attended path calls handle_server_request → stub it to a decline so the turn completes
+    monkeypatch.setattr(cs, "handle_server_request",
+                        lambda frame, *a, **k: {"id": frame.get("id"), "result": {"decision": "decline"}})
+    sm = cs.TurnStateMachine(); sm.turn_started(None)
+    ctx = _drive_turn_ctx(backend, force_park=False); ctx["state_machine"] = sm
+    try:
+        next(cs._drive_turn(ctx))
+        assert False, "expected StopIteration (attended decline → completion), not a park"
+    except StopIteration:
+        pass
+    assert seen["routed"] is False, "route_approval must NOT be consulted when unarmed"
+
+
+def test_t7_requestuserinput_not_in_approval_methods():
+    import codex_server as cs
+    assert "item/tool/requestUserInput" not in cs._APPROVAL_METHODS
+    assert "mcpServer/elicitation/request" not in cs._APPROVAL_METHODS
+
+
+def _make_parked(backend, force_park=True):
+    """Drive _drive_turn to its first park and build a manager._parked record (mirrors codex_run_v2)."""
+    import codex_server as cs
+    sm = cs.TurnStateMachine(); sm.turn_started(None)
+    ctx = _drive_turn_ctx(backend, force_park=force_park); ctx["state_machine"] = sm
+    gen = cs._drive_turn(ctx)
+    payload = next(gen)
+    backend._parked = {
+        "park_token": payload["park_token"], "thread_id": "T1", "inner_gen": gen,
+        "isolation_sig": None, "started_at": 0.0,
+        "request_frame": ctx["request_frame"], "decision_ids": ctx["decision_ids"], "ctx": ctx,
+    }
+    sm.park(payload["park_token"], "T1")
+    return sm, payload
+
+
+def test_server_instructions_and_codex_run_document_unattended_park_flow():
+    """#277 discoverability: a FRESH session must learn the unattended park→approve loop from the
+    InitializeResult.instructions manifest AND the codex_run description — else codex_run returning
+    awaiting_approval is a dead end (the model wouldn't know to call codex_approve to resume)."""
+    import codex_server as cs
+    manifest = cs.SERVER_INSTRUCTIONS
+    assert "codex_approve" in manifest and "awaiting_approval" in manifest, "manifest hides the park loop"
+    run_desc = next(td["description"] for td in cs.TOOLS if td["name"] == "codex_run")
+    assert "awaiting_approval" in run_desc and "codex_approve" in run_desc, "codex_run hides the park loop"
+
+
+def test_t7_codex_approve_valid_resume_completes():
+    import codex_server as cs
+    backend = _ScriptedBackend()
+    sm, payload = _make_parked(backend)
+    res = cs.codex_approve_v2({"park_token": payload["park_token"], "decision_id": "decline"},
+                              manager=backend, state_machine=sm)
+    assert "error" not in res and not sm.is_busy() and backend._parked is None
+    assert any(isinstance(w, dict) and w.get("id") == "APPROVAL-1"
+               and w.get("result", {}).get("decision") == "decline" for w in backend.writes)
+
+
+def test_t7_codex_approve_wrong_token_expired_park_unchanged():
+    import codex_server as cs
+    backend = _ScriptedBackend()
+    sm, payload = _make_parked(backend)
+    res = cs.codex_approve_v2({"park_token": "WRONG", "decision_id": "decline"},
+                              manager=backend, state_machine=sm)
+    assert res == {"error": "parked turn expired"}
+    assert backend._parked is not None and sm.is_parked()       # park PRESERVED (double-resume guard)
+
+
+def test_t7_codex_approve_unknown_id_retryable_park_unchanged():
+    import codex_server as cs
+    backend = _ScriptedBackend()
+    sm, payload = _make_parked(backend)
+    res = cs.codex_approve_v2({"park_token": payload["park_token"], "decision_id": "bogus-xyz"},
+                              manager=backend, state_machine=sm)
+    assert "error" in res and "unknown decision_id" in res["error"]
+    assert backend._parked is not None and sm.is_parked()       # park PRESERVED, NO gen.send (F3)
+    assert not any(isinstance(w, dict) and w.get("id") == "APPROVAL-1" and "result" in w
+                   for w in backend.writes), "a hallucinated id must NOT write a decision to the child"
+
+
+class _TwoApprovalBackend(_ScriptedBackend):
+    """Emits TWO command approvals in sequence → exercises codex_approve_v2's RE-PARK."""
+    def pump(self, timeout=0.2, watch_cc=False):
+        ts_write = next((w for w in self.writes
+                         if isinstance(w, dict) and w.get("method") == "turn/start"), None)
+        if ts_write is None:
+            return []
+        if not self._acked:
+            self._acked = True
+            return [{"id": ts_write["id"], "result": {"turn": {"id": "T1"}}}]
+        n_decided = sum(1 for w in self.writes if isinstance(w, dict) and "result" in w
+                        and str(w.get("id", "")).startswith("APPROVAL-"))
+        emitted = getattr(self, "_emitted", 0)
+        if emitted == n_decided and emitted < 2:        # emit approval k+1 only after k were decided
+            self._emitted = emitted + 1
+            return [{"id": f"APPROVAL-{self._emitted}", "method": "item/commandExecution/requestApproval",
+                     "params": {"command": self._command, "cwd": "/tmp", "availableDecisions": ["accept", "cancel"]}}]
+        if n_decided >= 2:
+            return [{"method": "turn/completed", "params": {"turn": {"status": "completed"}}}]
+        return []
+
+
+def test_t7_codex_approve_reparks_on_second_approval():
+    import codex_server as cs
+    backend = _TwoApprovalBackend()
+    sm, payload1 = _make_parked(backend)               # parked at APPROVAL-1
+    # first resume → generator writes decline-1, hits APPROVAL-2, parks AGAIN → re-park
+    res1 = cs.codex_approve_v2({"park_token": payload1["park_token"], "decision_id": "decline"},
+                               manager=backend, state_machine=sm)
+    assert res1["status"] == "awaiting_approval"        # RE-PARKED, not completed
+    assert backend._parked is not None and sm.is_parked()
+    assert res1["park_token"] != payload1["park_token"]  # a fresh token for the second park
+    # second resume → completes
+    res2 = cs.codex_approve_v2({"park_token": res1["park_token"], "decision_id": "decline"},
+                               manager=backend, state_machine=sm)
+    assert "error" not in res2 and not sm.is_busy() and backend._parked is None
+
+
+def test_t7_parked_busy_block_allows_only_codex_approve():
+    import codex_server as cs
+    sm = cs.TurnStateMachine(); sm.turn_started(None)
+    assert cs._parked_busy_block("codex_info", sm) is False     # not parked yet
+    sm.park("tok", "T1")
+    assert cs._parked_busy_block("codex_info", sm) is True
+    assert cs._parked_busy_block("codex_run", sm) is True
+    assert cs._parked_busy_block("codex_review", sm) is True
+    assert cs._parked_busy_block("codex_approve", sm) is False  # the ONLY tool allowed through
+
+
+# --- #277 Task 8/9: _teardown_park ordering + _park_cap_s + parked-aware finite wait ---
+class _ParkFakeManager:
+    """Manager double for _teardown_park / _parked_wait (child + reactor surface)."""
+    def __init__(self, alive=True, pump_batches=None):
+        self._child = self
+        self._reactor = self
+        self._isolation_sig = None
+        self._parked = None
+        self.writes = []
+        self.killed = False
+        self._alive = alive
+        self._pump_batches = list(pump_batches or [])
+
+    def _write(self, msg, child=None):
+        self.writes.append(msg)
+
+    def _next_id(self):
+        return 1
+
+    def poll(self):
+        return None if self._alive else 0       # None = alive, int = exited
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
+
+    def pump(self, timeout=0.2, watch_cc=False):
+        return self._pump_batches.pop(0) if self._pump_batches else []
+
+
+def _mk_parked(manager, sm, token="tok", cc_id=None, ts=None):
+    import time as _t
+    sm.turn_started(None)
+    sm.park(token, "T1")
+    manager._parked = {
+        "park_token": token, "thread_id": "T1", "inner_gen": None,
+        "isolation_sig": None, "started_at": _t.monotonic(),   # #277 R1-F2: cap measured from a REAL start
+        "request_frame": {"id": "A1", "method": "item/commandExecution/requestApproval",
+                          "params": {"command": "x", "cwd": "/p"}},
+        "decision_ids": {"d0", "decline"},
+        "ctx": {"args": {"_cc_id": cc_id}, "ts": ts},
+    }
+
+
+def test_teardown_park_declines_then_kills_then_clears():
+    import codex_server as cs
+    m = _ParkFakeManager()
+    sm = cs.TurnStateMachine()
+    _mk_parked(m, sm)
+    cs._teardown_park(m, sm, "cap")
+    # 1. auto-declined the pending approval (unblocks the child) with the ORIGINAL request id
+    assert any(isinstance(w, dict) and w.get("id") == "A1"
+               and w.get("result", {}).get("decision") == "decline" for w in m.writes), m.writes
+    assert m.killed and m._child is None        # 2. child killed → respawn next call
+    assert not sm.is_busy() and m._parked is None  # 3. turn_completed() (NOT unpark alone) + park cleared
+
+
+def test_teardown_park_dead_child_write_does_not_raise():
+    import codex_server as cs
+    m = _ParkFakeManager(alive=False)
+    m._write = lambda *a, **k: (_ for _ in ()).throw(BrokenPipeError("dead"))
+    sm = cs.TurnStateMachine()
+    _mk_parked(m, sm)
+    cs._teardown_park(m, sm, "cap")             # must NOT raise (best-effort, BrokenPipe-guarded)
+    assert m._parked is None and not sm.is_busy()
+
+
+def test_park_cap_s_default_and_env(monkeypatch):
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_PARK_CAP_S", raising=False)
+    assert cs._park_cap_s() == cs._PARK_CAP_S_DEFAULT == 1800.0
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "5")
+    assert cs._park_cap_s() == 5.0
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "garbage")
+    assert cs._park_cap_s() == cs._PARK_CAP_S_DEFAULT     # malformed → default
+
+
+def test_parked_wait_cap_fires_teardown(monkeypatch):
+    import codex_server as cs
+    m = _ParkFakeManager()
+    sm = cs.TurnStateMachine()
+    _mk_parked(m, sm)
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "0.05")
+    monkeypatch.setattr(cs._cc_stream, "next_frame", lambda timeout: ("none", None))  # never a CC frame
+    kind, req = cs._parked_wait(m, sm, lambda f: None)
+    assert m._parked is None and not sm.is_busy()        # cap with no resume → teardown
+
+
+def test_parked_wait_cc_frame_preserves_park(monkeypatch):
+    import codex_server as cs
+    m = _ParkFakeManager()
+    sm = cs.TurnStateMachine()
+    _mk_parked(m, sm)
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "60")
+    approve = {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+               "params": {"name": "codex_approve", "arguments": {"park_token": "tok", "decision_id": "decline"}}}
+    monkeypatch.setattr(cs._cc_stream, "next_frame", lambda timeout: ("frame", approve))
+    kind, req = cs._parked_wait(m, sm, lambda f: None)
+    assert kind == "frame" and req is approve            # CC frame → return it, park PRESERVED (resume incoming)
+    assert m._parked is not None and sm.is_parked()
+
+
+def test_parked_wait_eof_fires_teardown(monkeypatch):
+    import codex_server as cs
+    m = _ParkFakeManager()
+    sm = cs.TurnStateMachine()
+    _mk_parked(m, sm)
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "60")
+    monkeypatch.setattr(cs._cc_stream, "next_frame", lambda timeout: ("eof", None))
+    kind, req = cs._parked_wait(m, sm, lambda f: None)
+    assert kind == "eof" and m._parked is None and not sm.is_busy()
+
+
+def test_parked_wait_child_death_beats_cap(monkeypatch):
+    import codex_server as cs
+    m = _ParkFakeManager(alive=False)                    # child already dead
+    sm = cs.TurnStateMachine()
+    _mk_parked(m, sm)
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "60")     # cap NOT reached — death must win
+    monkeypatch.setattr(cs._cc_stream, "next_frame", lambda timeout: ("none", None))
+    kind, req = cs._parked_wait(m, sm, lambda f: None)
+    assert m._parked is None and not sm.is_busy()        # death detected → teardown (not mislabelled cap)
+
+
+def test_parked_wait_terminal_child_frame_beats_cap(monkeypatch):
+    import codex_server as cs
+    m = _ParkFakeManager(pump_batches=[[{"method": "turn/completed",
+                                         "params": {"turn": {"status": "completed"}}}]])
+    sm = cs.TurnStateMachine()
+    _mk_parked(m, sm)
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "60")
+    monkeypatch.setattr(cs._cc_stream, "next_frame", lambda timeout: ("none", None))
+    kind, req = cs._parked_wait(m, sm, lambda f: None)
+    assert m._parked is None and not sm.is_busy()        # a terminal child frame while parked → teardown
+
+
+# --- #277 R1-F2/F3/F4: cap-from-started_at, parked cancel teardown, terminal-error in parked wait ---
+def test_parked_wait_cap_uses_started_at_not_reset_by_frames(monkeypatch):
+    """R1-F2: the cap is measured from manager._parked['started_at'] — a stray frame each loop must NOT
+    reset it. Park started 100s ago, cap 30s → already exceeded → teardown despite stray frames."""
+    import codex_server as cs, time
+    m = _ParkFakeManager()
+    sm = cs.TurnStateMachine()
+    _mk_parked(m, sm)
+    m._parked["started_at"] = time.monotonic() - 100.0       # parked 100s ago
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "30")          # 30s cap — exceeded
+    monkeypatch.setattr(cs._cc_stream, "next_frame",
+                        lambda timeout: ("frame", {"jsonrpc": "2.0", "method": "x"}))  # stray frames
+    kind, req = cs._parked_wait(m, sm, lambda f: None)
+    assert kind == "none" and m._parked is None and not sm.is_busy()   # cap from started_at → teardown
+
+
+def test_parked_wait_our_cancel_tears_down(monkeypatch):
+    """R1-F3: notifications/cancelled whose requestId == the parked turn's cc_id → teardown."""
+    import codex_server as cs
+    m = _ParkFakeManager()
+    sm = cs.TurnStateMachine()
+    _mk_parked(m, sm, cc_id=42)
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "60")
+    monkeypatch.setattr(cs._cc_stream, "next_frame", lambda timeout: (
+        "frame", {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 42}}))
+    kind, req = cs._parked_wait(m, sm, lambda f: None)
+    assert kind == "none" and m._parked is None and not sm.is_busy()
+
+
+def test_parked_wait_unrelated_cancel_preserves_park(monkeypatch):
+    """R1-F3: a cancel for a DIFFERENT requestId must NOT teardown — it loops (here until EOF)."""
+    import codex_server as cs
+    m = _ParkFakeManager()
+    sm = cs.TurnStateMachine()
+    _mk_parked(m, sm, cc_id=42)
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "60")
+    calls = {"n": 0}
+    def fake_next(timeout):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            return ("frame", {"jsonrpc": "2.0", "method": "notifications/cancelled",
+                              "params": {"requestId": 999}})   # someone else's cancel
+        return ("eof", None)
+    monkeypatch.setattr(cs._cc_stream, "next_frame", fake_next)
+    kind, req = cs._parked_wait(m, sm, lambda f: None)
+    assert calls["n"] == 4                                    # 3 unrelated cancels LOOPED (not torn down)
+    assert kind == "eof" and m._parked is None               # EOF (not the cancels) ended it
+
+
+def test_parked_wait_terminal_error_beats_cap(monkeypatch):
+    """R1-F4: a terminal `error` notification (not just turn/completed) while parked → teardown."""
+    import codex_server as cs
+    err = {"jsonrpc": "2.0", "method": "error", "params": {"message": "boom"}}  # terminal (no willRetry)
+    m = _ParkFakeManager(pump_batches=[[err]])
+    sm = cs.TurnStateMachine()
+    _mk_parked(m, sm, ts=_mk_ts(manager=m))                   # _handle_child_frame needs a real ts
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "60")
+    monkeypatch.setattr(cs._cc_stream, "next_frame", lambda timeout: ("none", None))
+    kind, req = cs._parked_wait(m, sm, lambda f: None)
+    assert kind == "none" and m._parked is None and not sm.is_busy()
+
+
+def test_parked_wait_buffers_nonnotification_ack_for_resume(monkeypatch):
+    """#278: a non-notification child frame (the turn/start ACK — a JSON-RPC response) that lands while
+    parked must be BUFFERED into ts['drained_frames'], NOT dropped. The attended drain already does this
+    (else a pre-ACK approval falsely times out); _parked_wait must match. Here the ACK is pumped during
+    the park, then EOF ends the wait — the ACK must survive in drained_frames for the resumed turn loop."""
+    import codex_server as cs
+    ack = {"jsonrpc": "2.0", "id": 1, "result": {"turn": {"id": "T1"}}}   # turn/start ACK = a response
+    m = _ParkFakeManager(pump_batches=[[ack]])
+    sm = cs.TurnStateMachine()
+    ts = {}
+    _mk_parked(m, sm, ts=ts)
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "60")
+    monkeypatch.setattr(cs._cc_stream, "next_frame", lambda timeout: ("eof", None))
+    cs._parked_wait(m, sm, lambda f: None)
+    assert ts.get("drained_frames") == [ack]     # ACK BUFFERED for the resumed turn loop, not dropped
+
+
+# --- #277 R1-F6: awaiting payload must bound large permission profiles + file-change diffs ---
+def test_build_awaiting_payload_bounds_large_permissions():
+    import codex_server as cs, json
+    entries = [{"access": "read", "path": f"/p/file{i}"} for i in range(1000)]
+    params = {"permissions": {"network": {"enabled": True}, "fileSystem": {"entries": entries}}}
+    payload, _ = cs.build_awaiting_payload("item/permissions/requestApproval", params, {}, None, "tok")
+    assert len(json.dumps(payload)) < 20000                       # bounded (was ~65KB)
+    perms = payload["approval"]["permissions"]
+    assert perms["network"] == {"enabled": True}                 # network preserved FIRST (egress grant)
+    assert len(perms["fileSystem"]["entries"]) <= 41            # 40 entries + a "+N more" marker
+    assert any(isinstance(e, str) and "more" in e for e in perms["fileSystem"]["entries"])   # marker present
+    assert isinstance(payload["approval"]["summary"], str) and len(payload["approval"]["summary"]) < 8000
+
+
+def test_build_awaiting_payload_bounds_large_filechanges():
+    import codex_server as cs, json
+    ts = {"thread_id": "T1", "file_changes": {"it-1": {"changes": [
+        {"path": f"f{i}.py", "kind": {"type": "update"}, "diff": "x" * 5000} for i in range(100)]}}}
+    payload, _ = cs.build_awaiting_payload("item/fileChange/requestApproval", {"itemId": "it-1"}, ts, None, "tok")
+    assert len(json.dumps(payload)) < 30000                       # bounded to the total budget (≈500KB raw)
+    changes = payload["approval"]["changes"]
+    assert any(isinstance(c, str) and "more" in c for c in changes)                      # +N-more list marker
+    assert all(len(c.get("diff", "")) < 2500 for c in changes if isinstance(c, dict) and "diff" in c)
+
+
+# --- #277 R10-F1: legacy argv-LIST command must still surface in the parked payload ---
+def test_build_awaiting_payload_renders_legacy_argv_command():
+    import codex_server as cs
+    payload, _ = cs.build_awaiting_payload("execCommandApproval", {"command": ["ls", "-la"], "cwd": "/tmp"},
+                                           {}, None, "tok")
+    assert "command" in payload["approval"] and "ls -la" in payload["approval"]["command"]
+
+
+# --- #277 R1-F6 (round 5): the WHOLE payload (incl. top-level thread_id) is within the budget ---
+def test_build_awaiting_payload_bounds_thread_id_in_total():
+    import codex_server as cs, json
+    pay, _ = cs.build_awaiting_payload("item/permissions/requestApproval", {"permissions": {}},
+                                       {"thread_id": "T" * 200000}, None, "tok")
+    assert len(json.dumps(pay)) <= cs._PAYLOAD_MAX_TOTAL, len(json.dumps(pay))
+
+
+# --- #277 R1-F6 (round 4): pathological dict KEYS bounded + hard total guarantee ---
+def test_build_awaiting_payload_bounds_dict_keys_and_total():
+    import codex_server as cs, json
+    for params in ({"permissions": {"network": {"h" * 200000: True}}},   # huge network dict key
+                   {"permissions": {"x" * 200000: 1}}):                  # huge top-level permission key
+        pay, _ = cs.build_awaiting_payload("item/permissions/requestApproval", params, {}, None, "tok")
+        assert len(json.dumps(pay)) <= cs._PAYLOAD_MAX_TOTAL, len(json.dumps(pay))
+    ts = {"thread_id": "T1", "file_changes": {"it": {"changes": [{"k" * 200000: "v", "path": "f"}]}}}
+    pay, _ = cs.build_awaiting_payload("item/fileChange/requestApproval", {"itemId": "it"}, ts, None, "tok")
+    assert len(json.dumps(pay)) <= cs._PAYLOAD_MAX_TOTAL
+
+
+# --- #277 R1-F6 (round 3): EVERY model-facing approval field is bounded (one pass), not just perms/diff ---
+def test_build_awaiting_payload_bounds_all_evidence_fields():
+    import codex_server as cs, json
+    # long network scalar + raw scalar fields (reason/cwd/environmentId) must all be bounded
+    p1 = {"permissions": {"network": {"note": "n" * 200000}}, "reason": "r" * 200000,
+          "cwd": "/c" * 100000, "environmentId": "e" * 200000}
+    pay1, _ = cs.build_awaiting_payload("item/permissions/requestApproval", p1, {}, None, "tok")
+    assert len(json.dumps(pay1)) < 30000, len(json.dumps(pay1))
+    # unknown file-change field copied raw
+    ts = {"thread_id": "T1", "file_changes": {"it": {"changes": [
+        {"path": "f.py", "kind": {"type": "update"}, "diff": "d", "extra": "x" * 200000}]}}}
+    pay2, _ = cs.build_awaiting_payload("item/fileChange/requestApproval", {"itemId": "it"}, ts, None, "tok")
+    assert len(json.dumps(pay2)) < 30000, len(json.dumps(pay2))
+    # long filesystem paths surfacing via the summary string
+    p3 = {"permissions": {"fileSystem": {"entries": [{"access": "read", "path": "/p" + "x" * 5000}
+                                                     for _ in range(40)]}}}
+    pay3, _ = cs.build_awaiting_payload("item/permissions/requestApproval", p3, {}, None, "tok")
+    assert len(json.dumps(pay3)) < 30000, len(json.dumps(pay3))
+
+
+# --- #277 round-2: R1-F6 general bound, R2-F1 public seam, R2-F2 effective knob values ---
+def test_bound_permissions_caps_network_and_unknown_keys():
+    """R1-F6 (round 2): bound ALL model-facing permission evidence — network host lists AND unknown
+    top-level keys + long strings, not just fileSystem (a 2000-host network / 200KB extra key blew 247KB)."""
+    import codex_server as cs, json
+    perms = {"network": {"hosts": ["h%d" % i for i in range(2000)]},
+             "extra": "x" * 200000, "fileSystem": {"entries": [1] * 1000}}
+    payload, _ = cs.build_awaiting_payload("item/permissions/requestApproval", {"permissions": perms}, {}, None, "tok")
+    assert len(json.dumps(payload)) < 20000, len(json.dumps(payload))   # ALL fields bounded
+    b = payload["approval"]["permissions"]
+    assert "network" in b and len(b["network"]["hosts"]) <= 41          # network host list capped (40 + marker)
+    assert len(b["extra"]) < 5000                                       # unknown-key string capped
+
+
+def test_public_force_park_route_arg_is_ignored(monkeypatch):
+    """R2-F1: _force_park_route is a test-only ctx seam — a PUBLIC caller passing it in MCP args must
+    NOT force a park (only _unattended_active() arms routing)."""
+    import codex_server as cs
+    monkeypatch.setattr(cs, "_unattended_active", lambda: False)        # NOT armed
+    backend = _ScriptedBackend(command="python3 build.py")
+    monkeypatch.setattr(backend, "ensure", lambda *a, **k: backend._child, raising=False)
+    monkeypatch.setattr(backend, "start_thread", lambda **k: "T1", raising=False)
+    monkeypatch.setattr(cs, "handle_server_request",
+                        lambda frame, *a, **k: {"id": frame.get("id"), "result": {"decision": "decline"}})
+    backend._last_thread_meta = {}
+    sm = cs.TurnStateMachine()
+    res = cs.codex_run_v2({"prompt": "x", "mcp": "isolated", "mode": "implement", "_force_park_route": True},
+                          manager=backend, cc_write_fn=lambda m: None,
+                          cc_read_fn=lambda timeout=10.0: None, state_machine=sm)
+    assert res.get("status") != "awaiting_approval" and not sm.is_parked(), res   # public arg IGNORED
+
+
+def test_approval_knobs_invalid_env_reports_effective(monkeypatch):
+    """R2-F2: an INVALID env value reports the EFFECTIVE (normalized) value + 'default' source, not the
+    raw invalid string as if it were effective."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_FAST_PATH_SCOPE", "garbage")
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "notanumber")
+    k = cs.codex_info_v2({"query": "approval"})["result"]
+    assert k["fast_path_scope"] == "reads" and k["fast_path_scope_source"] == "default"
+    assert k["park_cap_s"] == cs._PARK_CAP_S_DEFAULT and k["park_cap_source"] == "default"
+
+
+# --- #277 R1-F7: deterministic OFFLINE public park/resume (codex_run_v2 → awaiting → codex_approve_v2) ---
+def test_public_codex_run_park_then_resume_offline(monkeypatch):
+    """The real-codex version is the self-skipping slow e2e; this is the always-on deterministic mirror
+    of the PUBLIC seam — codex_run_v2 returns awaiting_approval (armed + non-trivial), codex_approve_v2
+    resumes the SAME turn to completion (the cap/cancel bugs F2/F3 also have direct _parked_wait tests)."""
+    import codex_server as cs
+    backend = _ScriptedBackend(command="python3 build.py")        # non-trivial → route_approval parks
+    monkeypatch.setattr(cs, "_unattended_active", lambda: True)
+    monkeypatch.setattr(backend, "ensure", lambda *a, **k: backend._child, raising=False)
+    monkeypatch.setattr(backend, "start_thread", lambda **k: "T1", raising=False)
+    backend._last_thread_meta = {}
+    sm = cs.TurnStateMachine()
+    res = cs.codex_run_v2({"prompt": "x", "mcp": "isolated", "mode": "implement"},
+                          manager=backend, cc_write_fn=lambda m: None,
+                          cc_read_fn=lambda timeout=10.0: None, state_machine=sm)
+    assert res.get("status") == "awaiting_approval" and sm.is_parked(), res
+    assert res["approval"]["kind"] == "commandExecution"
+    did = res["approval"]["decisions"][0]["id"]
+    res2 = cs.codex_approve_v2({"park_token": res["park_token"], "decision_id": did},
+                               manager=backend, state_machine=sm)
+    assert "error" not in res2 and not sm.is_busy() and backend._parked is None, res2
+    assert any(isinstance(w, dict) and w.get("id") == "APPROVAL-1" and "result" in w for w in backend.writes)
+
+
+# --- #277 R1-F5: item/fileChange/outputDelta is a DEPRECATED tolerated no-op (documented deviation) ---
+def test_filechange_outputdelta_tolerated_noop():
+    """outputDelta is DEPRECATED (codex 0.142 'no longer emits'); the diff comes from patchUpdated.
+    Contract: a stray outputDelta is a KNOWN notification (no UNKNOWN_NOTIFICATION drift), a no-op
+    (returns None, no crash), and is NOT accumulated as evidence."""
+    import codex_server as cs
+    assert "item/fileChange/outputDelta" in cs._KNOWN_NOTIFICATIONS        # tolerated, not drift
+    ts = _mk_ts()
+    res = cs._handle_child_frame(
+        {"method": "item/fileChange/outputDelta", "params": {"itemId": "it-1", "delta": "x"}}, ts)
+    assert res is None and not ts.get("file_changes")                      # no-op, NOT accumulated
+
+
+# --- #277 Task 10: codex_info(query="approval") — local knob read-out (no app-server) ---
+def test_codex_info_approval_knobs(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_PARK_CAP_S", "42")
+    monkeypatch.setenv("BULLDOZER_FAST_PATH_SCOPE", "local-work")
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UNATTENDED", "1")
+    res = cs.codex_info_v2({"query": "approval"})        # purely local — NO codex / cold-start
+    assert res["query"] == "approval"
+    k = res["result"]
+    assert k["park_cap_s"] == 42.0 and k["fast_path_scope"] == "local-work"
+    assert k["unattended"] is True and k["unattended_source"] == "env"
+    assert "sentinel_path" in k
+    # R1-F8: each knob reports its source (env here, since all three are set above)
+    assert k["park_cap_source"] == "env" and k["fast_path_scope_source"] == "env"
+
+
+def test_codex_info_approval_knob_sources_default(monkeypatch):
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_PARK_CAP_S", raising=False)
+    monkeypatch.delenv("BULLDOZER_FAST_PATH_SCOPE", raising=False)
+    k = cs.codex_info_v2({"query": "approval"})["result"]
+    assert k["park_cap_source"] == "default" and k["fast_path_scope_source"] == "default"
+
+
+def test_codex_info_approval_reports_narrative_max(monkeypatch):
+    """codex_info(query='approval') surfaces the narrative cap knob (default + env-driven source)."""
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_APPROVAL_NARRATIVE_MAX", raising=False)
+    k = cs.codex_info_v2({"query": "approval"})["result"]
+    assert k["narrative_max_chars"] == 2000 and k["narrative_max_source"] == "default"
+    monkeypatch.setenv("BULLDOZER_APPROVAL_NARRATIVE_MAX", "4096")
+    k = cs.codex_info_v2({"query": "approval"})["result"]
+    assert k["narrative_max_chars"] == 4096 and k["narrative_max_source"] == "env"
+
+
+def test_codex_info_approval_reports_translation_config(monkeypatch):
+    """codex_info(query='approval') surfaces the dialog-localization knobs: language +
+    the provider chain (BULLDOZER_APPROVAL_LANG / BULLDOZER_TRANSLATE_PROVIDER)."""
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_APPROVAL_LANG", raising=False)
+    monkeypatch.delenv("BULLDOZER_TRANSLATE_PROVIDER", raising=False)
+    k = cs.codex_info_v2({"query": "approval"})["result"]
+    assert k["translate_lang"] == ""               # localization off by default
+    assert k["translate_provider"] == ["openai"]   # back-compat default chain
+    monkeypatch.setenv("BULLDOZER_APPROVAL_LANG", "ru")
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_PROVIDER", "google,opus")
+    k = cs.codex_info_v2({"query": "approval"})["result"]
+    assert k["translate_lang"] == "ru"
+    assert k["translate_provider"] == ["google", "opus"]
+
+
+def test_codex_info_approval_in_tool_enum():
+    import codex_server as cs
+    info = next(t for t in cs.TOOLS if t["name"] == "codex_info")
+    assert "approval" in info["inputSchema"]["properties"]["query"]["enum"]
 
 
 def test_build_interrupted_result_no_error_key_and_partial():
@@ -1770,6 +2814,92 @@ def test_command_approval_no_narrative_no_explained_line():
     assert "Codex explained:" not in msg
 
 
+def test_command_dialog_narrative_leads(monkeypatch):
+    """UX: codex's 'Codex explained:' narrative leads the command dialog — read intent BEFORE the
+    raw (often long/truncated) command. Header stays the title; narrative right after it, before Command."""
+    from codex_server import _build_command_approval_message
+    monkeypatch.delenv("BULLDOZER_APPROVAL_LANG", raising=False)
+    msg = _build_command_approval_message(
+        {"command": "rm -rf /x", "cwd": "/tmp", "reason": "cleanup"},
+        narrative="I'll remove the stale temp directory before rebuilding.")
+    assert "Codex explained:" in msg and "Command:" in msg
+    assert msg.index("Codex approval request") < msg.index("Codex explained:") < msg.index("Command:"), \
+        "order must be: header → Codex explained → Command"
+
+
+def test_simple_dialog_narrative_leads(monkeypatch):
+    """UX: narrative leads the fileChange/permissions dialog too (after the header, before reason/details)."""
+    from codex_server import _build_simple_approval_message
+    monkeypatch.delenv("BULLDOZER_APPROVAL_LANG", raising=False)
+    msg = _build_simple_approval_message("filechange", "edit the config",
+                                         narrative="Adding the new feature flag.")
+    assert "Codex explained:" in msg and "Reason:" in msg
+    assert msg.index("Codex explained:") < msg.index("Reason:"), \
+        "narrative must lead, before the reason"
+
+
+def test_approval_narrative_max_env_knob_and_clamp(monkeypatch):
+    """Narrative cap is a tunable knob (BULLDOZER_APPROVAL_NARRATIVE_MAX) with a raised default —
+    codex narratives routinely exceed the old hardcoded 500."""
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_APPROVAL_NARRATIVE_MAX", raising=False)
+    assert cs._approval_narrative_max() == 2000                     # raised default (was 500)
+    monkeypatch.setenv("BULLDOZER_APPROVAL_NARRATIVE_MAX", "5000")
+    assert cs._approval_narrative_max() == 5000
+    monkeypatch.setenv("BULLDOZER_APPROVAL_NARRATIVE_MAX", "999999")
+    assert cs._approval_narrative_max() == 8000                     # clamped ceiling
+    monkeypatch.setenv("BULLDOZER_APPROVAL_NARRATIVE_MAX", "10")
+    assert cs._approval_narrative_max() == 200                      # clamped floor
+    monkeypatch.setenv("BULLDOZER_APPROVAL_NARRATIVE_MAX", "garbage")
+    assert cs._approval_narrative_max() == 2000                     # invalid → default
+
+
+def test_attended_narrative_not_cut_at_old_500(monkeypatch):
+    """A ~1140-char single-line narrative is now shown IN FULL in the attended dialog
+    (it would have been chopped at 500 before the raised cap)."""
+    from codex_server import bridge_approval
+    monkeypatch.delenv("BULLDOZER_APPROVAL_NARRATIVE_MAX", raising=False)   # default 2000
+    long_narr = "I will carefully refactor the parser and verify each branch, " * 18  # ~1116 chars, 1 line
+    cc = FakeCC()
+    params = {"threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1",
+              "startedAtMs": 1, "command": "echo hi", "cwd": "/tmp"}
+    bridge_approval("item/commandExecution/requestApproval", params, cc.write, cc.read,
+                    narrative=long_narr)
+    msg = _last_elicit_message(cc)
+    assert long_narr.strip() in msg, "narrative truncated below the raised cap"
+    assert "more char" not in msg                                   # no truncation marker — it fit
+
+
+def test_attended_narrative_still_truncated_above_cap(monkeypatch):
+    """The cap still BOUNDS — set it low and a huge narrative is truncated with a marker
+    (proves we raised, not removed, the bound)."""
+    from codex_server import bridge_approval
+    monkeypatch.setenv("BULLDOZER_APPROVAL_NARRATIVE_MAX", "300")
+    cc = FakeCC()
+    huge = "Z" * 2000
+    params = {"threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1",
+              "startedAtMs": 1, "command": "echo hi", "cwd": "/tmp"}
+    bridge_approval("item/commandExecution/requestApproval", params, cc.write, cc.read,
+                    narrative=huge)
+    msg = _last_elicit_message(cc)
+    assert "…" in msg and "more char" in msg
+    assert huge not in msg
+    assert "Z" * 350 not in msg        # env=300 RESPECTED → cut well below the old hardcoded 500
+
+
+def test_park_narrative_uses_raised_cap(monkeypatch):
+    """The unattended park payload narrative also honors the raised cap (was the 800 default)."""
+    from codex_server import build_awaiting_payload
+    monkeypatch.delenv("BULLDOZER_APPROVAL_NARRATIVE_MAX", raising=False)   # default 2000
+    narr = "explanation-token " * 90      # ~1620 chars, 1 line — over the old 800, under 2000
+    payload, _ = build_awaiting_payload(
+        "item/commandExecution/requestApproval",
+        {"command": "echo hi", "cwd": "/tmp"}, {"thread_id": "T1"}, narr, "tok")
+    shown = payload["approval"]["narrative"]
+    assert shown.count("explanation-token") >= 88, \
+        f"park narrative cut below raised cap: {shown.count('explanation-token')} tokens"
+
+
 # ── #251 step-0: approval-event logging ───────────────────────────────────
 
 _APPROVAL_PARAMS = {"threadId": "T1", "turnId": "TURN1", "itemId": "ITEM1",
@@ -2078,6 +3208,283 @@ def test_translate_caches_identical(monkeypatch):
     cs._translate_texts(["Cache"], "ru")
     cs._translate_texts(["Cache"], "ru")
     assert len(n) == 1, "second identical request is a cache hit"
+
+
+# ── literal masking: protect paths/commands/identifiers from MT mangling ──────
+# Empirically (OPUS-MT, raw Google) a translator MANGLES file paths and shell
+# commands ("check"->"keck", "git apply patch.diff"->"git applect.diff"). The
+# masker swaps each literal for a [N] placeholder (proven to survive OPUS-MT 3/3),
+# translates only the prose, then restores the literals verbatim.
+
+def test_mask_literals_protects_and_restores_path_command_identifier():
+    import codex_server as cs
+    t = "Run `git apply patch.diff` in /Users/it/project then re-run test_parse_ledger."
+    masked, spans = cs._mask_literals(t)
+    # the sensitive literals are gone from the masked text (never sent to a translator)
+    assert "`git apply patch.diff`" not in masked
+    assert "/Users/it/project" not in masked
+    assert "test_parse_ledger" not in masked
+    # replaced by numbered [N] placeholders
+    assert "[0]" in masked and "[1]" in masked and "[2]" in masked
+    # restore is byte-exact
+    assert cs._unmask_literals(masked, spans) == t
+
+
+def test_mask_unmask_roundtrip_when_input_already_contains_bracket_token():
+    """codex_review [P2]: input that ALREADY contains a [N]-format token (list index,
+    citation, foo[1].txt) must still round-trip byte-exact — generated placeholders must
+    NOT collide with the original's bracketed text (else unmask corrupts both)."""
+    import codex_server as cs
+    t = "Step [0] then [1]: write to /tmp/out.txt and run test_parse_ledger"
+    masked, spans = cs._mask_literals(t)
+    # round-trip is byte-exact despite the literal [0]/[1] in the input
+    assert cs._unmask_literals(masked, spans) == t
+    # the maskable literals are gone from the masked text
+    assert "/tmp/out.txt" not in masked and "test_parse_ledger" not in masked
+    # the original [0]/[1] tokens are preserved verbatim (NOT consumed as placeholders)
+    assert "[0]" in masked and "[1]" in masked
+
+
+# ── google provider: raw client=gtx endpoint, keyless, per-string, fail-open ──
+
+def test_google_provider_translates_each_string(monkeypatch):
+    import codex_server as cs
+    calls = []
+    monkeypatch.setattr(cs, "_google_http",
+                        lambda text, lang, timeout: calls.append(text) or
+                        {"Hello": "Привет", "World": "Мир"}[text])
+    assert cs._translate_google(["Hello", "World"], "ru") == ["Привет", "Мир"]
+    assert calls == ["Hello", "World"]
+
+
+def test_google_provider_retries_once_then_succeeds(monkeypatch):
+    import codex_server as cs
+    attempts = []
+    def flaky(text, lang, timeout):
+        attempts.append(text)
+        if len(attempts) == 1:
+            raise TimeoutError("first try slow")
+        return "Привет"
+    monkeypatch.setattr(cs, "_google_http", flaky)
+    monkeypatch.setattr(cs.time, "sleep", lambda *_: None)  # no real backoff wait in test
+    assert cs._translate_google(["Hello"], "ru") == ["Привет"]
+    assert len(attempts) == 2, "one retry after a transient failure"
+
+
+def test_google_provider_returns_none_on_persistent_failure(monkeypatch):
+    import codex_server as cs
+    def boom(text, lang, timeout):
+        raise OSError("blocked / 429")
+    monkeypatch.setattr(cs, "_google_http", boom)
+    monkeypatch.setattr(cs.time, "sleep", lambda *_: None)
+    # None signals the dispatcher to fall through to the next provider (not English-here)
+    assert cs._translate_google(["Hello", "World"], "ru") is None
+
+
+# ── opus provider: offline OPUS-MT/CTranslate2, lazy-optional (None if absent) ──
+
+def test_opus_provider_returns_none_when_unavailable(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setattr(cs, "_opus_available", lambda: False)
+    # deps/model not provisioned → fall through, never raise
+    assert cs._translate_opus(["Hello"], "ru") is None
+
+
+def test_opus_provider_translates_when_available(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setattr(cs, "_opus_available", lambda: True)
+    monkeypatch.setattr(cs, "_opus_translate_one",
+                        lambda text, lang: {"Hello": "Привет", "World": "Мир"}[text])
+    assert cs._translate_opus(["Hello", "World"], "ru") == ["Привет", "Мир"]
+
+
+def test_opus_provider_none_on_translate_error(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setattr(cs, "_opus_available", lambda: True)
+    def boom(text, lang):
+        raise RuntimeError("ct2 failure")
+    monkeypatch.setattr(cs, "_opus_translate_one", boom)
+    assert cs._translate_opus(["Hello"], "ru") is None
+
+
+def test_opus_available_false_without_model_bin(monkeypatch, tmp_path):
+    """A dir with no model.bin (e.g. a raw HF snapshot that still holds only a .zip)
+    is NOT available, even when ctranslate2/sentencepiece are present."""
+    import importlib.util
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_OPUS_MODEL_DIR", str(tmp_path))  # dir exists, no model.bin
+    monkeypatch.setattr(importlib.util, "find_spec", lambda m: object())  # pretend deps present
+    assert cs._opus_available() is False
+
+
+@pytest.mark.slow
+def test_opus_real_lean_translation_appends_eos_no_repetition():
+    """Real OPUS-MT/CTranslate2 LEAN path (raw sentencepiece, no transformers/torch).
+    Guards the </s> EOS token: without it Marian degenerates into a repetition loop and
+    mangles the [N] placeholders. Self-skips unless ctranslate2+sentencepiece are
+    importable AND BULLDOZER_OPUS_MODEL_DIR points at an extracted CT2 model dir
+    (model.bin + source.spm), e.g. an unzipped ordois/opus-mt-en-ru-ctranslate2-int8."""
+    import importlib.util
+    import codex_server as cs
+    if not all(importlib.util.find_spec(m) for m in ("ctranslate2", "sentencepiece")):
+        pytest.skip("ctranslate2/sentencepiece not installed")
+    d = cs._opus_model_dir()
+    if not d or not os.path.isfile(os.path.join(d, "model.bin")):
+        pytest.skip("BULLDOZER_OPUS_MODEL_DIR not set to an extracted CT2 model")
+    cs._OPUS_ENGINE = None  # force a fresh engine load
+    out = cs._opus_translate_one("I will create a file at [0] then run [1] and [2].", "ru")
+    # each placeholder must survive EXACTLY once (no repetition-loop, no mangling)
+    assert out.count("[0]") == 1 and out.count("[1]") == 1 and out.count("[2]") == 1, out
+    # and it must actually be translated to Russian (Cyrillic present)
+    assert any("Ѐ" <= ch <= "ӿ" for ch in out), out
+
+
+# ── dispatcher: BULLDOZER_TRANSLATE_PROVIDER selector + masking + fallback chain ──
+
+def test_dispatcher_uses_selected_google_provider(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_PROVIDER", "google")
+    monkeypatch.setattr(cs, "_translate_google", lambda texts, lang: ["Г" + t for t in texts])
+    monkeypatch.setattr(cs, "_translate_openai",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("openai must not run")))
+    assert cs._translate_texts(["x"], "ru") == ["Гx"]
+
+
+def test_dispatcher_masks_literals_and_restores(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_PROVIDER", "google")
+    seen = []
+    def fake_google(texts, lang):
+        seen.extend(texts)
+        return ["перевод " + t for t in texts]   # keep the [N] placeholders intact
+    monkeypatch.setattr(cs, "_translate_google", fake_google)
+    out = cs._translate_texts(["run /tmp/x.txt now"], "ru")
+    # the provider received a MASKED skeleton — the path never left the box verbatim
+    assert "/tmp/x.txt" not in seen[0] and "[0]" in seen[0]
+    # the final output restores the path verbatim
+    assert "/tmp/x.txt" in out[0]
+
+
+def test_dispatcher_falls_through_to_next_provider(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_PROVIDER", "google,opus")
+    monkeypatch.setattr(cs, "_translate_google", lambda texts, lang: None)   # google unavailable
+    monkeypatch.setattr(cs, "_translate_opus", lambda texts, lang: ["O" + t for t in texts])
+    assert cs._translate_texts(["x"], "ru") == ["Ox"]
+
+
+def test_dispatcher_all_providers_fail_returns_english(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_PROVIDER", "google,opus")
+    monkeypatch.setattr(cs, "_translate_google", lambda texts, lang: None)
+    monkeypatch.setattr(cs, "_translate_opus", lambda texts, lang: None)
+    assert cs._translate_texts(["keep english"], "ru") == ["keep english"]
+
+
+def test_dispatcher_off_disables_translation(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_PROVIDER", "off")
+    monkeypatch.setattr(cs, "_translate_google",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("must not run when off")))
+    assert cs._translate_texts(["x"], "ru") == ["x"]
+
+
+def test_dispatcher_default_provider_is_openai_backcompat(monkeypatch):
+    """Unset BULLDOZER_TRANSLATE_PROVIDER → openai path (#247 back-compat)."""
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_TRANSLATE_PROVIDER", raising=False)
+    monkeypatch.setattr(cs, "_translate_openai", lambda texts, lang: ["OAI" + t for t in texts])
+    assert cs._translate_texts(["x"], "ru") == ["OAIx"]
+
+
+# ── /check R1-F1: reject provider output that dropped/duplicated a placeholder ──
+
+def test_dispatcher_rejects_dropped_placeholder_falls_through(monkeypatch):
+    """A translation that LOST a [N] placeholder silently loses the literal — must be
+    rejected (→ fall through to English), not accepted with a vanished path/command."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_PROVIDER", "google")
+    monkeypatch.setattr(cs, "_translate_google", lambda texts, lang: ["перевод без токена"])
+    assert cs._translate_texts(["run /tmp/x.txt"], "ru") == ["run /tmp/x.txt"]
+
+
+def test_dispatcher_rejects_duplicated_placeholder_falls_through(monkeypatch):
+    """A translation that DUPLICATED a [N] placeholder would duplicate the literal — reject."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_PROVIDER", "google")
+    monkeypatch.setattr(cs, "_translate_google", lambda texts, lang: [t + " " + t for t in texts])
+    assert cs._translate_texts(["run /tmp/x.txt"], "ru") == ["run /tmp/x.txt"]
+
+
+def test_dispatcher_broken_placeholder_falls_through_to_next_provider(monkeypatch):
+    """If the primary drops a placeholder, the chain tries the NEXT provider (not English yet)."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_PROVIDER", "google,opus")
+    monkeypatch.setattr(cs, "_translate_google", lambda texts, lang: ["dropped token"])  # broken
+    monkeypatch.setattr(cs, "_translate_opus", lambda texts, lang: ["ок " + t for t in texts])  # intact
+    out = cs._translate_texts(["run /tmp/x.txt"], "ru")
+    assert out[0].startswith("ок ") and "/tmp/x.txt" in out[0]  # opus result used, literal intact
+
+
+def test_dispatcher_rejects_non_string_provider_output(monkeypatch):
+    """A provider returning a NON-STRING element must be rejected (fail-open to English),
+    not crash the dispatcher (R1-F1 round 2: _placeholders_intact .count on non-str)."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_PROVIDER", "google")
+    monkeypatch.setattr(cs, "_translate_google", lambda texts, lang: [None])
+    assert cs._translate_texts(["run /tmp/x.txt"], "ru") == ["run /tmp/x.txt"]
+
+
+def test_dispatcher_rejects_malformed_non_list_provider_output(monkeypatch):
+    """A provider returning a non-list CONTAINER (dict/str/int) must be rejected, not crash
+    on len()/index (R1-F1 round 3: strict shape guard)."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_TRANSLATE_PROVIDER", "google")
+    for bad in ({"weird": "shape"}, "a string not a list", 7):
+        monkeypatch.setattr(cs, "_translate_google", lambda texts, lang, b=bad: b)
+        assert cs._translate_texts(["run /tmp/x.txt"], "ru") == ["run /tmp/x.txt"]
+
+
+# ── /check R1-F2: mask the WHOLE relative path (leading dir segment too) ──
+
+def test_mask_literals_masks_single_quoted_literal_but_not_apostrophes():
+    """R3-F1: a standalone single-quoted literal is masked, but English contractions /
+    possessives (apostrophe after a letter) are NOT (a naive '[^']+' would corrupt prose)."""
+    import codex_server as cs
+    t = "run with 'prod config' now"
+    masked, spans = cs._mask_literals(t)
+    assert "'prod config'" not in masked            # the literal is masked
+    assert cs._unmask_literals(masked, spans) == t   # byte-exact round-trip
+    t2 = "don't touch the user's files"
+    m2, _ = cs._mask_literals(t2)
+    assert m2 == t2                                   # contractions/possessives untouched
+
+
+def test_mask_literals_masks_whole_relative_path():
+    """A relative path like mcp/codex_server.py must be fully masked — the leading dir
+    segment must NOT leak to the translator (where it could be mangled)."""
+    import codex_server as cs
+    t = "edit mcp/codex_server.py and src/a.py now"
+    masked, spans = cs._mask_literals(t)
+    assert "mcp" not in masked and "src" not in masked   # leading segments masked
+    assert "codex_server.py" not in masked
+    assert cs._unmask_literals(masked, spans) == t        # byte-exact round-trip
+
+
+# ── /check R1-F3: OPUS engine cache must key on the model dir ──
+
+def test_opus_engine_reloads_when_model_dir_changes(monkeypatch):
+    """_OPUS_ENGINE must reload when BULLDOZER_OPUS_MODEL_DIR changes in-process
+    (module-singleton + context-param = stale-data trap)."""
+    import codex_server as cs
+    cs._OPUS_ENGINE = None
+    loaded = []
+    monkeypatch.setattr(cs, "_opus_load", lambda d: loaded.append(d) or ("tr-" + d, "src", "tgt"))
+    monkeypatch.setenv("BULLDOZER_OPUS_MODEL_DIR", "/model/A")
+    cs._opus_engine(); cs._opus_engine()      # cached → one load
+    monkeypatch.setenv("BULLDOZER_OPUS_MODEL_DIR", "/model/B")
+    cs._opus_engine()                          # dir changed → reload
+    assert loaded == ["/model/A", "/model/B"]
 
 
 def test_dialog_labels_fallback_english():
@@ -2417,6 +3824,44 @@ def test_turn_state_machine_eof_clears_in_flight():
     assert "error" in err
     assert "jsonrpc" not in err  # NOT a JSON-RPC frame — plain error dict
     assert not sm.is_busy()      # state cleared so child can respawn
+
+
+# --- #277 Task 2: TurnStateMachine parked state ---
+def test_tsm_parked_state():
+    from codex_server import TurnStateMachine
+    t = TurnStateMachine()
+    t.turn_started(cc_id=1)
+    t.park("tok-abc", "thr-1")
+    assert t.is_parked() and t.is_busy() and t.parked_token() == "tok-abc"
+    t.unpark()
+    assert not t.is_parked()
+
+
+def test_tsm_busy_error_distinguishes_parked_from_in_flight():
+    from codex_server import TurnStateMachine
+    t = TurnStateMachine()
+    t.turn_started(cc_id=1)
+    assert "park" not in t.busy_error()["error"].lower()   # plain in-flight
+    t.park("tok", "thr")
+    assert "park" in t.busy_error()["error"].lower()        # parked → distinct message
+
+
+def test_tsm_turn_completed_clears_park():
+    from codex_server import TurnStateMachine
+    t = TurnStateMachine()
+    t.turn_started(cc_id=1)
+    t.park("tok", "thr")
+    t.turn_completed()
+    assert not t.is_parked() and not t.is_busy() and t.parked_token() is None
+
+
+def test_tsm_eof_clears_park():
+    from codex_server import TurnStateMachine
+    t = TurnStateMachine()
+    t.turn_started(cc_id=1)
+    t.park("tok", "thr")
+    t.eof_error()
+    assert not t.is_parked() and not t.is_busy()
 
 
 def test_classify_shape_first_colliding_id():
@@ -3184,7 +4629,7 @@ def test_codex_info_tool_registered():
     assert tool is not None, "codex_info tool must be registered"
     enum = set(tool["inputSchema"]["properties"]["query"].get("enum") or [])
     assert enum == {"models", "auth", "config", "limits", "usage",
-                    "servers", "features", "profiles"}
+                    "servers", "features", "profiles", "approval"}   # #277: + local knob read-out
 
 
 def test_codex_info_maps_query_to_method():
@@ -3870,6 +5315,46 @@ class TestV2Dispatcher:
             assert "mcp" in schema_props, f"inputSchema missing 'mcp': {list(schema_props)}"
             required = codex_tool.get("inputSchema", {}).get("required", [])
             assert "mcp" in required, f"mcp must be REQUIRED, required={required}"
+        finally:
+            self._shutdown(proc)
+
+    def test_codex_approve_advertised_in_tools_list(self):
+        """#277 Task 3: codex_approve present in tools/list; required park_token+decision_id; no prompt/mcp."""
+        proc = self._start_server()
+        try:
+            self._send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            self._recv(proc)
+            self._send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+            resp = self._recv(proc)
+            tools = resp.get("result", {}).get("tools", [])
+            names = [t["name"] for t in tools]
+            assert "codex_approve" in names, f"codex_approve not in tools: {names}"
+            t = next(x for x in tools if x["name"] == "codex_approve")
+            schema = t.get("inputSchema", {})
+            props = schema.get("properties", {})
+            required = schema.get("required", [])
+            assert set(required) == {"park_token", "decision_id"}, f"required={required}"
+            assert "prompt" not in props and "mcp" not in props, (
+                f"codex_approve must NOT carry prompt/mcp (distinct from codex_run): {list(props)}"
+            )
+        finally:
+            self._shutdown(proc)
+
+    def test_codex_approve_dispatched_by_name_when_not_parked(self):
+        """#277 Task 3: codex_approve routes BY NAME to codex_approve_v2 (stub: not parked) — distinct
+        from codex_run, needs NO prompt/mcp and NO codex binary (stub short-circuits before ensure())."""
+        proc = self._start_server(env_override={"JAINE_CODEX_BIN": "/nonexistent/codex"})
+        try:
+            self._send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            self._recv(proc)
+            self._send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "codex_approve", "arguments": {"park_token": "x", "decision_id": "y"}}})
+            resp = self._recv(proc)
+            assert resp.get("id") == 2
+            result = resp.get("result", {})
+            assert result.get("isError") is True, f"expected isError: {result}"
+            text = result["content"][0]["text"]
+            assert "parked" in text.lower(), f"expected a parked-state error, got: {text}"
         finally:
             self._shutdown(proc)
 
@@ -4861,8 +6346,10 @@ def test_default_has_no_work_duration_deadline(ext_child):
     cap (e.g. 180.0) would have slipped through. Guard against ANY hardcoded numeric
     work-duration deadline, and assert the deadline is opt-in (derived from the timeout arg)."""
     import inspect, re, codex_server as cs
-    src = inspect.getsource(cs.codex_run_v2)
-    assert not re.search(r"deadline\s*=\s*time\.time\(\)\s*\+\s*\d", src), \
+    # #277: the turn-pump loop (with the deadline logic) moved into the inner generator _drive_turn;
+    # check BOTH sources so the no-hardcoded-cap guard + the opt-in-deadline assertion follow the code.
+    src = inspect.getsource(cs.codex_run_v2) + "\n" + inspect.getsource(cs._drive_turn)
+    assert not re.search(r"deadline\s*=\s*time\.(time|monotonic)\(\)\s*\+\s*\d", src), \
         "no HARDCODED numeric work-duration cap may exist — the cap must be opt-in (timeout arg)"
     # the work-duration deadline must be derived from the opt-in timeout (None when unset):
     assert "turn_timeout" in src and "deadline is None" in src, \
@@ -5182,3 +6669,412 @@ def test_e2e_all_loads_user_servers_by_tools_count():
     counts = _server_tool_counts(m)
     assert any(counts.get(n, 0) > 0 for n in config_servers), (
         f"no user server loaded tools under 'all' — tools-count test would be vacuous: {counts}")
+
+
+# ---------------------------------------------------------------------------
+# #277 — Unattended mode: _unattended_active() toggle + attended-dispatch fall-through.
+# (The #251 in-process classify_approval judge was REPLACED by route_approval / _is_trivially_safe
+# — those tests live in the "#277 Task 1/7" blocks above; the judge + its tests were deleted in #277.)
+# ---------------------------------------------------------------------------
+
+# --- toggle: _unattended_active() ---
+def test_unattended_active_off_by_default(monkeypatch):
+    monkeypatch.delenv("BULLDOZER_APPROVAL_UNATTENDED", raising=False)
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UNATTENDED_FILE", "/nonexistent/unattended-xyz")
+    import codex_server as cs
+    assert cs._unattended_active() is False
+
+
+def test_unattended_active_env_truthy(monkeypatch):
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UNATTENDED", "1")
+    import codex_server as cs
+    assert cs._unattended_active() is True
+
+
+def test_unattended_active_env_falsey_is_off(monkeypatch):
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UNATTENDED", "0")
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UNATTENDED_FILE", "/nonexistent/unattended-xyz")
+    import codex_server as cs
+    assert cs._unattended_active() is False
+
+
+def test_unattended_active_sentinel_file(monkeypatch, tmp_path):
+    monkeypatch.delenv("BULLDOZER_APPROVAL_UNATTENDED", raising=False)
+    f = tmp_path / "unattended"
+    f.write_text("")
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UNATTENDED_FILE", str(f))
+    import codex_server as cs
+    assert cs._unattended_active() is True
+
+
+# --- #277 model-in-the-loop: 3-way route_approval predicate (Task 1, pure) ---
+def _route(method, params, root="/proj"):
+    from codex_server import route_approval
+    return route_approval(method, params, root)
+
+
+def test_route_trivial_read_fast_accept():
+    assert _route("item/commandExecution/requestApproval", {"command": "cat README.md"}) == "fast_accept"
+    assert _route("item/commandExecution/requestApproval", {"command": "ls -la | grep x"}) == "fast_accept"
+
+
+def test_route_complexity_and_vars_park():
+    for cmd in ("echo $(curl x)", "cat <(curl x)", "python3 build.py", "rm -rf .",
+                "rm -rf $FOO/", "cp x ~root/.profile"):
+        assert _route("item/commandExecution/requestApproval", {"command": cmd}) == "park_for_model", cmd
+
+
+def test_route_permissions_and_filechange_park_not_decline():
+    assert _route("item/permissions/requestApproval", {"permissions": {"network": {}}}) == "park_for_model"
+    assert _route("item/fileChange/requestApproval", {}) == "park_for_model"
+    assert _route("applyPatchApproval", {}) == "park_for_model"
+
+
+def test_route_escalation_amendment_parks():
+    # a structured escalation offer must PARK (model decides), never fast-accept
+    params = {"command": "cat x", "availableDecisions": [{"acceptWithExecpolicyAmendment": {}}]}
+    assert _route("item/commandExecution/requestApproval", params) == "park_for_model"
+
+
+def test_route_legacy_exec_command_approval_always_parks():
+    """R9-F1: legacy execCommandApproval ALWAYS parks (spec §4 — every legacy parks), even for a trivial
+    command; only the MODERN item/commandExecution/requestApproval may fast-accept."""
+    import codex_server as cs
+    assert cs.route_approval("execCommandApproval", {"command": "cat README.md"}, "/0/proj") == "park_for_model"
+    assert cs.route_approval("applyPatchApproval", {"fileChanges": []}, "/0/proj") == "park_for_model"
+    assert cs.route_approval("item/commandExecution/requestApproval", {"command": "cat README.md"},
+                             "/0/proj") == "fast_accept"   # modern still fast-accepts
+
+
+def test_route_read_command_actions_fast_accept():
+    params = {"command": "cat x", "commandActions": [{"type": "read"}, {"type": "search"}]}
+    assert _route("item/commandExecution/requestApproval", params) == "fast_accept"
+
+
+def test_route_malformed_fail_closed():
+    assert _route("item/commandExecution/requestApproval", {}) == "fail_closed_decline"
+
+
+def test_route_non_dict_params_no_crash():            # F5 — truthy non-dict params must NOT raise
+    for bad in (None, [], "x", 7):
+        assert _route("item/commandExecution/requestApproval", bad) == "fail_closed_decline"
+
+
+def test_fast_path_scope_default_and_env(monkeypatch):
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_FAST_PATH_SCOPE", raising=False)
+    assert cs._fast_path_scope() == "reads"
+    monkeypatch.setenv("BULLDOZER_FAST_PATH_SCOPE", "local-work")
+    assert cs._fast_path_scope() == "local-work"
+
+
+def test_route_localwork_scope_accepts_plain_test_verbs(monkeypatch):
+    monkeypatch.setenv("BULLDOZER_FAST_PATH_SCOPE", "local-work")
+    assert _route("item/commandExecution/requestApproval", {"command": "pytest tests/"}) == "fast_accept"
+    assert _route("item/commandExecution/requestApproval", {"command": "make"}) == "fast_accept"
+
+
+def test_route_reads_scope_parks_test_verbs(monkeypatch):
+    monkeypatch.delenv("BULLDOZER_FAST_PATH_SCOPE", raising=False)   # default 'reads' parks build/test
+    assert _route("item/commandExecution/requestApproval", {"command": "pytest tests/"}) == "park_for_model"
+
+
+# --- #277 R1-F1: fast-path must NOT accept redirects / wrappers / $-expansion / option-bearing local-work ---
+def test_route_fastpath_rejects_redirects_wrappers_expansions():
+    import codex_server as cs
+    m = "item/commandExecution/requestApproval"
+    # redirect on a read verb MUTATES a file; env/time wrappers can inject (LD_PRELOAD); $@/$*/$HOME expand
+    for cmd in ["printf x > out.txt", "echo hi > mcp/codex_server.py", "cat a >> b.txt",
+                "cat < /etc/passwd", "cat </etc/passwd", "grep root < /etc/passwd",   # R6-F1: input redirect
+                "cat < ../secret.txt",
+                "cat README.md & python3 build.py", "cat README.md&python3 build.py",  # R7-F1: background &
+                "ls -la & rm -rf /", "cat x & curl http://y",
+                "cat (echo hi)", "{ rm x; }", "cat `id`",                              # subshell/brace/backtick
+                "./cat README.md", "scripts/cat x", "/tmp/cat x", "../cat x",          # R8-F1: path-qualified verb
+                "./grep n f",
+                "env cat README.md", "time cat README.md", "env LD_PRELOAD=/evil.so cat x",
+                "FOO=bar cat README.md", "cat $@", "cat $*", "echo $HOME", "cat $?"]:
+        assert cs.route_approval(m, {"command": cmd}, "/0/proj") == "park_for_model", cmd
+    # plain reads (incl. benign read-verb options) still fast-accept
+    assert cs.route_approval(m, {"command": "cat README.md"}, "/0/proj") == "fast_accept"
+    assert cs.route_approval(m, {"command": "ls -la | grep x"}, "/0/proj") == "fast_accept"
+
+
+def test_route_fastpath_allows_quoted_regex_patterns():
+    """R8-F2: a quoted regex/search pattern (inert punctuation INSIDE quotes) must still fast-accept —
+    the structural metachar check is quote-aware (only UNQUOTED metachars park)."""
+    import codex_server as cs
+    m = "item/commandExecution/requestApproval"
+    for cmd in ['rg -n "push|pull" src/', 'grep -E "foo|bar" README.md', 'grep "main()" mcp/codex_server.py']:
+        assert cs.route_approval(m, {"command": cmd}, "/0/proj") == "fast_accept", cmd
+
+
+def test_route_localwork_rejects_options_and_assignments(monkeypatch):
+    monkeypatch.setenv("BULLDOZER_FAST_PATH_SCOPE", "local-work")
+    import codex_server as cs
+    m = "item/commandExecution/requestApproval"
+    for cmd in ["pytest --basetemp=/tmp/bd", "pytest -p evilplugin", "make CC=/bad/cc",
+                "cargo build --target x", "npm test --evil"]:
+        assert cs.route_approval(m, {"command": cmd}, "/0/proj") == "park_for_model", cmd
+    for cmd in ["pytest tests/", "make", "make build", "npm test", "cargo build"]:
+        assert cs.route_approval(m, {"command": cmd}, "/0/proj") == "fast_accept", cmd
+
+
+def test_route_fastpath_rejects_dangerous_read_verb_flags():
+    """#280 A: a _TRIVIAL_READS verb carrying an EXEC / arbitrary-WRITE / state-mutation flag or output
+    operand must PARK, not fast-accept (the fast-path trusted the verb but not its flags — the
+    CVE-2025-66032 `sort -o` class). The gate is PER-VERB because the same flag differs by verb:
+    `sort -o` writes (dangerous) but `ls -o` is a long-listing (SAFE)."""
+    import codex_server as cs
+    m = "item/commandExecution/requestApproval"
+    # exec / arbitrary-write / state-mutation forms on read verbs → MUST park
+    for cmd in [
+        "rg --pre 'sh -c id' x", "rg --pre cat pattern .", "rg --pre-glob gz p .",
+        "rg --hostname-bin /bin/sh p .",
+        "sort -o /tmp/out data", "sort -o/tmp/out data", "sort --output=/tmp/out data",
+        "sort --output /tmp/out data", "sort --compress-program gzip data",
+        "uniq input output",                          # 2nd positional WRITES
+        "tree -o /tmp/out .", "tree -o/tmp/out .",
+        "date -s 2020-01-01", "date --set 2020-01-01",
+        "hostname newbox", "hostname -F /tmp/name", "hostname --file /tmp/name",
+    ]:
+        assert cs.route_approval(m, {"command": cmd}, "/0/proj") == "park_for_model", cmd
+    # SAFE read forms must STILL fast-accept (no over-parking — esp. ls -o = long listing)
+    for cmd in [
+        "sort data", "sort -r data", "sort -n -k2 data",
+        "ls -o", "ls -ao", "ls -la",                  # ls -o is long-listing, SAFE
+        "rg pattern .", "rg -n pattern src/", "rg -i foo .",
+        "uniq input", "uniq -c input",                # single file operand = read
+        "tree .", "tree -L 2 src/",
+        "date", "date +%Y", "date -u",
+        "hostname", "hostname -f", "hostname -i",      # query forms, no operand
+        "cat file", "head -n 5 f", "grep -i foo f", "wc -l f",
+    ]:
+        assert cs.route_approval(m, {"command": cmd}, "/0/proj") == "fast_accept", cmd
+
+
+def test_route_fastpath_path_bounds_reads():
+    """#280 D: a read verb targeting an absolute path OUTSIDE the project (or a `..` traversal) must
+    PARK — unattended fast-accept path-bounds reads to the workspace (comparable sandboxes scope reads
+    to the project root), so the model sees an out-of-project read instead of it auto-running. Reuses
+    _is_catastrophic_target (the same gate writes already use). In-project / relative reads still
+    fast-accept (trade-off: an absolute-path search PATTERN like `rg /etc src/` also parks — safe,
+    conservative, model-oversight not silent-accept)."""
+    import codex_server as cs
+    m = "item/commandExecution/requestApproval"
+    root = "/0/proj"
+    for cmd in ["cat /etc/passwd", "cat /Users/u/.ssh/id_rsa", "head -n1 /etc/shadow",
+                "cat ../outside.txt", "tail /var/log/system.log",
+                "ls /etc", "stat /Users/u/.aws/credentials"]:
+        assert cs.route_approval(m, {"command": cmd}, root) == "park_for_model", cmd
+    # in-project / relative reads still fast-accept
+    for cmd in ["cat README.md", "cat /0/proj/src/x.py", "head -n5 src/a.py",
+                "rg pattern src/", "grep -i foo README.md", "ls -la"]:
+        assert cs.route_approval(m, {"command": cmd}, root) == "fast_accept", cmd
+
+
+def test_awaiting_payload_includes_network_context_for_command():
+    """#280 B: a parked commandExecution approval must surface networkApprovalContext (host/protocol).
+    The attended dialog shows it (_build_command_approval_message); the parked model must see it too,
+    else it approves network egress blind to the destination."""
+    import codex_server as cs, json
+    # host is DELIBERATELY absent from the command string — so a match proves networkApprovalContext is
+    # surfaced, not merely echoed inside the command text.
+    params = {"command": "python3 fetch.py", "cwd": "/p",
+              "networkApprovalContext": {"host": "exfil.example.net", "protocol": "https"}}
+    payload, _ = cs.build_awaiting_payload("item/commandExecution/requestApproval", params, {}, None, "tok")
+    blob = json.dumps(payload)
+    assert "exfil.example.net" in blob, payload         # destination host must reach the model
+    assert "https" in blob, payload                     # protocol too
+    # no networkApprovalContext → no network key (don't fabricate one)
+    p2, _ = cs.build_awaiting_payload("item/commandExecution/requestApproval",
+                                      {"command": "ls", "cwd": "/p"}, {}, None, "tok")
+    assert "network" not in p2, p2
+
+
+def test_unattended_decisions_are_audit_logged(monkeypatch):
+    """#280 C: automated decision paths must emit an APPROVAL audit line — before, only attended
+    bridge_approval called _log_approval_event. Covers inline fast_accept (in _drive_turn) and the
+    _teardown_park auto-decline; both must log with unattended=True."""
+    import codex_server as cs
+    calls = []
+    monkeypatch.setattr(cs, "_log_approval_event", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(cs, "_unattended_active", lambda: True)
+    # 1) inline fast_accept (trivial command, armed) logs an accept
+    backend = _ScriptedBackend(command="cat README.md")
+    sm = cs.TurnStateMachine(); sm.turn_started(None)
+    ctx = _drive_turn_ctx(backend, force_park=False); ctx["state_machine"] = sm
+    try:
+        next(cs._drive_turn(ctx))                       # ACK → fast_accept (no yield) → completion
+        assert False, "expected StopIteration (fast_accept, no park)"
+    except StopIteration:
+        pass
+    assert any(k.get("unattended") for (_a, k) in calls), f"fast_accept not logged: {calls}"
+    # 2) _teardown_park auto-decline (cap/EOF/cancel/death) logs
+    calls.clear()
+    m = _ParkFakeManager(); sm2 = cs.TurnStateMachine()
+    _mk_parked(m, sm2)
+    cs._teardown_park(m, sm2, "cap")
+    assert calls, f"_teardown_park auto-decline not logged: {calls}"
+
+
+def test_model_resume_logs_resolved_decision_not_opaque_id(monkeypatch):
+    """codex_review P3: the model-resume audit line must record the RESOLVED decision (accept /
+    acceptForSession / perm:* — what was GRANTED), NOT the opaque d-id the model picked. Before the fix
+    it logged decision=d0/d1, so the #280-C audit trail could not tell what was actually granted."""
+    import codex_server as cs
+    calls = []
+    monkeypatch.setattr(cs, "_log_approval_event",
+                        lambda method, decision, *a, **k: calls.append((method, decision, k)))
+    monkeypatch.setattr(cs, "_unattended_active", lambda: True)
+    backend = _ScriptedBackend(command="echo hi", available=["accept", "acceptForSession", "cancel"])
+    sm = cs.TurnStateMachine(); sm.turn_started(None)
+    ctx = _drive_turn_ctx(backend); ctx["state_machine"] = sm
+    gen = cs._drive_turn(ctx)
+    payload = next(gen)
+    assert payload["status"] == "awaiting_approval"
+    # pick the d-id that maps to a SESSION grant — a distinct, non-default decision we want auditable
+    sess_id = next(d["id"] for d in payload["approval"]["decisions"]
+                   if cs.build_decision_response(ctx["request_frame"], d["id"])
+                       .get("result", {}).get("decision") == "acceptForSession")
+    try:
+        gen.send(sess_id)
+        assert False, "expected StopIteration"
+    except StopIteration:
+        pass
+    resume = [(mth, dec) for (mth, dec, k) in calls if k.get("rule") == "model_resume"]
+    assert resume, f"no model_resume audit line emitted: {calls}"
+    _mth, logged = resume[-1]
+    assert logged != sess_id, f"audit must not log the opaque d-id {sess_id!r}: {logged!r}"
+    assert cs._approval_decision_label(logged) == "acceptForSession", \
+        f"audit must record the resolved grant, not the opaque id: {logged!r}"
+
+
+def test_route_approval_unwraps_codex_shell_wrapper(monkeypatch):
+    """#281: codex app-server sends EVERY command wrapped as `<shell> -lc '<script>'`. route_approval
+    must unwrap the EXACT wrapper and evaluate the INNER script — else _is_trivially_safe parks on the
+    path-qualified shell verb (/bin/zsh) before any per-verb gate runs → the whole fast-path (and the
+    #280 A/D gates) is dead live. Unwrap is fail-closed: only the exact app-server shape unwraps; the
+    inner then runs the SAME predicate as a bare command."""
+    monkeypatch.setenv("BULLDOZER_FAST_PATH_SCOPE", "local-work")   # exercise build/test accept too
+    import codex_server as cs
+    m = "item/commandExecution/requestApproval"
+    root = "/0/proj"
+    def route(cmd): return cs.route_approval(m, {"command": cmd}, root)
+    # wrapped TRIVIAL commands route IDENTICALLY to their bare form (fast_accept), across shell variants
+    for inner in ["cat README.md", "ls -la", "rg -n foo src/", "pytest tests/", "make"]:
+        assert route(inner) == "fast_accept", f"bare baseline: {inner}"
+        for wrap in [f"/bin/zsh -lc '{inner}'", f"bash -c '{inner}'", f"zsh -lc \"{inner}\"",
+                     f"sh -c '{inner}'", f"/bin/bash -lc '{inner}'",
+                     f"/usr/bin/bash -lc '{inner}'", f"/opt/homebrew/bin/zsh -lc '{inner}'"]:  # trusted non-/bin dirs (P2)
+            assert route(wrap) == "fast_accept", wrap
+    # wrapped DANGEROUS inner still PARKS — the inner runs the full predicate (A / D / redirect / ; / rm)
+    for inner in ["rg --pre /bin/echo x .", "sort -o /tmp/o data", "cat /etc/passwd",
+                  "rm -rf x", "cat a > b", "cat a; rm b"]:
+        assert route(f"/bin/zsh -lc '{inner}'") == "park_for_model", f"dangerous inner: {inner}"
+    # SMUGGLING / non-exact wrappers must NOT unwrap → park (fail-closed)
+    for cmd in ["/bin/zsh -lc 'cat README.md' evilarg",   # positional $0/args after the script
+                "env zsh -lc 'cat README.md'",            # env prefix
+                "time sh -c 'cat README.md'",             # time prefix
+                "zsh -ic 'cat README.md'",                # interactive, not -c/-lc
+                "zsh -c 'cat a' -c 'rm b'",               # multiple -c
+                "./zsh -lc 'cat README.md'",              # relative-path shell
+                "/tmp/sh -c 'cat README.md'",             # untrusted absolute shell path (codex_review P2)
+                "/home/x/bash -lc 'cat README.md'",       # untrusted absolute shell path (codex_review P2)
+                "python3 -c 'import os'"]:                # not a shell wrapper at all
+        assert route(cmd) == "park_for_model", f"must not unwrap: {cmd}"
+
+
+def test_unwrap_shell_wrapper_rejects_untrusted_absolute_shell():
+    """codex_review P2: _unwrap_shell_wrapper must NOT trust an ARBITRARY absolute shell path. An
+    attacker-controlled `/tmp/sh -c 'cat README.md'` would otherwise unwrap to the trivial inner and
+    fast-accept, while the executable ACTUALLY run is the untrusted /tmp/sh. Only a KNOWN-good absolute
+    shell location (or a bare basename) may unwrap; unknown absolute paths stay wrapped → caller parks."""
+    import codex_server as cs
+    # untrusted absolute shell paths → returned UNCHANGED (caller then parks the wrapper)
+    for cmd in ["/tmp/sh -c 'cat README.md'", "/home/x/bash -lc 'ls'",
+                "/opt/evil/zsh -lc 'cat x'", "/sh -c 'ls'"]:
+        assert cs._unwrap_shell_wrapper(cmd) == cmd, f"must not unwrap untrusted abs shell: {cmd}"
+    # trusted absolute shells + bare basenames still unwrap to the inner script
+    assert cs._unwrap_shell_wrapper("/bin/zsh -lc 'cat README.md'") == "cat README.md"
+    assert cs._unwrap_shell_wrapper("/usr/bin/bash -lc 'ls -la'") == "ls -la"
+    assert cs._unwrap_shell_wrapper("/usr/local/bin/bash -c 'make'") == "make"
+    assert cs._unwrap_shell_wrapper("/opt/homebrew/bin/zsh -lc 'pytest tests/'") == "pytest tests/"
+    assert cs._unwrap_shell_wrapper("bash -lc 'cat x'") == "cat x"   # bare basename → PATH-resolved, allowed
+
+
+# --- bridge_approval integration: judge short-circuits the human dialog when armed ---
+def _arm_unattended(monkeypatch):
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UNATTENDED", "1")
+
+
+def test_unattended_bridge_falls_through_for_user_input(monkeypatch):
+    from codex_server import bridge_approval
+    _arm_unattended(monkeypatch)
+    cc = FakeCC()  # default answer: accept
+    bridge_approval("item/tool/requestUserInput", {}, cc.write, cc.read)
+    # judge returns None for non-approval elicitations → dispatch path → elicitation IS sent
+    assert len(cc._requests) == 1
+    assert cc._requests[0]["method"] == "elicitation/create"
+
+
+def test_unattended_off_uses_human_dispatch(monkeypatch):
+    from codex_server import bridge_approval
+    # disarm fixture already set OFF; a dangerous command must STILL go to the human (proves the
+    # judge is gated on the toggle, not always-on)
+    cc = FakeCC()  # default answer: accept
+    decision = bridge_approval(
+        "item/commandExecution/requestApproval",
+        {"command": "rm -rf ~", "cwd": "/0/proj"}, cc.write, cc.read)
+    assert len(cc._requests) == 1
+    assert cc._requests[0]["method"] == "elicitation/create"
+    assert decision == "accept"  # came from CC's answer, not the judge
+
+
+
+
+# ── #277 Task 11: real-codex park→resume + attended-unchanged slow e2e ──────────────────
+@skip_if_no_codex
+@pytest.mark.slow
+def test_e2e_armed_park_then_codex_approve_resumes_real(monkeypatch, tmp_path):
+    """#277 real park→resume: armed + a real codex turn that requests a NON-trivial command approval →
+    codex_run returns awaiting_approval; codex_approve(accept) resumes the SAME real turn to completion.
+    Self-skips when codex chooses not to request a parkable approval this run (non-deterministic)."""
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UNATTENDED", "1")
+    from codex_server import codex_run_v2, codex_approve_v2, _v2_state_machine
+    r = codex_run_v2({
+        "prompt": ("Run this exact shell command and then stop: "
+                   "python3 -c \"open('proof.txt','w').write('ok')\""),
+        "mode": "implement", "mcp": "isolated",
+        "sandbox": "workspace-write", "approval_policy": "untrusted", "cwd": str(tmp_path),
+    })
+    if r.get("status") != "awaiting_approval":
+        # codex completed/errored without a parkable approval — nothing to resume this run.
+        assert not _v2_state_machine.is_busy(), f"unexpected busy state: {r}"
+        pytest.skip(f"codex did not park this run: status={r.get('status')!r}, keys={sorted(r)}")
+    assert r["approval"]["kind"] == "commandExecution" and _v2_state_machine.is_parked()
+    decision_id = r["approval"]["decisions"][0]["id"]          # d0 → the plain accept option
+    r2 = codex_approve_v2({"park_token": r["park_token"], "decision_id": decision_id})
+    assert "error" not in r2, f"resume failed: {r2}"
+    assert not _v2_state_machine.is_busy()                     # turn completed, park cleared
+
+
+@skip_if_no_codex
+@pytest.mark.slow
+def test_e2e_unarmed_attended_elicitation_unchanged_real(monkeypatch, tmp_path):
+    """#277 attended-unchanged: UNARMED, a real codex approval still flows through the human
+    elicitation/create path (FakeCC answers accept) and the turn completes — never parks."""
+    monkeypatch.delenv("BULLDOZER_APPROVAL_UNATTENDED", raising=False)
+    from codex_server import codex_run_v2
+    cc = FakeCC()                                             # default answer: accept
+    r = codex_run_v2({
+        "prompt": ("Run this exact shell command and then stop: "
+                   "python3 -c \"open('proof.txt','w').write('ok')\""),
+        "mode": "implement", "mcp": "isolated",
+        "sandbox": "workspace-write", "approval_policy": "untrusted", "cwd": str(tmp_path),
+    }, cc_write_fn=cc.write, cc_read_fn=cc.read)
+    assert "error" not in r, f"attended turn errored: {r}"
+    assert r.get("status") != "awaiting_approval"            # UNARMED never parks
+    if not cc._requests:
+        pytest.skip("codex did not request an approval this run (nothing to verify for the attended path)")
+    assert all(req.get("method") == "elicitation/create" for req in cc._requests), cc._requests
