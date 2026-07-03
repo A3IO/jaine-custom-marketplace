@@ -31,9 +31,10 @@ _DANGER_EXT = {
 # Shell command-boundary punctuation passed to shlex. The default set (`();<>|&`,
 # which includes `;`) PLUS backtick: a backtick command substitution `...` opens a new
 # command context just like $( ), so splitting on it surfaces a destructive git hidden
-# in `git clean -fd`. (Quoted substitutions like "$(...)" and wrapper/prefix forms that
-# push git off the first token — `command`/`env`/`xargs` git …, `GIT_DIR=… git …` — stay
-# OUT of scope: the threat model is accidental work loss, not adversarial evasion.)
+# in `git clean -fd`. (Leading `VAR=val` env assignments before git ARE handled — see
+# _env_prefix_end, #297. Quoted substitutions like "$(...)" and true wrapper forms that
+# push git off the first token — `command`/`env`/`xargs` git … — stay OUT of scope: the
+# threat model is accidental work loss, not adversarial evasion.)
 _PUNCT = "();<>|&" + "`"
 
 # Tokens that separate one shell command from the next.
@@ -105,14 +106,90 @@ def _looks_like_file(arg: str) -> bool:
     return base.rsplit(".", 1)[-1].lower() in _DANGER_EXT
 
 
+# Git global options that consume the FOLLOWING token as their argument when not
+# written as --opt=value (#294: `git -C /p reset --hard` must not hide `reset`).
+# The full arg-taking set from git's SYNOPSIS; `--super-prefix` is rejected by
+# current git but kept for cross-version safety (blocking an inert command is fine).
+_GLOBAL_ARG_OPTS = {
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace",
+    "--config-env", "--attr-source", "--super-prefix",
+}
+
+# Globals that make real git print something and exit WITHOUT running any
+# sub-command that may follow (verified live: `git --html-path status` prints the
+# doc path and never runs status). Seeing one of these makes the segment inert.
+# Bare --exec-path is print-and-exit too; --exec-path=<p> falls through to the
+# generic argless branch and keeps the sub-command visible.
+_TERMINATING_OPTS = {
+    "--version", "-v", "--help", "-h",
+    "--html-path", "--man-path", "--info-path", "--exec-path",
+}
+
+
+def _skip_global_opts(segment: list[str], start: int) -> tuple[int, list[str], list[str]]:
+    """Skip git global options (with their arguments) up to the sub-command.
+
+    Returns (index of the sub-command in segment, values passed via `-c`, values
+    passed via `--config-env[= ]`). The index equals len(segment) when only
+    options follow. `--opt=value` forms are single self-contained tokens; an
+    unknown `-*` token before the sub-command is treated as an argless flag
+    (fail-open, see module docstring).
+    """
+    c_values: list[str] = []
+    env_values: list[str] = []
+    j = start
+    while j < len(segment):
+        tok = segment[j]
+        if tok in _TERMINATING_OPTS:
+            # git prints and exits: nothing after runs, and already-collected
+            # -c/--config-env values never take effect either
+            return len(segment), [], []
+        if tok in _GLOBAL_ARG_OPTS:
+            if j + 1 < len(segment):
+                if tok == "-c":
+                    c_values.append(segment[j + 1])
+                elif tok == "--config-env":
+                    env_values.append(segment[j + 1])
+            j += 2
+            continue
+        if tok.startswith("--config-env="):
+            env_values.append(tok.split("=", 1)[1])
+            j += 1
+            continue
+        if tok.startswith("-"):
+            j += 1
+            continue
+        break
+    # An arg-taking option at the very end can push j past len(segment); clamp so
+    # the documented "== len(segment) when only options follow" contract holds.
+    return min(j, len(segment)), c_values, env_values
+
+
+# Leading `VAR=val` environment assignments before `git` (`GIT_TRACE=1 git …`) don't
+# push git off the command — real git runs the sub-command with those vars set. Both
+# destructive and bypass detection skip them to reach the real `git` token (#294/#297).
+# `\+?=` also matches bash/zsh append form `VAR+=val git …` (verified: git still runs).
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+
+
+def _env_prefix_end(segment: list[str]) -> int:
+    """Index of the first token that is not a leading `VAR=val` env assignment."""
+    i = 0
+    while i < len(segment) and _ENV_ASSIGN.match(segment[i]):
+        i += 1
+    return i
+
+
 def is_destructive(segment: list[str]) -> bool:
     """True if a single command segment is a work-discarding git operation."""
     segment = strip_redirects(segment)
-    if len(segment) < 2:
+    i = _env_prefix_end(segment)
+    if i >= len(segment) or segment[i].rsplit("/", 1)[-1] != "git":
         return False
-    if segment[0].rsplit("/", 1)[-1] != "git":
+    j, _, _ = _skip_global_opts(segment, i + 1)
+    if j >= len(segment):
         return False
-    sub, rest = segment[1], segment[2:]
+    sub, rest = segment[j], segment[j + 1:]
 
     if sub == "reset":
         return "--hard" in rest
@@ -154,42 +231,39 @@ def is_destructive(segment: list[str]) -> bool:
 # history. shlex tokenization fixes the quoted-flag bypass that the old regex had
 # (`git commit '--no-verify'` → token `--no-verify`).
 _BYPASS_SUBS = {"commit", "push", "merge", "rebase", "cherry-pick"}
-_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_SKIP_ENV = re.compile(r"^JAINE_SKIP_(PUSH_GUARD|AUTO_REBUILD|AUTO_PUBLISH)=")
+_SKIP_ENV = re.compile(r"^JAINE_SKIP_(PUSH_GUARD|AUTO_REBUILD|AUTO_PUBLISH)\+?=")
+# Git config keys are case-insensitive (`-c CORE.HOOKSPATH=…` works), so both the
+# `-c` and `--config-env` bypass checks compare the key lowercased against this.
+_HOOKSPATH_KEY = "core.hookspath"
 
 
 def _hookspath_disabled(val: str) -> bool:
     """True if a `-c` value disables git hooks: core.hooksPath=<empty|/dev/null>."""
-    if not val.startswith("core.hooksPath="):
+    key, sep, v = val.partition("=")
+    if not sep or key.lower() != _HOOKSPATH_KEY:
         return False
-    v = val.split("=", 1)[1]
     return v == "" or v == "/dev/null" or v.endswith("/dev/null")
 
 
 def is_bypass(segment: list[str]) -> bool:
     """True if a segment disables git safety hooks or force-pushes over history."""
     segment = strip_redirects(segment)
-    i = 0
-    # Leading env assignments (VAR=val) before `git` — flag the JAINE_SKIP_* guards.
-    while i < len(segment) and _ENV_ASSIGN.match(segment[i]):
-        if _SKIP_ENV.match(segment[i]):
-            return True
-        i += 1
+    # Leading env assignments (VAR=val) before `git` — a JAINE_SKIP_* among them is
+    # itself the bypass signal; the rest are just skipped to reach the `git` token.
+    i = _env_prefix_end(segment)
+    if any(_SKIP_ENV.match(t) for t in segment[:i]):
+        return True
     if i >= len(segment) or segment[i].rsplit("/", 1)[-1] != "git":
         return False
-    # Global git options between `git` and the sub-command (e.g. -c core.hooksPath=…).
-    j = i + 1
-    while j < len(segment):
-        tok = segment[j]
-        if tok == "-c" and j + 1 < len(segment):
-            if _hookspath_disabled(segment[j + 1]):
-                return True
-            j += 2
-            continue
-        if tok.startswith("-"):
-            j += 1  # some other global option
-            continue
-        break
+    # Global git options between `git` and the sub-command. A `-c core.hooksPath=…`
+    # that disables hooks is itself the bypass, whatever follows it.
+    j, c_values, env_values = _skip_global_opts(segment, i + 1)
+    if any(_hookspath_disabled(v) for v in c_values):
+        return True
+    # --config-env pointing core.hooksPath at ANY env var swaps the hooks source;
+    # the variable's content is out of lexical reach, so the key alone is the signal.
+    if any(v.partition("=")[0].lower() == _HOOKSPATH_KEY for v in env_values):
+        return True
     if j >= len(segment):
         return False
     sub, rest = segment[j], segment[j + 1:]

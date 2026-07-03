@@ -57,12 +57,86 @@ CASES = [
     ("git push --force-with-lease", 2),
     ("git push -f", 2),
     ("JAINE_SKIP_PUSH_GUARD=1 git push", 2),     # skip-env before git
+    ("JAINE_SKIP_PUSH_GUARD+=1 git push", 2),    # skip-env in += append form (#297)
     # --- NEW: bypass-shaped but SAFE (allow) ---
     ("git push -n", 0),                          # push -n = --dry-run, NOT no-verify
     ("git merge -n origin/x", 0),                # merge -n = --no-stat, NOT no-verify
     ("grep -n no-verify file", 0),               # grep -n must not trigger
     ("git log -n 5", 0),                         # log -n = count
     ("echo 'git commit --no-verify'", 0),        # quoted mention only
+    # --- #294: global options before the sub-command must not hide it (block) ---
+    ("git -C /tmp/x reset --hard", 2),
+    ("git -C /tmp/x stash drop", 2),
+    ("git -C /tmp/x checkout -f", 2),
+    ("git -C /tmp/x restore file.py", 2),
+    ("git -c k=v -C p reset --hard", 2),         # mixed globals, each with its argument
+    ("git --git-dir=/p/.git reset --hard", 2),   # --opt=value form
+    ("git --git-dir /p/.git reset --hard", 2),   # --opt value form
+    ("git --work-tree=/p checkout -f", 2),
+    ("git --work-tree /p checkout -f", 2),
+    ("git --namespace ns reset --hard", 2),
+    ("git -C /a -C /b reset --hard", 2),         # same option twice
+    ("git --no-pager -C /p reset --hard", 2),    # argless flag mixed with -C
+    ("git -P -C /p clean -fd", 2),               # short argless flag mixed with -C
+    ("git -C /p commit --no-verify", 2),         # bypass class through -C
+    ("git -C /p push --force", 2),
+    ("git --git-dir=/p/.git push -f", 2),
+    ("git -C /p -c core.hooksPath=/dev/null commit -m x", 2),  # hooksPath still caught after -C
+    ("FOO=1 git -C /p push --force", 2),         # env prefix + global option
+    # --- #294: global options on SAFE commands must not false-positive (allow) ---
+    ("git -C /tmp/x status", 0),
+    ("git -C /tmp/x log --oneline", 0),
+    ("git -c user.name=x commit -m x", 0),       # plain -c value, not hooksPath
+    ("git -C /p stash", 0),                      # stash push is safe
+    ("git -C /p stash pop", 0),
+    ("git -C /p push -n", 0),                    # dry-run stays dry behind -C
+    ("git -C /p reset --soft HEAD~1", 0),
+    ("git -C /p checkout -b feat/x", 0),
+    ("git -C /p restore --staged file.py", 0),
+    # print-and-exit globals: real git prints and exits, the "sub-command" after
+    # them never runs (verified live: `git --html-path status` runs no status)
+    ("git --exec-path reset --hard", 0),
+    ("git --html-path reset --hard", 0),
+    ("git --man-path reset --hard", 0),
+    ("git --info-path reset --hard", 0),
+    ("git --version reset --hard", 0),
+    ("git -h reset --hard", 0),
+    ("git --help reset --hard", 0),
+    ("git -h commit --no-verify", 0),            # inert for the bypass class too
+    ("git -C reset --hard", 0),                  # -C consumes "reset" as its path; git errors, runs nothing
+    ("git -C /p -c", 0),                         # trailing option without argument — no crash, allow
+    # --- red-team round (codex): case-insensitive config keys + --config-env ---
+    ("git -c CORE.HOOKSPATH=/dev/null commit -m x", 2),   # git config keys are case-insensitive
+    ("git -c core.hookspath= commit -m x", 2),
+    ("git --config-env foo.bar=HP reset --hard", 2),      # separated form hides the sub-command; git RUNS reset
+    ("git --config-env=foo.bar=HP reset --hard", 2),      # = form, self-contained token
+    ("git --config-env core.hooksPath=HP commit -m x", 2),   # hooks source swapped to an env var
+    ("git --config-env=core.hooksPath=HP commit -m x", 2),
+    ("git --config-env foo.bar=HP status", 0),            # safe command behind config-env
+    ("git -c core.hooksPathX=/dev/null commit -m x", 0),  # different key must not match
+    # remaining arg-taking globals in git's SYNOPSIS — separate-token form must not hide the sub-command
+    ("git --attr-source HEAD reset --hard", 2),           # verified live: git consumes HEAD, runs reset
+    ("git --attr-source=HEAD reset --hard", 2),
+    ("git --super-prefix x/ reset --hard", 2),            # rejected by git 2.54, but block for cross-version safety
+    ("git --attr-source HEAD status", 0),                 # safe command behind attr-source
+    # terminating global AFTER -c: git prints and exits, the -c never takes effect
+    ("git -c core.hooksPath=/dev/null --help commit -m x", 0),
+    ("git -c core.hooksPath=/dev/null --version commit -m x", 0),
+    # --- #297: leading env-assignments must not hide a destructive sub-command ---
+    # (is_bypass already skipped them; is_destructive now matches — real git runs
+    #  the sub-command with those vars set, so the destruction happens for real)
+    ("GIT_TRACE=1 git reset --hard", 2),
+    ("GIT_TRACE=1 git clean -fd", 2),
+    ("GIT_TRACE=1 git stash drop", 2),
+    ("GIT_TRACE=1 git checkout -f", 2),
+    ("FOO=1 git -C /p clean -fd", 2),             # env prefix + global option together
+    ("FOO=1 BAR=2 git reset --hard", 2),          # multiple env assignments
+    ("FOO+=bar git reset --hard", 2),             # bash/zsh += append-assignment prefix (verified: git runs)
+    # --- #297: env-prefixed but SAFE — must stay allowed ---
+    ("NOTGIT=1 ls -la", 0),                       # env prefix in front of a non-git command
+    ("FOO=1 git status", 0),                      # env prefix, safe sub-command
+    ("VERSION=1 git commit -m x", 0),             # env prefix, non-destructive non-bypass
+    ("GIT_TRACE=1 git reset --soft HEAD~1", 0),   # env prefix, soft reset is safe
 ]
 
 
