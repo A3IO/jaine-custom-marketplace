@@ -18,62 +18,22 @@ Allowed (the agent's OWN, freshly-spawned processes — not the threat):
     a shell variable the agent set, or a job spec → the agent spawned it.
   * ``kill -0 <pid>`` — signal 0 is an existence check, sends no signal.
 
-Same shlex approach as guard-git-destructive-detect.py: a regex matches text, not
+Same shlex approach as guard-git-destructive-detect.py (the shared lexical
+front-end lives in git_lexer.py): a regex matches text, not
 grammar — it cannot tell a real ``kill`` from ``grep "kill 1234"`` or ``echo kill``.
 Fails OPEN (exit 0, allow) on any parse error: a false block that breaks a live
 session is worse than a missed exotic form (the threat is accidental harm).
 """
 import re
-import shlex
 import sys
 
-# Shell command-boundary punctuation (mirrors the git detector): default set + backtick,
-# so `foo;kill 1` and `kill `pgrep x`` split into separate command contexts.
-_PUNCT = "();<>|&" + "`"
-_SEP = {";", ";;", "&", "&&", "|", "||", "|&", "(", ")", "`", "\n"}
-_REDIR = re.compile(r"^(\d*[<>]|&>|>&)")
+from git_lexer import _command_prefix_end, split_segments, strip_redirects, tokenize
+
 # A literal PID/PGID target: a (possibly negative) integer. `-1` / `-<pgid>` target a whole
 # process group (e.g. `kill -9 -1` = signal everything) — also dangerous, not a signal flag.
 _NUMERIC_PID = re.compile(r"^-?\d+$")
 # pkill/killall flags that LIST/QUERY rather than kill — presence means "no kill happens".
 _INFO_FLAGS = {"-l", "--list", "-h", "--help", "-V", "--version"}
-
-
-def tokenize(command: str) -> "list[str] | None":
-    """Tokenize a shell command, respecting quotes and grouping operators (see the git
-    detector for the rationale). Returns a token list, or None if it cannot be parsed."""
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=_PUNCT)
-    lexer.whitespace_split = True
-    try:
-        return list(lexer)
-    except ValueError:
-        return None
-
-
-def split_segments(tokens: "list[str]") -> "list[list[str]]":
-    """Split a flat token list into per-command segments on separator tokens."""
-    segment: "list[str]" = []
-    segments: "list[list[str]]" = []
-    for token in tokens:
-        if token in _SEP:
-            if segment:
-                segments.append(segment)
-                segment = []
-        else:
-            segment.append(token)
-    if segment:
-        segments.append(segment)
-    return segments
-
-
-def strip_redirects(tokens: "list[str]") -> "list[str]":
-    """Drop a redirection operator and everything after it within a segment."""
-    kept: "list[str]" = []
-    for token in tokens:
-        if _REDIR.match(token):
-            break
-        kept.append(token)
-    return kept
 
 
 def _kill_has_literal_pid(args: "list[str]") -> bool:
@@ -118,10 +78,11 @@ def _pkill_kills(args: "list[str]") -> bool:
 def is_dangerous(segment: "list[str]") -> bool:
     """True if a single command segment is a risky process-kill."""
     segment = strip_redirects(segment)
-    if not segment:
+    i = _command_prefix_end(segment)
+    if i >= len(segment):
         return False
-    cmd = segment[0].rsplit("/", 1)[-1]
-    args = segment[1:]
+    cmd = segment[i].rsplit("/", 1)[-1]
+    args = segment[i + 1:]
     if cmd == "kill":
         # A lone "$" arg is the shlex residue of `kill $(...)` (the `(` splits the segment): a
         # command-substitution target — `kill $(pgrep agy)`, `kill $(cat pidfile)` — resolves at

@@ -137,6 +137,36 @@ CASES = [
     ("FOO=1 git status", 0),                      # env prefix, safe sub-command
     ("VERSION=1 git commit -m x", 0),             # env prefix, non-destructive non-bypass
     ("GIT_TRACE=1 git reset --soft HEAD~1", 0),   # env prefix, soft reset is safe
+    # --- #302: transparent wrapper prefixes reach the real git (block) ---
+    ("sudo git reset --hard", 2),                 # reviewer probe
+    ("command git reset --hard", 2),
+    ("nohup git clean -fd", 2),
+    ("nice -n 10 git checkout -- file.py", 2),    # arg-taking -n eats its numeric arg
+    ("sudo -u deploy git push --force origin main", 2),
+    ("command git commit --no-verify -m x", 2),   # bypass path through a wrapper
+    ("env JAINE_SKIP_PUSH_GUARD=1 git push", 2),  # skip-env as env's operand still sets it for git
+    ("sudo env VAR=1 git reset --hard", 2),       # nested wrappers
+    ("env -S git reset --hard", 2),               # red-team: spaced -S split-string runs git (macOS)
+    ("env - git reset --hard", 2),                # #299 red-team adjacent: bare dash = historic -i, git RUNS
+    ("xargs -I{} -S 999 git reset --hard", 2),    # red-team: BSD -S replsize must eat its arg
+    # --- #302: wrapper-prefixed but SAFE — must stay allowed ---
+    ("sudo git status", 0),
+    ("nice FOO=1 git reset --hard", 0),           # red-team: nice execs `FOO=1` → ENOENT, git never runs
+    ("command -pv git reset --hard", 0),          # red-team: clustered -v prints resolutions only
+    ("env --help git reset --hard", 0),           # codex-review: help/version terminate the wrapper
+    ("sudo -V git reset --hard", 0),              # version print — command never runs
+    ("sudo -l git reset --hard", 0),              # permission listing — command never runs
+    ("sudo --list git reset --hard", 0),          # long-form listing
+    ("sudo -v git reset --hard", 0),              # validate mode runs nothing
+    ("env -0 git reset --hard", 0),               # print-mode: "cannot specify command with -0"
+    ("env -u0 git reset --hard", 2),              # but glued -u0 unsets var `0` and RUNS git
+    ("sudo -e git reset --hard", 0),              # edit mode never runs a command
+    ("sudo -K git reset --hard", 0),              # -K may not be specified with a command
+    ("sudo -k git reset --hard", 2),              # but lowercase -k RUNS the command
+    ("command -v git", 0),                        # prints a path, executes nothing
+    ("command -v git reset --hard", 0),           # still only prints — inert
+    ("echo sudo git reset --hard", 0),            # mention behind echo, not a wrapper chain
+    ("xargs -0 grep git", 0),                     # wrapper, but the real command is not git
 ]
 
 

@@ -16,8 +16,9 @@ work loss, not a motivated adversary, so a false block that breaks a live
 session is worse than a missed exotic command.
 """
 import re
-import shlex
 import sys
+
+from git_lexer import tokenize, split_segments, strip_redirects, _has_force_flag, _skip_global_opts, _command_prefix_end
 
 # Source-file extensions: a positional arg to `git checkout` ending in one of
 # these is treated as a file being discarded, not a branch/tag name.
@@ -28,75 +29,6 @@ _DANGER_EXT = {
     "sql", "lua", "pl", "php", "vue",
 }
 
-# Shell command-boundary punctuation passed to shlex. The default set (`();<>|&`,
-# which includes `;`) PLUS backtick: a backtick command substitution `...` opens a new
-# command context just like $( ), so splitting on it surfaces a destructive git hidden
-# in `git clean -fd`. (Leading `VAR=val` env assignments before git ARE handled — see
-# _env_prefix_end, #297. Quoted substitutions like "$(...)" and true wrapper forms that
-# push git off the first token — `command`/`env`/`xargs` git … — stay OUT of scope: the
-# threat model is accidental work loss, not adversarial evasion.)
-_PUNCT = "();<>|&" + "`"
-
-# Tokens that separate one shell command from the next.
-_SEP = {";", ";;", "&", "&&", "|", "||", "|&", "(", ")", "`", "\n"}
-
-# A token that begins a redirection (everything after it is not a git argument).
-_REDIR = re.compile(r"^(\d*[<>]|&>|>&)")
-
-
-def tokenize(command: str) -> list[str] | None:
-    """Tokenize a shell command, respecting quotes and grouping operators.
-
-    punctuation_chars (_PUNCT) makes shlex emit `;`, `|`, `&`, `<`, `>`, `(`, `)`
-    and backtick as their own tokens even without surrounding whitespace (so
-    `foo;git ...` splits correctly), while posix quote handling keeps `"git reset"`
-    as one token. Returns a token list, or None if the command cannot be parsed.
-    """
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=_PUNCT)
-    lexer.whitespace_split = True
-    # Keep shlex's default '#' comment handling: a shell comment never executes, so a
-    # comment that merely MENTIONS a destructive command (e.g. `# see $(git reset --hard)`)
-    # must NOT trigger. (`# WHY:` is already stripped upstream by the .sh wrapper.)
-    try:
-        return list(lexer)
-    except ValueError:
-        return None
-
-
-def split_segments(tokens: list[str]) -> list[list[str]]:
-    """Split a flat token list into per-command segments on separator tokens."""
-    segment: list[str] = []
-    segments: list[list[str]] = []
-    for token in tokens:
-        if token in _SEP:
-            if segment:
-                segments.append(segment)
-                segment = []
-        else:
-            segment.append(token)
-    if segment:
-        segments.append(segment)
-    return segments
-
-
-def strip_redirects(tokens: list[str]) -> list[str]:
-    """Drop a redirection operator and everything after it within a segment."""
-    kept: list[str] = []
-    for token in tokens:
-        if _REDIR.match(token):
-            break
-        kept.append(token)
-    return kept
-
-
-def _has_force_flag(tokens: list[str]) -> bool:
-    """True if a short flag bundle carries -f, or --force is present."""
-    return any(
-        token == "--force"
-        or (token.startswith("-") and not token.startswith("--") and "f" in token)
-        for token in tokens
-    )
-
 
 def _looks_like_file(arg: str) -> bool:
     """True if a checkout arg looks like a source file (vs a branch/tag name)."""
@@ -106,84 +38,10 @@ def _looks_like_file(arg: str) -> bool:
     return base.rsplit(".", 1)[-1].lower() in _DANGER_EXT
 
 
-# Git global options that consume the FOLLOWING token as their argument when not
-# written as --opt=value (#294: `git -C /p reset --hard` must not hide `reset`).
-# The full arg-taking set from git's SYNOPSIS; `--super-prefix` is rejected by
-# current git but kept for cross-version safety (blocking an inert command is fine).
-_GLOBAL_ARG_OPTS = {
-    "-C", "-c", "--git-dir", "--work-tree", "--namespace",
-    "--config-env", "--attr-source", "--super-prefix",
-}
-
-# Globals that make real git print something and exit WITHOUT running any
-# sub-command that may follow (verified live: `git --html-path status` prints the
-# doc path and never runs status). Seeing one of these makes the segment inert.
-# Bare --exec-path is print-and-exit too; --exec-path=<p> falls through to the
-# generic argless branch and keeps the sub-command visible.
-_TERMINATING_OPTS = {
-    "--version", "-v", "--help", "-h",
-    "--html-path", "--man-path", "--info-path", "--exec-path",
-}
-
-
-def _skip_global_opts(segment: list[str], start: int) -> tuple[int, list[str], list[str]]:
-    """Skip git global options (with their arguments) up to the sub-command.
-
-    Returns (index of the sub-command in segment, values passed via `-c`, values
-    passed via `--config-env[= ]`). The index equals len(segment) when only
-    options follow. `--opt=value` forms are single self-contained tokens; an
-    unknown `-*` token before the sub-command is treated as an argless flag
-    (fail-open, see module docstring).
-    """
-    c_values: list[str] = []
-    env_values: list[str] = []
-    j = start
-    while j < len(segment):
-        tok = segment[j]
-        if tok in _TERMINATING_OPTS:
-            # git prints and exits: nothing after runs, and already-collected
-            # -c/--config-env values never take effect either
-            return len(segment), [], []
-        if tok in _GLOBAL_ARG_OPTS:
-            if j + 1 < len(segment):
-                if tok == "-c":
-                    c_values.append(segment[j + 1])
-                elif tok == "--config-env":
-                    env_values.append(segment[j + 1])
-            j += 2
-            continue
-        if tok.startswith("--config-env="):
-            env_values.append(tok.split("=", 1)[1])
-            j += 1
-            continue
-        if tok.startswith("-"):
-            j += 1
-            continue
-        break
-    # An arg-taking option at the very end can push j past len(segment); clamp so
-    # the documented "== len(segment) when only options follow" contract holds.
-    return min(j, len(segment)), c_values, env_values
-
-
-# Leading `VAR=val` environment assignments before `git` (`GIT_TRACE=1 git …`) don't
-# push git off the command — real git runs the sub-command with those vars set. Both
-# destructive and bypass detection skip them to reach the real `git` token (#294/#297).
-# `\+?=` also matches bash/zsh append form `VAR+=val git …` (verified: git still runs).
-_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
-
-
-def _env_prefix_end(segment: list[str]) -> int:
-    """Index of the first token that is not a leading `VAR=val` env assignment."""
-    i = 0
-    while i < len(segment) and _ENV_ASSIGN.match(segment[i]):
-        i += 1
-    return i
-
-
 def is_destructive(segment: list[str]) -> bool:
     """True if a single command segment is a work-discarding git operation."""
     segment = strip_redirects(segment)
-    i = _env_prefix_end(segment)
+    i = _command_prefix_end(segment)
     if i >= len(segment) or segment[i].rsplit("/", 1)[-1] != "git":
         return False
     j, _, _ = _skip_global_opts(segment, i + 1)
@@ -248,9 +106,10 @@ def _hookspath_disabled(val: str) -> bool:
 def is_bypass(segment: list[str]) -> bool:
     """True if a segment disables git safety hooks or force-pushes over history."""
     segment = strip_redirects(segment)
-    # Leading env assignments (VAR=val) before `git` — a JAINE_SKIP_* among them is
-    # itself the bypass signal; the rest are just skipped to reach the `git` token.
-    i = _env_prefix_end(segment)
+    # Leading env assignments and transparent wrappers before `git` — a JAINE_SKIP_*
+    # among them (bare or as an `env` operand, #302) is itself the bypass signal;
+    # the rest are just skipped to reach the `git` token.
+    i = _command_prefix_end(segment)
     if any(_SKIP_ENV.match(t) for t in segment[:i]):
         return True
     if i >= len(segment) or segment[i].rsplit("/", 1)[-1] != "git":

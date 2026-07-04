@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test the generic guard-dispatch.sh end-to-end (dispatch -> detector -> engine), driving
-# both detectors, with osascript/afplay stubbed so no real dialog pops. Confirms: a
+# all three detectors, with osascript/afplay stubbed so no real dialog pops. Confirms: a
 # detector HIT reaches the dialog (and the chosen button maps to the right exit code), a
 # MISS allows silently, and malformed/non-Bash input fails OPEN.
 #
@@ -27,6 +27,7 @@ run() {  # $1=desc $2=expected_exit $3=detector $4=json(stdin)
 
 KILLDET="guard-process-kill-detect.py"
 GITDET="guard-git-destructive-detect.py"
+BRANCHDET="guard-git-branch-delete-detect.py"
 
 # kill detector through the dispatcher
 set_button "Deny"
@@ -40,6 +41,12 @@ run "kill \$! (own) -> 0"            0 "$KILLDET" '{"tool_input":{"command":"kil
 set_button "Deny"
 run "git reset --hard + Deny -> 2"   2 "$GITDET" '{"tool_input":{"command":"git reset --hard"}}'
 run "git status -> 0, no dialog"     0 "$GITDET" '{"tool_input":{"command":"git status"}}'
+
+# branch-delete detector through the SAME dispatcher. Use the $VAR fail-closed path — it
+# reaches exit 2 with NO git subprocess, so the HIT is deterministic regardless of repo state.
+set_button "Deny"
+run "branch -D \$VAR (fail-closed) + Deny -> 2" 2 "$BRANCHDET" '{"tool_input":{"command":"git branch -D $X"}}'
+run "branch-delete: git status -> 0, no dialog"  0 "$BRANCHDET" '{"tool_input":{"command":"git status"}}'
 
 # fail-open paths
 run "empty stdin -> 0"               0 "$KILLDET" ''

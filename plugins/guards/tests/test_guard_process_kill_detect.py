@@ -59,7 +59,49 @@ CASES = [
     ("echo kill 1234", 0),
     ("echo 'pkill agy'", 0),
     ("git commit -m 'kill the flaky test 1234'", 0),
+    # --- #302: transparent wrapper prefixes reach the real kill -> block ---
+    ("sudo kill 1234", 2),
+    ("command kill 1234", 2),
+    ("sudo -u root pkill -f agy", 2),      # arg-taking -u eats its arg
+    ("nohup killall Chrome", 2),
+    ("VAR=1 kill 1234", 2),                # leading env assignment no longer hides kill
+    # --- #302: wrapper-prefixed but SAFE -> allow ---
+    ("sudo kill $!", 0),                   # own-process target stays allowed through the wrapper
+    ("echo sudo kill 1234", 0),            # mention behind echo, not a wrapper chain
+    ("xargs --version kill 1234", 0),      # help/version terminates the wrapper — kill never runs
+    ("sudo --help kill 1234", 0),
+    ("sudo -ll kill 1234", 0),             # clustered listing — kill never runs
+    ("sudo --validate kill 1234", 0),      # validate mode runs nothing
+    ("env -0 kill 1234", 0),               # env print-mode errors out — kill never runs
+    ("sudo -K kill 1234", 0),              # -K may not be specified with a command
+    ("sudo -k kill 1234", 2),              # but lowercase -k RUNS the command
 ]
+
+
+# #300 dedup contract: the kill detector must REUSE git_lexer's base trio (one lexer,
+# one place to fix), not carry byte-identical local copies. `is`-identity pins the
+# dedup against a future re-fork — a local redefinition breaks it immediately.
+_LEXER_TRIO = ("tokenize", "split_segments", "strip_redirects")
+
+
+def dedup_contract_failures() -> int:
+    import importlib.util
+
+    hooks = Path(__file__).parent.parent / "hooks"
+    sys.path.insert(0, str(hooks))
+    import git_lexer
+
+    spec = importlib.util.spec_from_file_location(
+        "kill_detect", hooks / "guard-process-kill-detect.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    failed = 0
+    for name in _LEXER_TRIO:
+        if getattr(mod, name) is not getattr(git_lexer, name):
+            failed += 1
+            print(f"FAIL: detector {name} is a local copy, not git_lexer.{name} (#300)")
+    return failed
 
 
 def main() -> int:
@@ -70,7 +112,8 @@ def main() -> int:
         if not ok:
             failed += 1
             print(f"FAIL: {cmd!r} -> exit {got}, expected {expected}")
-    total = len(CASES)
+    failed += dedup_contract_failures()
+    total = len(CASES) + len(_LEXER_TRIO)
     print(f"\n{total - failed}/{total} passed")
     return 1 if failed else 0
 

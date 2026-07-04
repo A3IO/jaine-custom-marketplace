@@ -1,5 +1,5 @@
 {
-  "description": "guards — interactive Allow/Deny/Объясни gate on destructive Bash ops (git work-loss/hook-bypass + risky process kills), plus a Stop/SubagentStop guard that recovers Opus-4.8 dropped (namespaceless) tool calls.",
+  "description": "guards — interactive Allow/Deny/Объясни gate on destructive Bash ops (git work-loss/hook-bypass/branch-delete + risky process kills), plus a Stop/SubagentStop guard that recovers Opus-4.8 dropped (namespaceless) tool calls.",
   "hooks": {
     "PreToolUse": [
       {
@@ -13,6 +13,11 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/guard-dispatch.sh guard-process-kill-detect.py '🛡 Убийство процесса'",
+            "timeout": 60
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/guard-dispatch.sh guard-git-branch-delete-detect.py '🛡 Удаление/перезапись НЕвлитой ветки'",
             "timeout": 60
           }
         ]
