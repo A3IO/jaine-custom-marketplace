@@ -117,6 +117,21 @@ failures):
 Max **3** fix-verify iterations per finding. The 4th failure → STOP and report
 honestly: what was tried, the last ASSERT_FAIL/CONSOLE_GATE_FAIL output, your
 hypothesis. Token-burn without progress is a bug, not persistence.
+
+When the breaker trips, also write one durable line (#322 A1 — a tripped breaker
+was previously invisible to log mining). Shell state does not persist between
+Bash calls — resolve the plugin dir IN the same call:
+
+```bash
+BULLDOZER_DIR=$( { [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT/lib" ] \
+  && printf '%s\n' "$CLAUDE_PLUGIN_ROOT"; } || ls -dt ~/.claude/plugins/cache/*/bulldozer/*/ 2>/dev/null | head -1 )
+python3 "$BULLDOZER_DIR/lib/bulldozer_log.py" \
+    "${BULLDOZER_DRIVE_LOG:-$HOME/.claude/hooks/bulldozer-drive.log}" \
+    circuit-breaker "port=<lane port>" "finding=<short label>" "iterations=3"
+```
+
+Substitute the CONCRETE lane port (`$PORT` from the setup call does not survive
+into a later Bash call — same non-persistent-shell reason as above).
 (The limit of 3 is now **empirically validated** by the SP4 calibration: across
 30 fix-verify runs the complete-cycle distribution was {1:10, 2:19, 3:1}, 0
 censored — one cell needed all 3 cycles and succeeded on the 3rd, so a floor of 2
@@ -197,6 +212,15 @@ CDP_PORT=$PORT CHROME_APP_NAME="Google Chrome for Testing" \
 #    The unique mktemp profile IS the ownership token: this pattern can only
 #    ever kill your own browser, so parallel subagents cannot interfere.
 pkill -f -- "$LANE_KILL_MATCH"
+# lane-stop ONLY after the port is confirmed free — a delivered SIGTERM is not a
+# terminated process (headless Chrome can serve CDP for seconds; #328 r8)
+for i in 1 2 3 4 5; do
+  curl -s -m1 "http://localhost:$PORT/json/version" >/dev/null 2>&1 || break; sleep 0.5
+done
+curl -s -m1 "http://localhost:$PORT/json/version" >/dev/null 2>&1 || \
+  python3 "$PLUGIN/lib/bulldozer_log.py" \
+    "${BULLDOZER_DRIVE_LOG:-$HOME/.claude/hooks/bulldozer-drive.log}" \
+    lane-stop "port=$PORT" "profile=$LANE_PROFILE"   # #322: lifecycle completes (start→stop)
 ```
 
 When a run must be graded externally (calibration, CI), wrap every command in
@@ -275,11 +299,40 @@ the flow:
 
 ```bash
 pkill -f -- "--user-data-dir=<profile>($|[[:space:]])"   # anchored — never by port substring
+BULLDOZER_DIR=$( { [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT/lib" ] \
+  && printf '%s\n' "$CLAUDE_PLUGIN_ROOT"; } || ls -dt ~/.claude/plugins/cache/*/bulldozer/*/ 2>/dev/null | head -1 )
+python3 "$BULLDOZER_DIR/lib/bulldozer_log.py" \
+    "${BULLDOZER_DRIVE_LOG:-$HOME/.claude/hooks/bulldozer-drive.log}" \
+    lane-stop "port=<lane port>" "profile=<profile>"   # #322: lane lifetime becomes computable (start→stop)
 ```
 
 Confirm the port is actually free before reusing the lane (headless Chrome can
 serve CDP for a few seconds after SIGTERM):
 `curl -s -m1 http://localhost:$PORT/json/version || echo free`.
+
+Write the `lane-stop` line ONLY after the port-free confirm succeeds — an
+unconditional stop event would report a still-running lane as cleaned (#328 r7).
+
+## Logging (#322 PR5)
+
+`/drive` has its own stable channel: `~/.claude/hooks/bulldozer-drive.log` (env
+override `BULLDOZER_DRIVE_LOG`; canonical grammar via `lib/bulldozer_log.py` —
+sanitized values, `session=`, 5MB rotation):
+
+- `event=drive-invoke` — start marker from the UserPromptSubmit hook.
+- `event=lane-start` / `event=lane-fail` — written by `launch.sh` for every
+  non-9333 lane LAUNCH ATTEMPT (port/profile/headless/automation/ephemeral/
+  insecure/pid; fail lines carry `reason=` — missing binary, DevToolsActivePort
+  timeout/garble, CDP silence, Chrome death). Pre-launch env-validation
+  rejections (malformed CDP_PORT/profile) exit without a line — caller bugs,
+  not lane events. The daily 9333 browser never logs here.
+- `event=cookie-seed` — every `cookie_seed.py` invocation, success AND failure
+  (`from_port`/`to_port`/`domains`/`cookies=N`/`ok=`/`reason=` — counts only,
+  never cookie names or values).
+- `event=circuit-breaker` — written per the Circuit-breaker section above.
+
+cdp.py traffic itself lands in `bulldozer-look.log` with `port=` on every line —
+`/drive` lane activity is separable from the daily browser by port.
 
 ## Assert patterns for modern frameworks (dogfood #172)
 

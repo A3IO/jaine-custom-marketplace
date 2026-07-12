@@ -3,7 +3,7 @@
 **Event:** `PreToolUse` (matcher `Workflow`)
 **Files:** `hooks/require-workflow-skill.py` (all logic) + `hooks/hooks.json` (registers it as `python3 ${CLAUDE_PLUGIN_ROOT}/hooks/require-workflow-skill.py` — marketplace-portable, no hardcoded paths, no `.sh` wrapper).
 **Type:** **ADVISORY by default** — injects the routing/throttle doctrine on every Workflow call. The **DENY is OPT-IN**: it fires only when `BULLDOZER_ENFORCE_WORKFLOW_ROUTING` is truthy (`1`/`true`/`yes`/`on`). So installing bulldozer never surprise-blocks a consumer's workflows — you enable enforcement deliberately (panel verdict 2026-06-14: an opinionated heuristic guardrail must not be imposed by default). When enforced, deny = PreToolUse JSON `permissionDecision: "deny"` (+ reason) fed to Claude, which re-authors with routing+throttle (no user prompt).
-**Log:** `~/.claude/hooks/require-workflow-skill.log` (one block per decision, incl. `enforce=0/1`; override via `WORKFLOW_HOOK_LOG`).
+**Log:** `~/.claude/hooks/require-workflow-skill.log` (one pipe-KV line per decision via `lib/bulldozer_log.py` — `{ts} | event=decision | session=… | decision=… | signals… | project=…`, incl. `enforce=0/1`; override via `WORKFLOW_HOOK_LOG`). Records before 2026-07-12 are the old `---`-separated YAML blocks (#322 C5 migration) — mining the historical epoch needs the dual parser.
 **Escape:** a real `// workflow-routing-ok` **comment** (not the token inside a string), or a **cheap** `CLAUDE_CODE_SUBAGENT_MODEL` pin (haiku/sonnet — NOT opus/fable, which pin everything expensive = the very burst we deny), bypasses the deny.
 
 ---
@@ -32,9 +32,9 @@ Routing cuts rate-limits ~3.5×; throttling (`mapThrottled`, which retries nulls
 3. **Strips `//` + `/* */` comments and string literals**, then computes signals on the remaining *code*: `fanout` (`parallel(`/`pipeline(` with optional space, or `Promise.all`), `model_count` (`model:` keys in code), `throttle` (`mapThrottled`/`chunk(`/`CLAUDE_FALLBACK_MODEL`). `escape` is matched **only in comment text**. Stripping is what makes `// model: haiku` or `"see workflow-routing-ok"` no longer flip a signal.
 4. **DENY** iff `fanout && model_count==0 && !throttle && !escape && no cheap CLAUDE_CODE_SUBAGENT_MODEL pin` — reason tells Claude to route per role **and** wrap the fan-out in `mapThrottled`; it does **not** embed the literal escape token (so re-authoring can't copy-paste the bypass).
 5. Otherwise **ALLOW** + a `systemMessage` carrying the doctrine summary (points at `skill:workflow-swarms`).
-6. Logs every decision with its signals, in the SAME process that emits it (so the log can never show `DENY` while `ALLOW` was emitted). Decisions: `DENY` / `ADVISORY` (the would-deny case when enforcement is OFF — same emit as ALLOW, logged distinctly) / `ALLOW` / `ALLOW_ENV` / `ALLOW_ESCAPE` / `ALLOW_NAMED` / `ALLOW_UNREADABLE` / `ALLOW_UNPARSED`.
+6. Logs every decision with its signals, in the SAME process that emits it (so the log can never show `DENY` while `ALLOW` was emitted). Decisions: `DENY` / `ADVISORY` (the would-deny case when enforcement is OFF — same emit as ALLOW, logged distinctly) / `ALLOW` / `ALLOW_ENV` / `ALLOW_ESCAPE` / `ALLOW_NAMED` / `ALLOW_UNREADABLE` / `ALLOW_UNPARSED` / `ALLOW_PARSE_ERROR` (unparseable stdin) / `SKIP_NOT_WORKFLOW` (dead under the `Workflow` matcher — a line here means a misrouted registration).
 
-**Fail-open:** a JSON parse error, a non-Workflow tool, an unreadable `scriptPath`, or a malformed `tool_input` → ALLOW. A hook bug must never block a workflow — but each fail-open path logs a **distinct** decision so the log never shows a false `safe`.
+**Fail-open:** a JSON parse error, a non-Workflow tool, an unreadable `scriptPath`, or a malformed `tool_input` → ALLOW. A hook bug must never block a workflow — but each fail-open path logs a **distinct** decision so the log never shows a false `safe` (#322 D4 closed the last two unlogged paths: parse-error and non-Workflow).
 
 ## Scope — what is and isn't denied
 

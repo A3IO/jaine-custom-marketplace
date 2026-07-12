@@ -840,14 +840,16 @@ class LegResult:
     display: str
     output: str | None
     reason: str | None
+    elapsed_s: float | None = None  # per-leg wall time (#322 PR3)
 
     @classmethod
-    def ok(cls, display: str, output: str) -> "LegResult":
-        return cls(display, output, None)
+    def ok(cls, display: str, output: str, elapsed_s: "float | None" = None) -> "LegResult":
+        return cls(display, output, None, elapsed_s)
 
     @classmethod
-    def failed(cls, display: str, reason: str | None) -> "LegResult":
-        return cls(display, None, reason or "unknown")
+    def failed(cls, display: str, reason: str | None,
+               elapsed_s: "float | None" = None) -> "LegResult":
+        return cls(display, None, reason or "unknown", elapsed_s)
 
 
 def _run_one(
@@ -859,6 +861,10 @@ def _run_one(
     Command, env, and parser all come from the model's ``_MODEL_SPECS`` row — no
     per-model branch."""
     spec = _MODEL_SPECS[name]
+    t_leg = time.perf_counter()
+
+    def _t() -> float:  # per-leg wall time for the completion line (#322 PR3)
+        return round(time.perf_counter() - t_leg, 1)
     try:
         if spec.readonly_hook:
             # read-only leg (agy): run in a temp cwd seeded with a fail-closed PreToolUse
@@ -897,12 +903,12 @@ def _run_one(
     except Exception as e:
         # command-build (prepare) / spawn error → per-model failure, never crash the
         # whole panel (dogfood R2 finding)
-        return LegResult.failed(spec.display, f"setup error: {e}")
+        return LegResult.failed(spec.display, f"setup error: {e}", _t())
     if not result.ok:
-        return LegResult.failed(spec.display, result.reason)
+        return LegResult.failed(spec.display, result.reason, _t())
     output = spec.parser(result.output or "")
     if output:
-        return LegResult.ok(spec.display, output)
+        return LegResult.ok(spec.display, output, _t())
     # failure: distinguish a present-but-empty field ("") from unparseable (None).
     # Only grok's JSON parser can yield "" (empty text field); agy/codex plain-text
     # parsers map empty → None. The reason stays model-neutral.
@@ -911,7 +917,7 @@ def _run_one(
     else:  # output is None
         snippet = _sanitize(result.output)[:200]
         reason = f"unparseable output: {snippet}" if snippet else "empty output"
-    return LegResult.failed(spec.display, reason)
+    return LegResult.failed(spec.display, reason, _t())
 
 
 def _run_summarizer(
@@ -1020,6 +1026,7 @@ CONSULT_LOG = Path(
     os.environ.get("BULLDOZER_CONSULT_LOG")
     or Path.home() / ".claude" / "hooks" / "bulldozer-consult.log"
 )
+_LOG_WARNED = False  # once-per-process write-failure warning (#326 r3)
 
 
 def _project_root() -> str:
@@ -1049,30 +1056,67 @@ def _verdict_label(ok: bool, verdict_mode: bool, survivors: list[tuple[str, str]
     return "find-holes"
 
 
+def _reason_class(reason: str) -> str:
+    """Compact failure class for the log: text up to the first ':', token-normalized
+    (metadata-only — never the full reason text, matching the privacy property)."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", (reason or "unknown").split(":")[0].strip())[:24]
+
+
 def _log_completion(
     t0: float, selected: list[str], web_set: set[str],
     verdict_mode: bool, survivors: list[tuple[str, str]], ok: bool,
+    legs: "list[LegResult] | None" = None,
 ) -> None:
     """Append ONE completion line to CONSULT_LOG. Best-effort: a logging failure NEVER blocks
-    the panel. Panel-shape (``models=``/``web=``) — distinct from the inline single-codex
-    line (``model=``); a reader keys on the field names. tokens=NA (the panel does not yet
-    capture per-model token usage)."""
+    the panel (one stderr warning — the _write_web_bundle pattern, D3). Panel-shape
+    (``models=``/``web=``) — distinct from the inline single-codex line (``model=``); a reader
+    keys on the field names. tokens=NA (the panel does not yet capture per-model token usage).
+
+    #322 PR3: ``legs`` adds per-leg outcomes — survivors=N/M (a systemically broken leg was
+    invisible: models= lists the REQUEST, verdict stays find-holes while a leg dies every
+    call), failures=Display:reason_class, legtimes=Display:sec, and the resolved model ids
+    (agy_model= from _AGY_MODEL; codex_effort= — the silent build_codex_cmd default)."""
     try:
         elapsed = time.perf_counter() - t0
-        session = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "")[:8] or "NA"
+        raw_sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+        # token-normalize BEFORE slicing — an adversarial env value must not split
+        # the pipe grammar (same rule as lib/bulldozer_log.py)
+        session = re.sub(r"[^A-Za-z0-9_-]", "_", raw_sid)[:8] or "NA"
         web = ",".join(m for m in selected if m in web_set)
         line = (
             f"{datetime.now().astimezone().isoformat(timespec='seconds')}"
             f" | session={session} | round=1"
             f" | verdict={_verdict_label(ok, verdict_mode, survivors)}"
             f" | tokens=NA | time={elapsed:.1f}s | models={','.join(selected)}"
-            f" | web={web} | project={_project_root()}"
+            f" | web={web}"
         )
+        if legs is not None:
+            fails = [l for l in legs if l.output is None]
+            line += (
+                f" | survivors={len(legs) - len(fails)}/{len(legs)}"
+                f" | failures={','.join(f'{l.display}:{_reason_class(l.reason)}' for l in fails)}"
+                f" | legtimes={','.join(f'{l.display}:{l.elapsed_s}' for l in legs if l.elapsed_s is not None)}"
+            )
+        if "agy" in selected:
+            line += f" | agy_model={re.sub(r'[^A-Za-z0-9._()-]', '_', _AGY_MODEL)}"
+        if "codex" in selected:
+            line += " | codex_effort=medium"  # build_codex_cmd's default — not threaded through
+        line += f" | project={_project_root()}"
         CONSULT_LOG.parent.mkdir(parents=True, exist_ok=True)
         with CONSULT_LOG.open("a") as f:
             f.write(line + "\n")
-    except Exception:
-        pass  # observability, never a blocker
+    except Exception as e:
+        # observability, never a blocker — but surface it once instead of forever-silently.
+        # The warning itself is best-effort too: a closed stderr (detached process) must
+        # not abort an otherwise successful panel (codex review #326 r2, mirrors PR1),
+        # and it fires once per process (#326 r3 — same contract as lib/bulldozer_log.py).
+        global _LOG_WARNED
+        if not _LOG_WARNED:
+            _LOG_WARNED = True
+            try:
+                print(f"warning: could not write consult log: {e}", file=sys.stderr)
+            except Exception:
+                pass
 
 
 def run_panel(
@@ -1118,7 +1162,7 @@ def run_panel(
     ]
     ok = len(survivors) > 0
     if verdict_mode:
-        _log_completion(t0, selected, webset, verdict_mode, survivors, ok)
+        _log_completion(t0, selected, webset, verdict_mode, survivors, ok, legs=results)
         return _render_verdict(survivors, failures), ok
     raw_by_display: dict[str, str] = {}
     web_displays: set[str] = set()
@@ -1135,7 +1179,7 @@ def run_panel(
         ]
     strategy = decide_merge(survivors)
     if strategy == "error":
-        _log_completion(t0, selected, webset, verdict_mode, survivors, ok)
+        _log_completion(t0, selected, webset, verdict_mode, survivors, ok, legs=results)
         return _render_error(failures), ok
     merged = _run_summarizer(survivors, timeout, runner) if strategy == "summarize" else None
     merge_failed = strategy == "summarize" and merged is None
@@ -1145,7 +1189,7 @@ def run_panel(
         ts = time.strftime("%Y%m%d-%H%M%S")
         bundle = _write_web_bundle(BUNDLE_BASE, ts, output, raw_by_display, web_displays)
         output = f"{output}\n\n_Raw research bundle: {bundle}/_"
-    _log_completion(t0, selected, webset, verdict_mode, survivors, ok)
+    _log_completion(t0, selected, webset, verdict_mode, survivors, ok, legs=results)
     return output, ok
 
 
@@ -1176,26 +1220,36 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None, runner: Runner = run_model) -> int:
     parser = _build_parser()
-    args = parser.parse_args(argv)
-    selected = [m for m in ("codex", "grok", "agy") if getattr(args, m)]
-    if not selected:
-        selected = ["codex", "grok", "agy"]   # --panel or no model flag → all three
-    if args.web is None:
-        web_models: set[str] = set()
-    elif args.web == "__ALL__":
-        web_models = set(selected)
-    else:
-        req = [s.strip() for s in args.web.split(",") if s.strip()]
-        bad = [r for r in req if r not in ("codex", "grok", "agy")]
-        if bad:
-            parser.error(f"--web: unknown model(s): {', '.join(bad)}")
-        not_sel = [r for r in req if r not in selected]
-        if not_sel:
-            parser.error(f"--web names non-selected model(s): {', '.join(not_sel)}")
-        web_models = set(req)
+    try:
+        args = parser.parse_args(argv)
+        selected = [m for m in ("codex", "grok", "agy") if getattr(args, m)]
+        if not selected:
+            selected = ["codex", "grok", "agy"]   # --panel or no model flag → all three
+        if args.web is None:
+            web_models: set[str] = set()
+        elif args.web == "__ALL__":
+            web_models = set(selected)
+        else:
+            req = [s.strip() for s in args.web.split(",") if s.strip()]
+            bad = [r for r in req if r not in ("codex", "grok", "agy")]
+            if bad:
+                parser.error(f"--web: unknown model(s): {', '.join(bad)}")
+            not_sel = [r for r in req if r not in selected]
+            if not_sel:
+                parser.error(f"--web names non-selected model(s): {', '.join(not_sel)}")
+            web_models = set(req)
+    except SystemExit as e:
+        # CLI validation failure (argparse OR the --web checks above, which exit via
+        # parser.error): still leave a schema-complete ERROR record so the start marker
+        # is not the only trace (#326 r4). Selected models may be unknown at this point.
+        # -h/--help exits SystemExit(0) — a SUCCESSFUL exit, not failure telemetry (r5).
+        if e.code not in (0, None):
+            _log_completion(time.perf_counter(), [], set(), False, [], False, legs=[])
+        raise
     # --web research runs long (subagent swarms ~3 min); raise the default unless the caller
     # set --timeout explicitly. Non-web default stays 180.
     timeout = args.timeout if args.timeout is not None else (600 if web_models else 180)
+    t0 = time.perf_counter()
     try:
         output, ok = run_panel(
             args.question, models=selected, web_models=web_models,
@@ -1204,9 +1258,15 @@ def main(argv: list[str] | None = None, runner: Runner = run_model) -> int:
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
+        # #322 PR3 (A7): an exception before run_panel's own logging left NO line at all.
+        # legs=[] (not None) → survivors=0/0 with empty failures/legtimes — the record
+        # keeps the full panel schema so miners can tell a zero-leg validation failure
+        # from an older/malformed line (#326 r3).
+        _log_completion(t0, selected, web_models, args.verdict, [], False, legs=[])
         return 2
     except Exception as e:  # top-level guard — never leak a raw traceback (R2)
         print(f"panel error: {e}", file=sys.stderr)
+        _log_completion(t0, selected, web_models, args.verdict, [], False, legs=[])
         return 2
     print(output)
     return 0 if ok else 1

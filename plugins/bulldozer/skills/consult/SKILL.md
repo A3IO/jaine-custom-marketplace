@@ -1,6 +1,6 @@
 ---
 name: consult
-description: "Lightweight conversational design consultation via external AI reviewer(s) — for abstract design questions, architectural tradeoffs, and 'should I X or Y?' decisions before any artifact exists. Single-codex by default; add --panel for a 3-model (codex+grok+agy) parallel find-holes panel, or --panel --repo for informed multi-model review of a real codebase. Pick a single model (--codex/--grok/--agy), or add --web for opt-in deep web research (live community practice). Triggers on 'help me choose between', 'compare options', 'search the web', 'talk through this architecture', 'what tradeoffs am I missing', 'what am I overlooking', 'find the holes', 'sanity check', 'ask all three models', 'Помоги выбрать', 'обсудим архитектурное решение', 'какие тут компромиссы', 'спроси codex', 'спроси все три модели'. Do NOT use single-consult to review a file/diff on disk as the target — use bulldozer:check, or --panel --repo for a multi-model read of real code (a question that merely names a file as context is fine)."
+description: "Lightweight conversational design consultation via external AI reviewer(s) — for abstract design questions, architectural tradeoffs, and 'should I X or Y?' decisions before any artifact exists. Single-codex by default; add --panel for a 3-model (codex+grok+agy) parallel find-holes panel, or --panel --repo for informed multi-model review of a real codebase. Pick a single model (--codex/--grok/--agy), or add --web to ground the critique in live web research. Triggers on 'help me choose between', 'compare options', 'talk through this architecture', 'what tradeoffs am I missing', 'what am I overlooking', 'find the holes', 'sanity check', 'ask all three models', 'Помоги выбрать', 'обсудим архитектурное решение', 'какие тут компромиссы', 'спроси codex', 'спроси все три модели'. Do NOT use for literature/paper search or raw data gathering — every mode critiques or judges, never runs a search. Do NOT use single-consult to review a file/diff on disk — use bulldozer:check, or --panel --repo for real code."
 argument-hint: "[design question] — or: [--codex|--grok|--agy|--panel] [--web[=models]] [--repo PATH] [--verdict] <question>"
 allowed-tools: ["Bash", "Read", "AskUserQuestion"]
 ---
@@ -32,7 +32,7 @@ Same flow as `/bulldozer:check`. Read saved preference from `.bulldozer/config.m
 **Selection rules** (in order):
 1. ALWAYS include current global model from `~/.codex/config.toml`
 2. ALWAYS include last used model from `.bulldozer/config.md`
-3. Fill remaining slots from: gpt-5.5, gpt-5.3-codex-spark, gpt-5.4-mini
+3. Fill remaining slots from: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna
 4. Mark saved choice as "(Recommended)"
 
 Save choice → use as `-m <model>` argument to codex.
@@ -88,9 +88,9 @@ The `SKIP SKILLS.` prefix is prompt-level suppression (weak on its own — codex
 ```bash
 TMPDIR_RUN="/tmp/bulldozer-consult-$$"
 mkdir -p "$TMPDIR_RUN"
-SESSION="${CLAUDE_CODE_SESSION_ID:0:8}"
 OUT="$TMPDIR_RUN/verdict-r${ROUND}.txt"
 
+START=$(python3 -c 'import time; print(time.time())')   # feeds ELAPSED for the Step 6 log line (#322 D5)
 (
   cd "$TMPDIR_RUN"
   timeout 180s codex exec \
@@ -105,6 +105,7 @@ OUT="$TMPDIR_RUN/verdict-r${ROUND}.txt"
     < /dev/null > "$OUT" 2>"$OUT.err"
 )
 EXIT_CODE=$?
+ELAPSED=$(python3 -c "import time; print(f'{time.time() - $START:.1f}')")   # tenths — matches the time=<X.X>s grammar
 ```
 
 **Every flag is load-bearing** (validated empirically — see "Why this isolation" below):
@@ -125,8 +126,8 @@ EXIT_CODE=$?
 
 **Check exit code:**
 - `0` → proceed to Step 5
-- `124` → timeout hit; tell user "codex exceeded 180s, try a shorter prompt or lower reasoning effort"
-- Other non-zero → read last 20 lines of `$OUT`, report to user, do NOT silently retry
+- `124` → timeout hit; **first write the Step 6 log line with `verdict=TIMEOUT`** (a failed invocation must not vanish from the log — the panel path logs `verdict=ERROR` on total failure, this flow previously logged only successes, #322 A6), then tell user "codex exceeded 180s, try a shorter prompt or lower reasoning effort"
+- Other non-zero → **first write the Step 6 log line with `verdict=ERROR`**, then read last 20 lines of `$OUT`, report to user, do NOT silently retry
 
 ## Step 5: Parse the Verdict (Fail-Closed)
 
@@ -213,6 +214,8 @@ Opt-in: run **three models** (codex + grok + agy) in parallel instead of one cod
 - "What am I overlooking / what are the holes here?" — find-holes diversity (~50% of findings are unique to one model; verdict diversity is ≈0, so don't use panel just for a GO/NO-GO).
 - A high-stakes design call where one reviewer's blind spot is costly. Cost: 4 model calls, ~17–60s typical. Worst case approaches **2×`--timeout`** (default 180s): the summarizer runs serially *after* the parallel triad, so a slow-but-not-failed model plus a slow merge stack up.
 
+**NOT a research runner (#260):** every consult path — single and panel, with or without `--web` — wraps the question in **critique (find-holes) or verdict** framing; the models are told to list holes or judge, never to execute a task. A "find/list papers on X" or "search Y and return results" request gets its *query critiqued* (the literal max-8-points holes list) instead of results — the template working as designed, not a broken leg (verified live 2026-07-12: agy leg, zero tool calls, prompt critique only). `--web` grounds a critique/verdict in live sources; it does not turn consult into a search tool. Route literature/data-gathering requests to your own research tools (WebSearch/WebFetch), not consult.
+
 **Invocation:**
 
 ```bash
@@ -237,6 +240,8 @@ python3 "$PANEL" [--repo <path>] --verdict "<question>"
 
 # --web: opt-in DEEP web research (web search + subagents). ALWAYS use the =form so it
 # can't eat the question; blanket = all selected, scoped = a comma-list.
+# ⚠ ALWAYS launch --web via Bash run_in_background: true — total wall-clock routinely
+# hits 600–660 s, past the 10-min foreground Bash cap (see "Web lane", #313).
 python3 "$PANEL" --grok --web=grok "<question>"          # web on grok only
 python3 "$PANEL" --panel --web=codex,grok "<question>"   # web on codex+grok; agy isolated
 ```
@@ -257,9 +262,13 @@ Output: a merged `## SHARED` / `## UNIQUE` synthesis (find-holes) or a per-model
 
 **READ-side only, by design.** `--web` enables web fetch/search + subagents (reading), NEVER write/shell. So `--web --repo` lets a model read your real code AND reach the web — it **reverses the #189 no-egress guarantee** (opt-in, like `--repo`: code/design can egress to the web), but it can NOT mutate the repo. Default (no `--web`) stays fully isolated / no-egress.
 
-**Output & persistence:** each web model's raw research (large, sometimes garbled by parallel subagents) is pre-compressed to a findings+URL digest before the merge (inline shows the digest); the full raw is saved to `.bulldozer/consult-<ts>/` (self-ignoring `.gitignore`; `research.md` + `raw-<model>.md`; keep-last-10) for drill-down. The default `--timeout` rises to 600 s under `--web` (research runs ~3 min).
+**Output & persistence:** each web model's raw research (large, sometimes garbled by parallel subagents) is pre-compressed to a findings+URL digest before the merge (inline shows the digest); the full raw is saved to `.bulldozer/consult-<ts>/` (self-ignoring `.gitignore`; `research.md` + `raw-<model>.md`; keep-last-10) for drill-down. The default `--timeout` rises to 600 s under `--web`.
+
+**Run `--web` panels in the BACKGROUND (#313).** The research-compressor runs **serially per web survivor**, then the summarizer — all **after** the parallel triad: total = slowest web leg + N×compress (one per web survivor) + merge, every stage bounded by `--timeout` (so the 3-web-survivor worst case approaches 5×600 s = 50 min; typical runs land in the 600–660 s band, 12 runs ≥ 500 s in the completion log). Claude Code's foreground Bash cap is a hard 10-min SIGKILL — a foreground `--web` panel dies at exactly 600 s with the work nearly done. Invoke the panel with `run_in_background: true` on the Bash tool and read the output when the task completes — the background path has no cap (455 s run verified). Non-web panels (~17–60 s typical) stay foreground.
 
 ## Logging
+
+**Channel split (#322 F1):** every consult codex leg — inline Step 4 and the panel's `--codex` — is a raw `codex exec` subprocess, entirely OUTSIDE the plugin's own MCP bridge (`mcp/codex_server.py`). The bridge's `TURN_OK`/`TURN_ERROR`/`APPROVAL` auditing in `bulldozer-codex.log` therefore never sees consult traffic: a codex capacity error during a consult surfaces ONLY here, as `verdict=TIMEOUT|ERROR` (or a panel `failures=codex:…` field). Accepted split — consult's value is process isolation from an empty tmpdir, which the session-singleton bridge cannot provide.
 
 Two kinds of line land in `~/.claude/hooks/bulldozer-consult.log`, told apart by their fields:
 
@@ -277,19 +286,21 @@ Two kinds of line land in `~/.claude/hooks/bulldozer-consult.log`, told apart by
 
 ```
 <ISO8601-ts> | session=<S> | round=<N> | verdict=<V> | tokens=<T> | time=<X>s | model=<M> | project=<P>
-2026-05-25T03:15:00+03:00 | session=f7186873 | round=1 | verdict=GO | tokens=4500 | time=4.3s | model=gpt-5.5 | project=/path/to/repo
+2026-05-25T03:15:00+03:00 | session=f7186873 | round=1 | verdict=GO | tokens=NA | time=4.3s | model=gpt-5.6-sol | project=/path/to/repo
 ```
+
+(`tokens=` is honestly **NA today** — no extraction mechanism exists since the codex banner-parsing hack was dropped; matching the panel path. `verdict=` may also be `TIMEOUT`/`ERROR` from the Step 4 failure branches, #322 A6.)
 
 **Panel / per-model / `--web`** — `models=` (comma list) + `web=`, written by the script:
 
 ```
-<ISO8601-ts> | session=<S> | round=1 | verdict=<V> | tokens=NA | time=<X>s | models=<m,…> | web=<m,…> | project=<P>
-2026-06-22T00:30:08+07:00 | session=NA | round=1 | verdict=find-holes | tokens=NA | time=12.4s | models=codex,grok | web=codex | project=/path/to/repo
+<ISO8601-ts> | session=<S> | round=1 | verdict=<V> | tokens=NA | time=<X>s | models=<m,…> | web=<m,…> | survivors=<N/M> | failures=<Display:class,…> | legtimes=<Display:sec,…> | agy_model=<id> | codex_effort=<e> | project=<P>
+2026-07-11T12:10:00+07:00 | session=6b48be89 | round=1 | verdict=find-holes | tokens=NA | time=54.8s | models=codex,grok,agy | web= | survivors=2/3 | failures=Grok:timeout | legtimes=GPT:31.2,Grok:180.0,Gemini:44.9 | agy_model=Gemini_3.1_Pro_(High) | codex_effort=medium | project=/path/to/repo
 ```
 
 | Field | Value — and the ONLY accepted "no data" form |
 |-------|---------|
-| `session` | `${CLAUDE_CODE_SESSION_ID:0:8}`; `NA` if unset — **never the project name** |
+| `session` | `CLAUDE_CODE_SESSION_ID` token-normalized (`tr -c 'A-Za-z0-9_-' '_'`) then first 8 chars; `NA` if unset — **never the project name** |
 | `round` | integer ≥ 1 (panel is single-shot → always `1`) |
 | `verdict` | inline: `GO` / `NO-GO` / `MINOR-FIXES` / `INCONCLUSIVE`. Panel: `find-holes` (no GO/NO-GO) · the collapsed per-model verdict or `mixed` (disagreement) in `--verdict` mode · `ERROR` (all models failed). **Never `TBD` or empty.** |
 | `tokens` | inline: integer, `NA` if codex didn't report it. Panel: always `NA` (no per-model token capture yet). **One sentinel, not `N/A`/`na`/`-`/`~`/``/`0`.** |
@@ -344,6 +355,7 @@ WRAPPED_PROMPT=$(printf 'SKIP SKILLS. Do not inspect files or run tools. Text-on
 # 4. Isolated invocation
 TMPDIR_RUN="/tmp/bulldozer-consult-$$"
 mkdir -p "$TMPDIR_RUN"
+START=$(python3 -c 'import time; print(time.time())')
 (
   cd "$TMPDIR_RUN"
   timeout 180s codex exec \
@@ -358,6 +370,20 @@ mkdir -p "$TMPDIR_RUN"
     < /dev/null > verdict.txt 2>verdict.err   # split streams: stderr noise out of the verdict file
 )
 EXIT=$?
+ELAPSED=$(python3 -c "import time; print(f'{time.time() - $START:.1f}')")   # tenths — the time=<X.X>s grammar
+
+# 4b. Failure branch BEFORE parsing (#322 A6): a timeout/error must not be
+# misclassified by the verdict parser — log it and stop.
+if [ "$EXIT" -ne 0 ]; then
+    [ "$EXIT" -eq 124 ] && VERDICT=TIMEOUT || VERDICT=ERROR
+    # token-normalize BEFORE slicing — an adversarial env value must not split the
+    # pipe grammar (same rule as the panel path, #326 r4)
+    S=$(printf '%s' "${CLAUDE_CODE_SESSION_ID:-}" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_' | cut -c1-8)
+    S="${S:-NA}"
+    echo "$(date -Iseconds) | session=$S | round=$ROUND | verdict=$VERDICT | tokens=NA | time=${ELAPSED}s | model=$MODEL | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)" >> ~/.claude/hooks/bulldozer-consult.log
+    tail -20 "$TMPDIR_RUN/verdict.err"   # report the failure to the user; do NOT silently retry
+    rm -rf "$TMPDIR_RUN"; exit "$EXIT"
+fi
 
 # 5. Parse verdict (fail-closed) — §3.7 classifier, not sed/loose-regex
 #    (self-resolves the scripts dir — $CLAUDE_PLUGIN_ROOT is NOT in the Bash env, #221)
@@ -378,7 +404,8 @@ PY
 )
 
 # 6. Log metadata, cleanup
-S="${CLAUDE_CODE_SESSION_ID:0:8}"; S="${S:-NA}"   # session id, never the project name (#107 schema)
+S=$(printf '%s' "${CLAUDE_CODE_SESSION_ID:-}" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_' | cut -c1-8)
+S="${S:-NA}"   # session id (token-normalized), never the project name (#107 schema)
 T="${TOKENS:-NA}"; [ "$T" = "0" ] && T="NA"        # 0 is the no-data stub the schema forbids, not a count (#107)
 echo "$(date -Iseconds) | session=$S | round=$ROUND | verdict=$VERDICT | tokens=$T | time=${ELAPSED}s | model=$MODEL | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)" >> ~/.claude/hooks/bulldozer-consult.log
 rm -rf "$TMPDIR_RUN"

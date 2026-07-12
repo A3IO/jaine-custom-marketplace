@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -80,7 +81,40 @@ def browser_ws_url(port):
         return None
 
 
+DRIVE_LOG_DEFAULT = os.path.join(os.path.expanduser("~"), ".claude", "hooks",
+                                 "bulldozer-drive.log")
+
+
+def _audit(event_kv):
+    """#322 A2: a security-sensitive cross-lane cookie transfer previously left ZERO
+    durable trace. Counts/ports/domains only — never cookie names or values (the
+    script's own privacy discipline). Best-effort via the canonical writer."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
+        from bulldozer_log import append_line
+        append_line(os.environ.get("BULLDOZER_DRIVE_LOG") or DRIVE_LOG_DEFAULT,
+                    "cookie-seed", **event_kv)
+    except Exception:
+        pass
+
+
 def main(argv=None):
+    try:
+        rc, kv = _main_inner(argv)
+    except BaseException as e:
+        # an unexpected exception must not bypass the audit trail (#328 r5) —
+        # record the failure, then re-raise (traceback behavior unchanged;
+        # KeyboardInterrupt included). Skip when _main_inner already wrote the
+        # context-rich record (#328 r7 sentinel).
+        if not getattr(e, "_bdz_audited", False):
+            _audit({"ok": "no", "reason": "unhandled exception: {}".format(type(e).__name__)})
+        raise
+    if kv is not None:
+        _audit(kv)
+    return rc
+
+
+def _main_inner(argv=None):
     p = argparse.ArgumentParser(description="Seed selected domains' cookies "
                                 "from the daily browser into a /drive lane.")
     p.add_argument("--domains", required=True,
@@ -90,12 +124,24 @@ def main(argv=None):
     p.add_argument("--dry-run", action="store_true")
     try:
         args = p.parse_args(argv)
-    except SystemExit:
-        return 2
+    except SystemExit as e:
+        # -h/--help exits SystemExit(0) — a SUCCESSFUL exit, not a seed attempt:
+        # no audit line, standard exit code preserved (#328 r8). A genuine usage
+        # error still leaves its audit line (#328 r2).
+        if e.code in (0, None):
+            return 0, None
+        return 2, {"ok": "no", "reason": "usage error (argparse)"}
+
+    def kv(ok, **extra):
+        base = {"from_port": args.from_port, "to_port": args.to_port,
+                "domains": ",".join(domains) if domains else args.domains, "ok": ok}
+        base.update(extra)
+        return base
+
     domains = [d.strip() for d in args.domains.split(",") if d.strip()]
     if not domains:
         print("ERROR: --domains must list at least one domain", file=sys.stderr)
-        return 2
+        return 2, kv("no", reason="empty domains")
     daily_ports = {DAILY_PORT}
     try:
         daily_ports.add(int(os.environ.get("CDP_PORT", DAILY_PORT)))
@@ -105,19 +151,31 @@ def main(argv=None):
         print("ERROR: refusing to seed INTO the daily browser (port {}) — "
               "cookie-seed only flows daily → isolated lane".format(args.to_port),
               file=sys.stderr)
-        return 2
+        return 2, kv("no", reason="refused: target is the daily browser")
     if args.to_port == args.from_port:
         print("ERROR: --from-port and --to-port must differ", file=sys.stderr)
-        return 2
+        return 2, kv("no", reason="from_port == to_port")
 
+    try:
+        return _seed(args, domains, kv)
+    except Exception as e:
+        # transport/protocol crash AFTER parsing: keep the invocation context in
+        # the audit record (#328 r7), then re-raise (traceback unchanged).
+        # Sentinel prevents main()'s catch-all from writing a second line.
+        _audit(kv("no", reason="unhandled exception: {}".format(type(e).__name__)))
+        e._bdz_audited = True
+        raise
+
+
+def _seed(args, domains, kv):
     src_ws = browser_ws_url(args.from_port)
     if not src_ws:
         print("ERROR: source browser not reachable on port {}".format(args.from_port),
               file=sys.stderr)
-        return 1
+        return 1, kv("no", reason="source unreachable")
     r = cdp.ws_send(src_ws, "Storage.getCookies", {})
     if r is None:
-        return 1
+        return 1, kv("no", reason="Storage.getCookies failed")
     cookies = r.get("result", {}).get("cookies", [])
 
     selected = []
@@ -135,23 +193,23 @@ def main(argv=None):
     if not selected:
         print("ERROR: no cookies matched --domains on the source browser — "
               "nothing to seed (are you logged in there?)", file=sys.stderr)
-        return 1
+        return 1, kv("no", reason="no matching cookies")
     if args.dry_run:
         print("DRY-RUN: would seed {} cookie(s) into port {}".format(
             len(selected), args.to_port))
-        return 0
+        return 0, kv("yes", cookies=len(selected), dry_run="true")
 
     dst_ws = browser_ws_url(args.to_port)
     if not dst_ws:
         print("ERROR: target lane not reachable on port {}".format(args.to_port),
               file=sys.stderr)
-        return 1
+        return 1, kv("no", reason="target lane unreachable", cookies=len(selected))
     w = cdp.ws_send(dst_ws, "Storage.setCookies", {"cookies": selected})
     if w is None:
-        return 1
+        return 1, kv("no", reason="Storage.setCookies failed", cookies=len(selected))
     print("Seeded {} cookie(s) ({} domain(s)) into port {}".format(
         len(selected), sum(1 for v in counts.values() if v), args.to_port))
-    return 0
+    return 0, kv("yes", cookies=len(selected))
 
 
 if __name__ == "__main__":

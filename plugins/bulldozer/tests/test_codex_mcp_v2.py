@@ -5197,6 +5197,340 @@ def test_codex_run_mismatch_signature_no_binary_fails_safe(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# #320: TURN_ERROR / WARNING audit lines in the stable log.
+#
+# Terminal turn errors were returned to the caller and written NOWHERE durable
+# (session e4328466: 4x "model is at capacity", zero log trace); the `warning`
+# notification was flagged UNKNOWN_NOTIFICATION with its payload dropped.
+# Contract: best-effort one-line audit per terminal error (model/effort/mcp/
+# retries/msg, sanitized) + a WARNING line carrying the payload; the caller-
+# facing result shape is UNCHANGED and transient willRetry errors stay unlogged.
+# ---------------------------------------------------------------------------
+
+class TestTurnErrorAudit:
+    def _log_text(self):
+        import os
+        from pathlib import Path
+        p = Path(os.environ["BULLDOZER_CODEX_LOG"])
+        return p.read_text() if p.exists() else ""
+
+    def test_terminal_error_notification_writes_turn_error_line(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts(model_val="gpt-5.6-luna", effort_val="max", retries=2)
+        out = cs._handle_child_frame(
+            {"method": "error",
+             "params": {"error": {"message": "Selected model is at capacity."}}}, ts)
+        assert out is not None and "error" in out  # caller-facing result unchanged
+        log = self._log_text()
+        assert "| TURN_ERROR |" in log
+        assert "model=gpt-5.6-luna" in log
+        assert "effort=max" in log
+        assert "retries=2" in log
+        assert "Selected model is at capacity." in log
+
+    def test_transient_willretry_error_not_logged(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts()
+        out = cs._handle_child_frame(
+            {"method": "error",
+             "params": {"willRetry": True, "error": {"message": "Reconnecting 1/5"}}}, ts)
+        assert out is None and ts["retries"] == 1  # existing transient behavior
+        assert "TURN_ERROR" not in self._log_text()
+
+    def test_failed_status_turn_writes_turn_error_line(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts(model_val="gpt-5.5", effort_val="xhigh")
+        out = cs._handle_child_frame(
+            {"method": "turn/completed",
+             "params": {"turn": {"status": "failed", "error": "boom"}}}, ts)
+        assert out is not None and "error" in out
+        log = self._log_text()
+        assert "| TURN_ERROR |" in log and "model=gpt-5.5" in log and "boom" in log
+
+    def test_turn_error_msg_is_sanitized_one_line(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts()
+        cs._handle_child_frame(
+            {"method": "error",
+             "params": {"error": {"message": "line1 | pipe\nline2"}}}, ts)
+        log = self._log_text()
+        assert log.count("\n") == 1  # exactly one log line despite embedded newline
+        assert "line1 / pipe line2" in log  # | -> /, newline -> space
+
+    def test_warning_notification_logs_payload_and_no_drift(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts()
+        out = cs._handle_child_frame(
+            {"method": "warning", "params": {"message": "model capacity degraded"}}, ts)
+        assert out is None  # non-terminal: the turn continues
+        log = self._log_text()
+        assert "| WARNING |" in log and "model capacity degraded" in log
+        assert not any(d.get("code") == "UNKNOWN_NOTIFICATION" for d in ts["acc"]), \
+            "warning is an explicit signal, not protocol drift"
+
+    def test_warning_with_unexpected_shape_still_logs(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts()
+        out = cs._handle_child_frame({"method": "warning", "params": {"foo": 1}}, ts)
+        assert out is None
+        assert "| WARNING |" in self._log_text()  # payload shape unknown -> still a line
+
+    def test_turn_error_falls_back_to_effective_thread_meta(self, tmp_path, monkeypatch):
+        # #321 review P2: model/effort omitted at top level (config-routed / resumed call)
+        # must attribute the failure to the EFFECTIVE values from _last_thread_meta —
+        # the same fallback _build_result_meta uses — not to a lying "default".
+        import types
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        mgr = types.SimpleNamespace(_last_thread_meta={"model": "gpt-5.6-sol", "effort": "low"})
+        ts = _mk_ts(model_val=None, effort_val=None, manager=mgr)
+        cs._handle_child_frame(
+            {"method": "error", "params": {"error": {"message": "boom"}}}, ts)
+        log = self._log_text()
+        assert "model=gpt-5.6-sol" in log and "effort=low" in log
+
+    def test_start_rejection_response_writes_turn_error_line(self, tmp_path, monkeypatch):
+        # #321 review P2: a JSON-RPC error RESPONSE to turn/start is a terminal failure
+        # too — it must leave a TURN_ERROR trace, same as an error notification.
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+
+        class _StartRejectedBackend(_ScriptedBackend):
+            def pump(self, timeout=0.2, watch_cc=False):
+                ts_write = next((w for w in self.writes if isinstance(w, dict)
+                                 and w.get("method") == "turn/start"), None)
+                if ts_write is None:
+                    return []
+                return [{"id": ts_write["id"],
+                         "error": {"code": -32000, "message": "model at capacity"}}]
+
+        backend = _StartRejectedBackend()
+        sm = cs.TurnStateMachine()
+        sm.turn_started(None)
+        ctx = _drive_turn_ctx(backend)
+        ctx["state_machine"] = sm
+        gen = cs._drive_turn(ctx)
+        try:
+            next(gen)
+            assert False, "expected StopIteration with the terminal start-rejection result"
+        except StopIteration as e:
+            assert isinstance(e.value, dict) and "error" in e.value
+        log = self._log_text()
+        assert "| TURN_ERROR |" in log and "model at capacity" in log
+
+    def test_pre_ack_transient_and_warning_are_counted_and_logged(self, tmp_path, monkeypatch):
+        # #321 review P2: a willRetry error BEFORE the start ACK must bump retries and a
+        # pre-ACK warning must reach the WARNING audit line (previously both were dropped).
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+
+        class _PreAckNoiseBackend(_ScriptedBackend):
+            def __init__(self):
+                super().__init__()
+                self._step = 0
+
+            def pump(self, timeout=0.2, watch_cc=False):
+                ts_write = next((w for w in self.writes if isinstance(w, dict)
+                                 and w.get("method") == "turn/start"), None)
+                if ts_write is None:
+                    return []
+                self._step += 1
+                if self._step == 1:   # pre-ACK noise batch
+                    return [{"method": "error",
+                             "params": {"willRetry": True,
+                                        "error": {"message": "Reconnecting 1/5"}}},
+                            {"method": "warning",
+                             "params": {"message": "capacity degraded upstream"}}]
+                if self._step == 2:   # then the ACK
+                    return [{"id": ts_write["id"], "result": {"turn": {"id": "T1"}}}]
+                return [{"method": "turn/completed",
+                         "params": {"turn": {"status": "completed"}}}]
+
+        backend = _PreAckNoiseBackend()
+        sm = cs.TurnStateMachine()
+        sm.turn_started(None)
+        ctx = _drive_turn_ctx(backend)
+        ctx["state_machine"] = sm
+        gen = cs._drive_turn(ctx)
+        try:
+            next(gen)
+            assert False, "expected StopIteration with the completed result"
+        except StopIteration as e:
+            assert isinstance(e.value, dict) and "error" not in e.value
+        assert ctx["ts"]["retries"] == 1, "pre-ACK willRetry must increment retries"
+        log = self._log_text()
+        assert "| WARNING |" in log and "capacity degraded upstream" in log
+        assert "TURN_ERROR" not in log  # the turn completed — nothing terminal to audit
+
+    def test_model_rerouted_updates_turn_error_attribution(self, tmp_path, monkeypatch):
+        # #321 review r2: codex emits model/rerouted (e.g. capacity fallback) — a later
+        # terminal failure must be attributed to the EFFECTIVE toModel, not the requested one.
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts(model_val="gpt-5.6-sol")
+        out = cs._handle_child_frame(
+            {"method": "model/rerouted",
+             "params": {"fromModel": "gpt-5.6-sol", "toModel": "gpt-5.6-terra"}}, ts)
+        assert out is None  # reroute is informational, the turn continues
+        cs._handle_child_frame(
+            {"method": "error", "params": {"error": {"message": "boom"}}}, ts)
+        log = self._log_text()
+        assert "model=gpt-5.6-terra" in log, "must attribute to the rerouted model"
+        assert "model=gpt-5.6-sol" not in log
+
+    def test_child_eof_mid_turn_writes_turn_error_line(self, tmp_path, monkeypatch):
+        # #321 review r2: the app-server dying mid-turn is a terminal failure of the
+        # transport class — it must leave a TURN_ERROR trace too.
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+
+        class _DeadChildBackend(_ScriptedBackend):
+            def pump(self, timeout=0.2, watch_cc=False):
+                return []          # no frames ever
+
+            def poll(self):
+                return 1           # child is dead
+
+        backend = _DeadChildBackend()
+        sm = cs.TurnStateMachine()
+        sm.turn_started(None)
+        ctx = _drive_turn_ctx(backend)
+        ctx["state_machine"] = sm
+        gen = cs._drive_turn(ctx)
+        try:
+            next(gen)
+            assert False, "expected StopIteration with the EOF error result"
+        except StopIteration as e:
+            assert isinstance(e.value, dict) and "error" in e.value
+        log = self._log_text()
+        assert "| TURN_ERROR |" in log and "exited mid-turn" in log
+
+    def test_pre_ack_reroute_updates_attribution(self, tmp_path, monkeypatch):
+        # #321 review r3: model/rerouted arriving BEFORE the start ACK (the common capacity-
+        # fallback timing) must not be discarded — later failures attribute to toModel.
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+
+        class _PreAckRerouteBackend(_ScriptedBackend):
+            def __init__(self):
+                super().__init__()
+                self._step = 0
+
+            def pump(self, timeout=0.2, watch_cc=False):
+                ts_write = next((w for w in self.writes if isinstance(w, dict)
+                                 and w.get("method") == "turn/start"), None)
+                if ts_write is None:
+                    return []
+                self._step += 1
+                if self._step == 1:   # pre-ACK reroute
+                    return [{"method": "model/rerouted",
+                             "params": {"fromModel": "gpt-5.6-sol", "toModel": "gpt-5.6-terra"}}]
+                if self._step == 2:
+                    return [{"id": ts_write["id"], "result": {"turn": {"id": "T1"}}}]
+                return [{"method": "turn/completed",
+                         "params": {"turn": {"status": "failed", "error": "capacity"}}}]
+
+        backend = _PreAckRerouteBackend()
+        sm = cs.TurnStateMachine()
+        sm.turn_started(None)
+        ctx = _drive_turn_ctx(backend)
+        ctx["ts"]["model_val"] = "gpt-5.6-sol"
+        ctx["state_machine"] = sm
+        gen = cs._drive_turn(ctx)
+        try:
+            next(gen)
+            assert False, "expected StopIteration with the failed-turn result"
+        except StopIteration as e:
+            assert isinstance(e.value, dict) and "error" in e.value
+        log = self._log_text()
+        assert "model=gpt-5.6-terra" in log, "pre-ACK reroute must reach attribution"
+
+    def test_teardown_park_writes_turn_error_line(self, tmp_path, monkeypatch):
+        # #321 review r3: a parked turn dying (child-death / cap / cc-eof) is terminal —
+        # it must leave a TURN_ERROR trace before teardown.
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        backend = _ScriptedBackend()
+        backend._parked = {"request_frame": {"id": "A1", "method": "item/commandExecution/requestApproval"},
+                           "ctx": {"ts": _mk_ts(model_val="gpt-5.6-sol")}}
+        sm = cs.TurnStateMachine()
+        sm.turn_started(None)
+        cs._teardown_park(backend, sm, "child-death")
+        log = self._log_text()
+        assert "| TURN_ERROR |" in log and "child-death" in log and "model=gpt-5.6-sol" in log
+
+    def test_teardown_park_child_terminal_not_double_logged(self, tmp_path, monkeypatch):
+        # child-terminal teardown: an error frame was ALREADY audited by _handle_child_frame —
+        # the teardown itself must not write a second TURN_ERROR line.
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        backend = _ScriptedBackend()
+        backend._parked = {"request_frame": {"id": "A1", "method": "item/commandExecution/requestApproval"},
+                           "ctx": {"ts": _mk_ts()}}
+        sm = cs.TurnStateMachine()
+        sm.turn_started(None)
+        cs._teardown_park(backend, sm, "child-terminal")
+        assert "TURN_ERROR" not in self._log_text()
+
+    def test_broken_pipe_on_parked_resume_writes_turn_error_line(self, tmp_path, monkeypatch):
+        # #321 review r3: the child dying mid-park (decision undeliverable) is terminal too.
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+
+        class _PipeDeadOnDecisionBackend(_ScriptedBackend):
+            def _write(self, msg, child=None):
+                if isinstance(msg, dict) and "result" in msg:   # the decision reply
+                    raise BrokenPipeError("child gone")
+                super()._write(msg, child)
+
+        backend = _PipeDeadOnDecisionBackend()
+        sm = cs.TurnStateMachine()
+        sm.turn_started(None)
+        ctx = _drive_turn_ctx(backend)
+        ctx["state_machine"] = sm
+        gen = cs._drive_turn(ctx)
+        payload = next(gen)                     # parks on the scripted approval
+        assert payload["status"] == "awaiting_approval"
+        try:
+            gen.send("decline")
+            assert False, "expected StopIteration with the broken-pipe error result"
+        except StopIteration as e:
+            assert isinstance(e.value, dict) and "error" in e.value
+            assert "during park" in e.value["error"]
+        log = self._log_text()
+        assert "| TURN_ERROR |" in log and "during park" in log
+
+    def test_pump_exception_writes_turn_error_line(self, tmp_path, monkeypatch):
+        # #321 review r2: the catch-all exception exit is terminal too.
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+
+        class _ExplodingBackend(_ScriptedBackend):
+            def pump(self, timeout=0.2, watch_cc=False):
+                raise RuntimeError("transport blew up")
+
+        backend = _ExplodingBackend()
+        sm = cs.TurnStateMachine()
+        sm.turn_started(None)
+        ctx = _drive_turn_ctx(backend)
+        ctx["state_machine"] = sm
+        gen = cs._drive_turn(ctx)
+        try:
+            next(gen)
+            assert False, "expected StopIteration with the exception error result"
+        except StopIteration as e:
+            assert isinstance(e.value, dict) and "error" in e.value
+        log = self._log_text()
+        assert "| TURN_ERROR |" in log and "transport blew up" in log
+
+
+# ---------------------------------------------------------------------------
 # Task 6 (Fix 2): V2 dispatcher integration test — subprocess-level contract.
 #
 # Drives the REAL main() dispatcher over stdio (Popen python3 mcp/codex_server.py)
@@ -5897,6 +6231,7 @@ def test_fingerprint_matches_code_constants():
     assert set(fp["bridged_methods"]) == set(cs._BRIDGED_METHODS)
     assert set(fp["unsupported_methods"]) == set(cs._UNSUPPORTED_METHODS)
     assert fp["last_verified_codex_version"] == cs.LAST_VERIFIED_CODEX_VERSION
+    assert fp["effort_enum"] == list(cs.SUPPORTED_EFFORTS)
     for d in fp["command_decision_variants"]:
         assert cs._is_valid_command_decision(d)   # strings AND dict-shaped amendment variants both valid as-is
         # NOTE (R1-F1): amendment variants are stored as truthy dicts in the fixture, NOT bare
@@ -7078,3 +7413,352 @@ def test_e2e_unarmed_attended_elicitation_unchanged_real(monkeypatch, tmp_path):
     if not cc._requests:
         pytest.skip("codex did not request an approval this run (nothing to verify for the attended path)")
     assert all(req.get("method") == "elicitation/create" for req in cc._requests), cc._requests
+
+
+# ---------------------------------------------------------------------------
+# Effort surface: max/ultra are PER-MODEL (gpt-5.6 family), enum + live preflight
+# ---------------------------------------------------------------------------
+
+_CATALOG_56 = {"data": [
+    {"id": "gpt-5.6-sol", "supportedReasoningEfforts": [
+        {"reasoningEffort": e} for e in ("low", "medium", "high", "xhigh", "max", "ultra")]},
+    {"id": "gpt-5.6-luna", "supportedReasoningEfforts": [
+        {"reasoningEffort": e} for e in ("low", "medium", "high", "xhigh", "max")]},
+    {"id": "gpt-5.5", "supportedReasoningEfforts": [
+        {"reasoningEffort": e} for e in ("low", "medium", "high", "xhigh")]},
+], "nextCursor": None}
+
+_PREFLIGHT_MARKER = "is not supported by model"
+
+
+class CatalogFakeChild(ExtendedFakeChild):
+    """ExtendedFakeChild that also answers model/list (gated-effort preflight tests)."""
+
+    def _dispatch(self, msg):
+        if msg.get("method") == "model/list":
+            self._write_msg({"id": msg.get("id"), "result": _CATALOG_56})
+            return
+        super()._dispatch(msg)
+
+
+def test_effort_enum_extended_and_identical_in_both_schemas():
+    """The effort enum is a single module constant used by BOTH tool schemas — they
+    must never diverge — and the per-model gating (max/ultra) must be documented in
+    the param description the calling model reads."""
+    import codex_server as cs
+    assert list(cs.SUPPORTED_EFFORTS) == ["low", "medium", "high", "xhigh", "max", "ultra"]
+    assert set(cs.GATED_EFFORTS) == {"max", "ultra"}
+    for name in ("codex_run", "codex_review"):
+        tool = next(t for t in cs.TOOLS if t["name"] == name)
+        prop = tool["inputSchema"]["properties"]["effort"]
+        assert prop["enum"] == list(cs.SUPPORTED_EFFORTS), f"{name} enum diverged: {prop['enum']}"
+        desc = prop.get("description") or ""
+        assert "ultra" in desc and "5.6" in desc, \
+            f"{name} effort description must document the per-model gating; got: {desc!r}"
+
+
+def test_gated_effort_rejected_for_unsupporting_model():
+    """model=gpt-5.5 + effort=max is provably invalid per the live catalog → reject
+    BEFORE thread/start (no cold start wasted) with an actionable message."""
+    fake = CatalogFakeChild()
+    try:
+        r = call_codex_run(fake, "hi", effort="max", model="gpt-5.5")
+        assert "error" in r and _PREFLIGHT_MARKER in r["error"], r
+        assert "max" in r["error"] and "gpt-5.5" in r["error"], r
+        assert "xhigh" in r["error"], f"message must list the live supported efforts: {r['error']}"
+        assert fake.received("thread/start") is None, "must reject BEFORE thread/start"
+    finally:
+        fake.kill()
+
+
+def test_gated_effort_ultra_rejected_for_luna():
+    """gpt-5.6-luna supports max but NOT ultra — the family alone is not enough."""
+    fake = CatalogFakeChild()
+    try:
+        r = call_codex_run(fake, "hi", effort="ultra", model="gpt-5.6-luna")
+        assert "error" in r and _PREFLIGHT_MARKER in r["error"], r
+        assert "ultra" in r["error"] and "gpt-5.6-luna" in r["error"], r
+    finally:
+        fake.kill()
+
+
+def test_gated_effort_allowed_for_supporting_model():
+    fake = CatalogFakeChild()
+    try:
+        r = call_codex_run(fake, "hi", effort="ultra", model="gpt-5.6-sol")
+        assert _PREFLIGHT_MARKER not in str(r.get("error", "")), r
+        assert fake.received("thread/start") is not None, "preflight must let the run proceed"
+        assert fake.received("turn/start")["params"].get("effort") == "ultra"
+    finally:
+        fake.kill()
+
+
+def test_gated_effort_fail_open_when_model_omitted():
+    """With `model` omitted the effective model is the user's config.toml default —
+    not resolvable without a ~71K config/read per call → fail-open (documented)."""
+    fake = CatalogFakeChild()
+    try:
+        r = call_codex_run(fake, "hi", effort="max")
+        assert _PREFLIGHT_MARKER not in str(r.get("error", "")), r
+        assert fake.received("thread/start") is not None
+    finally:
+        fake.kill()
+
+
+def test_gated_effort_fail_open_on_unknown_model():
+    """A model id absent from the catalog (alias/hidden/future) is NOT provably
+    invalid — codex stays the authority."""
+    fake = CatalogFakeChild()
+    try:
+        r = call_codex_run(fake, "hi", effort="max", model="gpt-9-future")
+        assert _PREFLIGHT_MARKER not in str(r.get("error", "")), r
+        assert fake.received("thread/start") is not None
+    finally:
+        fake.kill()
+
+
+def test_gated_effort_fail_open_on_catalog_error(monkeypatch):
+    """model/list unavailable → skip validation, never brick a legit call."""
+    from codex_server import codex_run_v2, AppServerManager
+    fake = ExtendedFakeChild()
+    try:
+        mgr = AppServerManager(bin=fake)
+
+        def boom(method, params=None, timeout=30.0):
+            raise RuntimeError("model/list down")
+
+        monkeypatch.setattr(mgr, "connection_request", boom)
+        r = codex_run_v2(
+            {"prompt": "hi", "mcp": "isolated", "effort": "max", "model": "gpt-5.5"},
+            manager=mgr, cc_write_fn=lambda m: None, cc_read_fn=lambda timeout=10.0: None)
+        assert _PREFLIGHT_MARKER not in str(r.get("error", "")), r
+        assert fake.received("thread/start") is not None
+    finally:
+        fake.kill()
+
+
+def test_gated_effort_validated_via_config_channel():
+    """codex_review routes effort→config.model_reasoning_effort, and raw config
+    passthrough can smuggle the pair too — the preflight must see BOTH channels."""
+    fake = CatalogFakeChild()
+    try:
+        r = call_codex_run(fake, "hi", config={"model_reasoning_effort": "ultra",
+                                               "model": "gpt-5.6-luna"})
+        assert "error" in r and _PREFLIGHT_MARKER in r["error"], r
+    finally:
+        fake.kill()
+
+
+def test_codex_review_gated_effort_rejected():
+    from codex_server import codex_review_v2, AppServerManager
+    fake = CatalogFakeChild()
+    try:
+        r = codex_review_v2(
+            {"target": "uncommitted", "mcp": "isolated", "cwd": "/tmp",
+             "effort": "max", "model": "gpt-5.5"},
+            manager=AppServerManager(bin=fake),
+            cc_write_fn=lambda m: None, cc_read_fn=lambda timeout=10.0: None)
+        assert "error" in r and _PREFLIGHT_MARKER in r["error"], r
+        assert fake.received("thread/start") is None
+    finally:
+        fake.kill()
+
+
+def test_ungated_effort_never_fetches_catalog():
+    """low..xhigh are universal — the hot path must stay zero-overhead (no model/list)."""
+    fake = CatalogFakeChild()
+    try:
+        r = call_codex_run(fake, "hi", effort="xhigh", model="gpt-5.5")
+        assert _PREFLIGHT_MARKER not in str(r.get("error", "")), r
+        assert fake.received("model/list") is None, "ungated effort must not fetch the catalog"
+    finally:
+        fake.kill()
+
+
+def test_gated_effort_fail_open_on_partially_malformed_efforts_list():
+    """A catalog whose supportedReasoningEfforts mixes well-formed and MALFORMED
+    elements is uncertainty about the full list, NOT proof of non-support — the
+    surviving subset must not drive a rejection (codex-review P1, PR #315)."""
+
+    class MalformedCatalogChild(ExtendedFakeChild):
+        def _dispatch(self, msg):
+            if msg.get("method") == "model/list":
+                self._write_msg({"id": msg.get("id"), "result": {"data": [
+                    {"id": "gpt-5.5", "supportedReasoningEfforts": [
+                        {"reasoningEffort": "xhigh"},
+                        {"effort": "max"},   # drifted/unknown shape
+                    ]},
+                ], "nextCursor": None}})
+                return
+            super()._dispatch(msg)
+
+    fake = MalformedCatalogChild()
+    try:
+        r = call_codex_run(fake, "hi", effort="max", model="gpt-5.5")
+        assert _PREFLIGHT_MARKER not in str(r.get("error", "")), r
+        assert fake.received("thread/start") is not None
+    finally:
+        fake.kill()
+
+
+def test_gated_effort_exact_id_match_wins_over_alias():
+    """An entry whose secondary `model` field matches must not shadow a later
+    entry with the EXACT id (codex-review P2, PR #315)."""
+
+    class AliasCatalogChild(ExtendedFakeChild):
+        def _dispatch(self, msg):
+            if msg.get("method") == "model/list":
+                self._write_msg({"id": msg.get("id"), "result": {"data": [
+                    {"id": "alias-entry", "model": "gpt-x",
+                     "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}]},
+                    {"id": "gpt-x",
+                     "supportedReasoningEfforts": [
+                         {"reasoningEffort": e} for e in ("xhigh", "max")]},
+                ], "nextCursor": None}})
+                return
+            super()._dispatch(msg)
+
+    fake = AliasCatalogChild()
+    try:
+        r = call_codex_run(fake, "hi", effort="max", model="gpt-x")
+        assert _PREFLIGHT_MARKER not in str(r.get("error", "")), r
+        assert fake.received("thread/start") is not None
+    finally:
+        fake.kill()
+
+
+def test_gated_effort_unhashable_config_value_no_crash():
+    """Raw config passthrough can carry garbage (a JSON array) under
+    model_reasoning_effort — the preflight must not crash on it; the garbage
+    passes through to codex exactly as before (codex-review P2, PR #315)."""
+    fake = CatalogFakeChild()
+    try:
+        r = call_codex_run(fake, "hi", config={"model_reasoning_effort": ["ultra"],
+                                               "model": "gpt-5.6-luna"})
+        assert _PREFLIGHT_MARKER not in str(r.get("error", "")), r
+        assert fake.received("thread/start") is not None
+    finally:
+        fake.kill()
+
+
+# ---------------------------------------------------------------------------
+# #322 PR2: TURN_OK / INTERRUPT / PARK / INFO_ERROR audit lines + setup timing.
+#
+# TURN_ERROR (#320) has no success-side counterpart, so error RATES are not
+# computable (no denominator); interrupts, park creations and codex_info
+# failures leave no durable trace; the 28-80s cold-start is measured nowhere.
+# ---------------------------------------------------------------------------
+
+class TestTurnObservability:
+    def _log_text(self):
+        import os
+        from pathlib import Path
+        p = Path(os.environ["BULLDOZER_CODEX_LOG"])
+        return p.read_text() if p.exists() else ""
+
+    def test_completed_turn_writes_turn_ok_line(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts(model_val="gpt-5.6-sol", effort_val="high", retries=1,
+                    usage_snapshot={"total": {"totalTokens": 1234}},
+                    setup_ms=4200, cold_spawn=True)
+        out = cs._handle_child_frame(
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}}, ts)
+        assert out is not None and "error" not in out
+        log = self._log_text()
+        assert "| TURN_OK |" in log
+        assert "model=gpt-5.6-sol" in log and "effort=high" in log
+        assert "mcp=isolated" in log and "retries=1" in log
+        assert "tokens=1234" in log
+        assert "duration_ms=" in log
+        assert "setup_ms=4200" in log and "cold_spawn=true" in log
+
+    def test_failed_turn_writes_no_turn_ok(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts()
+        cs._handle_child_frame(
+            {"method": "turn/completed",
+             "params": {"turn": {"status": "failed", "error": "boom"}}}, ts)
+        log = self._log_text()
+        assert "TURN_OK" not in log and "| TURN_ERROR |" in log
+
+    def test_interrupted_turn_writes_interrupt_line(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts(model_val="gpt-5.6-terra")
+        res = cs._build_interrupted_result(ts, interrupted_by="timeout", thread_warm=False)
+        assert res["status"] == "interrupted"
+        log = self._log_text()
+        assert "| INTERRUPT |" in log
+        assert "interrupted_by=timeout" in log and "thread_warm=false" in log
+        assert "model=gpt-5.6-terra" in log
+        assert "TURN_ERROR" not in log  # an interrupt is graceful, not a failure
+
+    def test_park_creation_writes_park_line(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts()
+        payload, ids = cs.build_awaiting_payload(
+            "item/commandExecution/requestApproval",
+            {"itemId": "i1", "command": "rm -rf /tmp/x"}, ts, None, "tok-secret-12345")
+        assert payload["status"] == "awaiting_approval"
+        log = self._log_text()
+        assert "| PARK |" in log
+        assert "kind=" in log
+        assert "tok-secret-12345" not in log  # token never logged verbatim
+        # suffix slice: 'park-<hex>' tokens keep entropy (a prefix slice would log
+        # the constant 'park-' + 3 hex digits — #325 r3)
+        assert "token8=et-12345" in log
+
+    def test_info_error_writes_line(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+
+        class FM:
+            _child = None
+            _bin = "/nonexistent-codex"
+            def ensure(self, argv):
+                raise RuntimeError("spawn exploded")
+
+        out = cs.codex_info_v2({"query": "models"}, manager=FM())
+        assert "error" in out
+        log = self._log_text()
+        assert "| INFO_ERROR |" in log
+        assert "query=models" in log and "spawn exploded" in log
+
+    def test_setup_timing_attached_to_result_meta(self):
+        import codex_server as cs
+        ts = _mk_ts(setup_ms=3100, cold_spawn=False)
+        meta = cs._build_result_meta(ts["manager"], ts["usage_snapshot"],
+                                     ts["turn_start_t"], ts["mcp_mode"],
+                                     ts["mcp_servers_enabled"], ts["effort_val"],
+                                     ts["model_val"], "completed", ts=ts)
+        assert meta["timing"]["setup_ms"] == 3100
+        assert meta["timing"]["cold_spawn"] is False
+
+    def test_failed_turn_meta_carries_setup_timing_too(self, tmp_path, monkeypatch):
+        # result schema must not depend on the outcome (codex review #325 P2)
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts(setup_ms=2500, cold_spawn=True)
+        out = cs._handle_child_frame(
+            {"method": "turn/completed",
+             "params": {"turn": {"status": "failed", "error": "boom"}}}, ts)
+        assert out["timing"]["setup_ms"] == 2500 and out["timing"]["cold_spawn"] is True
+        out2 = cs._handle_child_frame(
+            {"method": "error",
+             "params": {"error": {"message": "capacity"}}}, _mk_ts(setup_ms=900))
+        assert out2["timing"]["setup_ms"] == 900
+
+    def test_malformed_wire_tokens_cannot_forge_log_lines(self, tmp_path, monkeypatch):
+        # totalTokens is wire-derived — a malicious/drifted string must not inject
+        # a fake TURN_ERROR line or corrupt the pipe grammar (codex review #325 r2)
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(tmp_path / "log"))
+        ts = _mk_ts(usage_snapshot={"total": {"totalTokens": "x\n2000-01-01 | TURN_ERROR | forged"}})
+        cs._handle_child_frame(
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}}, ts)
+        log = self._log_text()
+        assert "TURN_ERROR" not in log.replace("/ TURN_ERROR /", "")  # sanitized pipes
+        assert log.count("\n") == 1  # exactly one line written

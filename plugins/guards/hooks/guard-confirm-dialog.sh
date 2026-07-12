@@ -7,8 +7,8 @@
 #   $1 = dialog title (e.g. "🛡 Опасная git-операция")
 #   $2 = the command (may carry a trailing "# WHY: <reason>" that Claude appended)
 #
-# Buttons: Allow -> exit 0 (run the command) · Deny -> exit 2 (block) · Объясни -> exit 2
-# (block; ask Claude to re-issue with a # WHY: reason).
+# Buttons: Allow (default — highlighted, Enter-activated, #311) -> exit 0 (run the command) ·
+# Deny -> exit 2 (block) · Объясни -> exit 2 (block; ask Claude to re-issue with a # WHY: reason).
 # Fail-safe: osascript failure (no GUI / SSH) OR Esc/Cancel OR the 55s timeout -> exit 2.
 # Security: the command + title are passed to osascript via `on run argv`, never spliced
 # into an -e string, so $(...) / backticks inside them cannot execute.
@@ -48,14 +48,17 @@ BEEPER=$!
 trap 'kill "$BEEPER" 2>/dev/null' EXIT INT TERM
 
 # Modal dialog. Title + command passed via argv (no shell/AppleScript injection). Default
-# button "Deny" so Enter is safe. "giving up after 55" auto-dismisses BELOW the CC hook
-# timeout (60s, set in hooks.json) so the hook returns a DENY itself instead of being killed
-# by CC — which would fail-OPEN (allow). Sentinel "GAVEUP" = timed out.
+# button "Allow" (#311): highlighted + Enter-activated, so a keyboard operator confirms fast
+# instead of hunting the mouse and losing to the timeout. Deliberate tradeoff: a stray Enter
+# now allows — Chris judged a stray-Enter DENY of a legit command the worse failure; silence
+# still fail-safe DENIES. "giving up after 55" auto-dismisses BELOW the CC hook timeout (60s,
+# set in hooks.json) so the hook returns a DENY itself instead of being killed by CC — which
+# would fail-OPEN (allow). Sentinel "GAVEUP" = timed out.
 BTN=$(osascript - "$BODY" "$TITLE" <<'APPLESCRIPT' 2>/dev/null
 on run argv
     set bodyText to item 1 of argv
     set titleText to item 2 of argv
-    set r to display dialog bodyText with title titleText buttons {"Deny", "Объясни", "Allow"} default button "Deny" with icon caution giving up after 55
+    set r to display dialog bodyText with title titleText buttons {"Deny", "Объясни", "Allow"} default button "Allow" with icon caution giving up after 55
     if gave up of r then
         return "GAVEUP"
     end if

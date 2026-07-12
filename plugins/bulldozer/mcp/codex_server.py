@@ -91,7 +91,7 @@ def _codex_bin_available(bin_path: str | None = None) -> bool:
 # mid-session codex install/upgrade is picked up (#227).
 CODEX = _resolve_codex_bin()
 PROTO = "2025-06-18"
-LAST_VERIFIED_CODEX_VERSION = "0.142"   # last codex app-server version this bridge was verified against
+LAST_VERIFIED_CODEX_VERSION = "0.144"   # last codex app-server version this bridge was verified against
 
 REVIEW_SCHEMA = {
     "type": "object",
@@ -113,6 +113,26 @@ REVIEW_SCHEMA = {
         },
     },
 }
+
+# Reasoning-effort surface — single source for BOTH tool schemas (codex_run /
+# codex_review) so they can never diverge; pinned by the protocol fingerprint
+# ("effort_enum"). low..xhigh are supported by every model in the catalog; the
+# GATED tiers exist only on newer families (2026-07: max = gpt-5.6 sol/terra/luna,
+# ultra = sol/terra only), so a gated request is pre-validated against the LIVE
+# model/list catalog (_validate_effort_support) instead of a hardcoded model→efforts
+# table that would drift with every catalog change.
+SUPPORTED_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+GATED_EFFORTS = frozenset({"max", "ultra"})
+
+_EFFORT_DESCRIPTION = (
+    "Reasoning effort. low/medium/high/xhigh: every model. max/ultra are PER-MODEL "
+    "— the live catalog (codex_info query='models') is authoritative; currently "
+    "(codex 0.144) max = GPT-5.6 family (sol/terra/luna), ultra = gpt-5.6-sol/terra "
+    "only (adds automatic task delegation), older models (gpt-5.5/5.4/spark) cap at "
+    "xhigh. With max/ultra pass `model` explicitly — the server pre-validates the "
+    "pair against the live catalog and rejects unsupported combos BEFORE the "
+    "expensive thread start; with `model` omitted the pair passes through as-is."
+)
 
 TOOLS = [
     {
@@ -165,7 +185,8 @@ TOOLS = [
                     "enum": ["read-only", "workspace-write", "danger-full-access"],
                     "default": "read-only",
                 },
-                "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh"], "default": "medium"},
+                "effort": {"type": "string", "enum": list(SUPPORTED_EFFORTS),
+                           "default": "medium", "description": _EFFORT_DESCRIPTION},
                 "model": {"type": "string"},
                 "cwd": {"type": "string", "description": "Working dir. Omit for an isolated tmpdir."},
                 "base_instructions": {"type": "string"},
@@ -251,8 +272,8 @@ TOOLS = [
                     ],
                 },
                 "model": {"type": "string"},
-                "effort": {"type": "string",
-                           "enum": ["low", "medium", "high", "xhigh"], "default": "medium"},
+                "effort": {"type": "string", "enum": list(SUPPORTED_EFFORTS),
+                           "default": "medium", "description": _EFFORT_DESCRIPTION},
                 "timeout": {"type": "number",
                             "description": "Optional work-duration cap in seconds."},
             },
@@ -307,6 +328,121 @@ def _drift_warn(acc, code: str, detail: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a") as f:
             f.write(f"{_now_iso()} | {code} | {detail}\n")
+    except Exception:
+        pass
+
+
+def _log_san(v) -> str:
+    """One-line log sanitizer (shared by the audit writers): a value must never
+    break the `ts | KIND | k=v | ...` line grammar of the stable log."""
+    return str(v).replace("\n", " ").replace("\r", " ").replace("|", "/")
+
+
+def _turn_error_log(ts: dict, emsg) -> None:
+    """#320: best-effort TURN_ERROR audit line for a TERMINAL turn failure.
+
+    Terminal errors are returned to the calling session and previously left NO
+    durable trace (e4328466: 4x "model is at capacity", zero log entries) — this
+    line makes error rates minable per model/effort. Transient willRetry errors
+    are deliberately NOT logged (noise); their count arrives here as retries=N.
+    Never raises; never touches the caller-facing result.
+    """
+    try:
+        # Attribute to the EFFECTIVE model/effort: top-level args win, else the
+        # thread/start|resume echo in _last_thread_meta (config-routed / resumed
+        # calls) — the same fallback _build_result_meta uses (#321 review P2).
+        tm = getattr(ts.get("manager"), "_last_thread_meta", {}) or {}
+        # rerouted_model (model/rerouted, e.g. capacity fallback) outranks the REQUESTED
+        # model — a failure after a reroute belongs to the model that actually ran (#321 r2).
+        _drift_warn(None, "TURN_ERROR", (
+            f"model={_log_san(ts.get('rerouted_model') or ts.get('model_val') or tm.get('model') or 'default')} | "
+            f"effort={_log_san(ts.get('effort_val') or tm.get('effort') or 'default')} | "
+            f"mcp={_log_san(ts.get('mcp_mode') or '?')} | "
+            f"retries={ts.get('retries') or 0} | "
+            f"msg={_log_san(emsg or 'unknown error')[:500]}"))
+    except Exception:
+        pass
+
+
+def _turn_ok_log(ts: dict, meta: dict) -> None:
+    """#322 PR2: best-effort TURN_OK audit line for a COMPLETED turn — the
+    success-side counterpart of TURN_ERROR (#320). Without it error RATES are
+    not computable (no denominator) and per-model/effort latency is invisible.
+    Never raises; never touches the caller-facing result."""
+    try:
+        tm = getattr(ts.get("manager"), "_last_thread_meta", {}) or {}
+        timing = (meta or {}).get("timing") or {}
+        tokens = ((meta or {}).get("usage") or {}).get("total_tokens")
+        parts = [
+            f"model={_log_san(ts.get('rerouted_model') or ts.get('model_val') or tm.get('model') or 'default')}",
+            f"effort={_log_san(ts.get('effort_val') or tm.get('effort') or 'default')}",
+            f"mcp={_log_san(ts.get('mcp_mode') or '?')}",
+            f"retries={ts.get('retries') or 0}",
+            f"duration_ms={timing.get('duration_ms')}",
+            # tokens is wire-derived (tokenUsage notification) — sanitize like every
+            # other external field or a malformed value forges log lines (#325 r2)
+            f"tokens={_log_san(tokens) if tokens is not None else 'NA'}",
+        ]
+        if ts.get("setup_ms") is not None:
+            parts.append(f"setup_ms={ts['setup_ms']}")
+            parts.append(f"cold_spawn={'true' if ts.get('cold_spawn') else 'false'}")
+        _drift_warn(None, "TURN_OK", " | ".join(parts))
+    except Exception:
+        pass
+
+
+def _interrupt_log(ts: dict, interrupted_by: str, thread_warm: bool) -> None:
+    """#322 PR2 (A5/#218): best-effort INTERRUPT audit line. An interrupt is a
+    graceful partial, not a failure — it gets its own kind, never TURN_ERROR."""
+    try:
+        tm = getattr(ts.get("manager"), "_last_thread_meta", {}) or {}
+        _drift_warn(None, "INTERRUPT", (
+            f"interrupted_by={_log_san(interrupted_by)} | "
+            f"thread_warm={'true' if thread_warm else 'false'} | "
+            f"model={_log_san(ts.get('rerouted_model') or ts.get('model_val') or tm.get('model') or 'default')} | "
+            f"mcp={_log_san(ts.get('mcp_mode') or '?')}"))
+    except Exception:
+        pass
+
+
+def _fail_meta(ts: dict) -> dict:
+    """Result meta for a terminal failure OUTSIDE the frame-handler paths (start-ACK
+    rejection, pre-ACK terminal error, child EOF, ACK/turn timeouts, the exception
+    catch-all) — so the result schema does not depend on WHERE the turn failed
+    (#325 r2). Best-effort: an inconsistent ts yields {} rather than masking the error."""
+    try:
+        return _build_result_meta(ts["manager"], ts["usage_snapshot"], ts["turn_start_t"],
+                                  ts["mcp_mode"], ts["mcp_servers_enabled"],
+                                  ts["effort_val"], ts["model_val"], "failed", ts=ts)
+    except Exception:
+        return {}
+
+
+def _info_error_log(query, msg) -> None:
+    """#322 PR2 (F3): best-effort INFO_ERROR audit line — a codex_info outage
+    (spawn/read failure) was previously visible only to the caller."""
+    try:
+        _drift_warn(None, "INFO_ERROR", (
+            f"query={_log_san(query)} | msg={_log_san(msg or 'unknown error')[:500]}"))
+    except Exception:
+        pass
+
+
+def _warning_log(params: dict) -> None:
+    """#320: best-effort WARNING audit line for the codex `warning` notification.
+
+    Previously flagged UNKNOWN_NOTIFICATION with the payload DROPPED (a lost
+    capacity-storm precursor on 2026-07-11). It is an explicit codex signal, not
+    protocol drift — log the message, keep it out of the _drift channel."""
+    try:
+        p = params or {}
+        msg = p.get("message")
+        if not isinstance(msg, str) or not msg:
+            w = p.get("warning")
+            msg = w.get("message") if isinstance(w, dict) else None
+        if not isinstance(msg, str) or not msg:
+            msg = json.dumps(p)[:300]  # unknown shape — keep SOMETHING greppable
+        _drift_warn(None, "WARNING", _log_san(msg)[:500])
     except Exception:
         pass
 
@@ -1023,6 +1159,7 @@ class AppServerManager:
         """
         sig = tuple(isolation_argv or [])
         if _is_child_alive(self._child) and self._isolation_sig == sig:
+            self.last_ensure_spawned = False  # warm reuse (#322 PR2 B7)
             return self._child
 
         # Spawn a new child. _bin is None (lazy: resolve the codex binary from the CURRENT
@@ -1056,6 +1193,7 @@ class AppServerManager:
         self._child = new_child
         self._reactor = new_reactor
         self._isolation_sig = sig
+        self.last_ensure_spawned = True  # cold spawn (#322 PR2 B7)
         if old_child is not None and old_child is not new_child:
             try:
                 old_child.kill()
@@ -2018,15 +2156,12 @@ def _log_approval_event(method, decision, wait_ms, timed_out, unattended=False, 
         # line) or the ' | ' field delimiter (split corruption).
         return str(v).replace("\n", " ").replace("\r", " ").replace("|", "/")
     try:
-        path = os.environ.get("BULLDOZER_CODEX_LOG") or os.path.expanduser(
-            "~/.claude/hooks/bulldozer-codex.log")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         extra = f" | unattended=true | rule={_san(rule)}" if unattended else ""
-        with open(path, "a") as f:
-            f.write(
-                f"{_now_iso()} | APPROVAL | method={_san(method)} | "
-                f"decision={_san(_approval_decision_label(decision))} | "
-                f"wait_ms={wait_ms} | timed_out={'true' if timed_out else 'false'}{extra}\n")
+        # single shared writer (#322 PR2): same line format, one open/append path
+        _drift_warn(None, "APPROVAL", (
+            f"method={_san(method)} | "
+            f"decision={_san(_approval_decision_label(decision))} | "
+            f"wait_ms={wait_ms} | timed_out={'true' if timed_out else 'false'}{extra}"))
     except Exception:
         pass
 
@@ -2465,6 +2600,18 @@ def build_awaiting_payload(method: str, params, ts, narrative, park_token):
     decisions = [{"id": d_id, "label": label} for d_id, label, _ in table]
     decision_ids = {d_id for d_id, _, _ in table} | {"decline"}
     kind = _APPROVAL_KIND.get(method, "unknown")
+    # #322 PR2 (F4): a park that never resumes (cap teardown, session death) previously
+    # left no "parked at t=X" line to correlate the resolution against. Token logged as
+    # an 8-char prefix only — never verbatim (it is the resume capability).
+    try:
+        # token8 = the LAST 8 chars: production tokens are 'park-<hex>', so a prefix
+        # slice would keep the constant 'park-' + 3 hex digits (4096 ids, ~50%
+        # collision at ~75 parks) — the suffix carries full entropy (#325 r3).
+        _drift_warn(None, "PARK", (
+            f"kind={_log_san(kind)} | method={_log_san(method)} | "
+            f"token8={_log_san(str(park_token)[-8:])}"))
+    except Exception:
+        pass
     approval = {"kind": kind, "decisions": decisions}
     if narrative:
         approval["narrative"] = _truncate_for_display(
@@ -3258,10 +3405,12 @@ def codex_info_v2(args: dict, manager: "AppServerManager | None" = None) -> dict
         # (e.g. left warm by a prior codex_run) is reused as-is — even if the codex symlink was
         # removed mid-session (an upgrade) — so gate the binary check on the spawn path only.
         if not _respawn_allowed():
+            _info_error_log(query, "codex binary not found")
             return {"error": f"codex binary not found at '{_resolve_codex_bin()}'. Install codex or set JAINE_CODEX_BIN."}
         try:
             manager.ensure([])   # default connection (no isolation) only if none alive
         except Exception as e:
+            _info_error_log(query, e)
             return _stamp_drift({"error": f"{method} failed: {e}"}, acc)
 
     try:
@@ -3272,11 +3421,13 @@ def codex_info_v2(args: dict, manager: "AppServerManager | None" = None) -> dict
         # now actually dead (a live-child error is a real protocol/timeout error: surface it,
         # don't mask) and a respawn is permitted (binary present on the singleton path).
         if _is_child_alive(manager._child) or not _respawn_allowed():
+            _info_error_log(query, e)
             return _stamp_drift({"error": f"{method} failed: {e}"}, acc)
         try:
             manager.ensure([])
             result = manager.connection_request(method, params)
         except Exception as e2:
+            _info_error_log(query, f"after respawn-retry: {e2}")
             return _stamp_drift({"error": f"{method} failed after respawn-retry: {e2}"}, acc)
     if query == "config":
         result = _project_config(result)
@@ -3356,7 +3507,8 @@ def _build_interrupted_result(ts: dict, interrupted_by: str, thread_warm: bool =
     partial = "".join(ts["final_message_parts"])
     meta = _build_result_meta(ts["manager"], ts["usage_snapshot"], ts["turn_start_t"],
                               ts["mcp_mode"], ts["mcp_servers_enabled"],
-                              ts["effort_val"], ts["model_val"], "interrupted")
+                              ts["effort_val"], ts["model_val"], "interrupted", ts=ts)
+    _interrupt_log(ts, interrupted_by, thread_warm)
     res = _shape_result(ts["mode"], ts["thread_id"], partial, meta)
     res["status"] = "interrupted"          # top-level status (overrides meta's status key too)
     res["interrupted_by"] = interrupted_by
@@ -3444,14 +3596,16 @@ def _handle_child_frame(frame: dict, ts: dict):
         if t.get("status") != "completed" or t.get("error"):  # TurnStatus has no "success" (codex 0.141: completed/interrupted/failed/inProgress)
             meta = _build_result_meta(ts["manager"], ts["usage_snapshot"], ts["turn_start_t"],
                                       ts["mcp_mode"], ts["mcp_servers_enabled"],
-                                      ts["effort_val"], ts["model_val"], "failed")
+                                      ts["effort_val"], ts["model_val"], "failed", ts=ts)
+            _turn_error_log(ts, f"turn failed: status={t.get('status')!r} error={t.get('error')!r}")
             return {"error": f"turn failed: status={t.get('status')!r} error={t.get('error')!r}",
                     "thread_id": ts["thread_id"], **meta}
         meta = _build_result_meta(ts["manager"], ts["usage_snapshot"], ts["turn_start_t"],
                                   ts["mcp_mode"], ts["mcp_servers_enabled"],
-                                  ts["effort_val"], ts["model_val"], "completed")
+                                  ts["effort_val"], ts["model_val"], "completed", ts=ts)
         if ts["retries"]:
             meta["retries"] = ts["retries"]
+        _turn_ok_log(ts, meta)
         return _shape_result(ts["mode"], ts["thread_id"], "".join(ts["final_message_parts"]), meta)
     if method == "error":
         # willRetry:true = transient stream reconnect (codex retries) → NOT terminal, NOT drift.
@@ -3461,7 +3615,8 @@ def _handle_child_frame(frame: dict, ts: dict):
             return None
         meta = _build_result_meta(ts["manager"], ts["usage_snapshot"], ts["turn_start_t"],
                                   ts["mcp_mode"], ts["mcp_servers_enabled"],
-                                  ts["effort_val"], ts["model_val"], "failed")
+                                  ts["effort_val"], ts["model_val"], "failed", ts=ts)
+        _turn_error_log(ts, emsg)
         return {"error": f"codex error: {emsg or 'unknown error'}",
                 "thread_id": ts["thread_id"], **meta}
     if method == "item/started":
@@ -3490,6 +3645,18 @@ def _handle_child_frame(frame: dict, ts: dict):
         if item_id:
             ts.setdefault("file_changes", {})[item_id] = {
                 "changes": p.get("changes") or [], "turn_id": p.get("turnId")}
+        return None
+    if method == "warning":
+        # #320: an explicit codex signal (e.g. capacity degradation) — log the payload,
+        # keep it out of the _drift channel (it is not protocol drift). Non-terminal.
+        _warning_log(frame.get("params") or {})
+        return None
+    if method == "model/rerouted":
+        # #321 r2: capture the EFFECTIVE model so a later TURN_ERROR is attributed to the
+        # model that actually ran, not the requested one. Informational — the turn continues.
+        to = (frame.get("params") or {}).get("toModel")
+        if isinstance(to, str) and to:
+            ts["rerouted_model"] = to
         return None
     if method not in _KNOWN_NOTIFICATIONS:
         _drift_warn(ts.get("acc"), "UNKNOWN_NOTIFICATION", method)
@@ -3550,14 +3717,8 @@ def _log_kill_switch_once() -> None:
     if getattr(_log_kill_switch_once, "_done", False) or _interrupts_enabled():
         return
     _log_kill_switch_once._done = True
-    try:
-        path = os.environ.get("BULLDOZER_CODEX_LOG") or os.path.expanduser(
-            "~/.claude/hooks/bulldozer-codex.log")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a") as f:
-            f.write(f"{_now_iso()} | INTERRUPT_DISABLED | BULLDOZER_CODEX_NO_INTERRUPT set\n")
-    except Exception:
-        pass
+    # single shared writer (#322 PR2): same line format, one open/append path
+    _drift_warn(None, "INTERRUPT_DISABLED", "BULLDOZER_CODEX_NO_INTERRUPT set")
 
 
 def codex_approve_v2(args: dict, manager: "AppServerManager | None" = None,
@@ -3595,6 +3756,7 @@ def codex_approve_v2(args: dict, manager: "AppServerManager | None" = None,
         manager._parked = None
         return e.value                                 # already _stamp_drift'd inside the generator
     except Exception as e:                             # defensive — a resume crash must not strand the park
+        _turn_error_log(ctx.get("ts") or {}, f"resume error: {e}")
         state_machine.turn_completed()
         manager._parked = None
         return _stamp_drift({"error": f"resume error: {e}"}, acc)
@@ -3687,6 +3849,14 @@ def _teardown_park(manager, state_machine, reason: str) -> None:
     else _in_flight stays True forever and deadlocks the next tool). Best-effort: NEVER raises (main()'s
     parked wait has no tool-call try/except; a dead-child decline write is BrokenPipe-guarded, C8b)."""
     parked = manager._parked if isinstance(getattr(manager, "_parked", None), dict) else None
+    if parked is not None and reason != "child-terminal":
+        # #321 r3: a parked turn dying (cap / cc-eof / child-death) is a terminal failure —
+        # audit it. child-terminal is EXCLUDED: an error frame was already audited by
+        # _handle_child_frame, and a completed-during-park turn is a delivery loss, not an error.
+        _ctx = parked.get("ctx")
+        _pts = (_ctx or {}).get("ts") if isinstance(_ctx, dict) else None
+        _turn_error_log(_pts if isinstance(_pts, dict) else {"manager": manager},
+                        f"parked turn torn down: {reason}")
     if parked is not None:
         req = parked.get("request_frame")
         if isinstance(req, dict):
@@ -3902,9 +4072,11 @@ def _drive_turn(ctx):
                             if "error" not in _resp:           # pre-validated id (F3); error = defensive skip
                                 manager._write(_resp)
                         except BrokenPipeError:                # child died mid-park (C8b) → graceful, no crash
+                            _turn_error_log(ts, "codex child exited during park (decision undeliverable)")
                             state_machine.turn_completed()
                             return _stamp_drift(
-                                {"error": "codex child exited during park (decision undeliverable)"}, acc)
+                                {"error": "codex child exited during park (decision undeliverable)",
+                                 **_fail_meta(ts)}, acc)
                         # #280 C audit (codex_review P3): log the RESOLVED grant from the built response
                         # (accept / acceptForSession / perm:* — what was GRANTED), NOT the opaque d-id the
                         # model picked. Mirrors the attended path, which passes the decision payload too.
@@ -3943,15 +4115,24 @@ def _drive_turn(ctx):
                     # Phase 1: looking for the start ACK (response to our review/turn-start id)
                     if kind == "response" and frame.get("id") == mid:
                         if "error" in frame:
+                            _turn_error_log(ts, f"{start_method} error: {frame['error']}")
                             state_machine.turn_completed()
-                            return _stamp_drift({"error": f"{start_method} error: {frame['error']}"}, acc)
+                            return _stamp_drift({"error": f"{start_method} error: {frame['error']}",
+                                                 **_fail_meta(ts)}, acc)
                         turn_acked = True
                         turn_id = ((frame.get("result") or {}).get("turn") or {}).get("id")
                     elif method == "error":
                         is_terminal, emsg = _classify_error_notification(frame.get("params", {}) or {})
                         if is_terminal:
+                            _turn_error_log(ts, emsg)
                             state_machine.turn_completed()
-                            return _stamp_drift({"error": f"codex error: {emsg or 'unknown error'}"}, acc)
+                            return _stamp_drift({"error": f"codex error: {emsg or 'unknown error'}",
+                                                 **_fail_meta(ts)}, acc)
+                        ts["retries"] += 1   # pre-ACK transient counts too (#321 review P2)
+                    elif method in ("warning", "model/rerouted"):
+                        # #321 r2/r3: pre-ACK warning/reroute must not be dropped — delegate to the
+                        # shared handler (WARNING audit line / rerouted_model capture, both non-terminal).
+                        _handle_child_frame(frame, ts)
                     continue
 
                 # Phase 2: event stream — delegate to the shared child-frame handler.
@@ -3968,8 +4149,9 @@ def _drive_turn(ctx):
                 if cancel_pending:                   # R1-F2: cancel pending + child died → graceful COLD
                     return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
                 eof_err = state_machine.eof_error()
+                _turn_error_log(ts, eof_err.get("error"))
                 manager._child = None
-                return _stamp_drift(eof_err, acc)
+                return _stamp_drift({**eof_err, **_fail_meta(ts)}, acc)
 
             if cancel_pending and turn_acked:        # AFTER the batch → same-batch ACK + deltas captured
                 return _stamp_drift(_finish_interrupt(manager, ts, turn_id, "cancel", state_machine), acc)
@@ -3981,18 +4163,73 @@ def _drive_turn(ctx):
                 # check would otherwise fire before the next iteration replays drained_frames.
                 if cancel_pending:                   # R1-F2: cancel pending, ACK never arrived → graceful COLD
                     return _stamp_drift(_finish_interrupt(manager, ts, None, "cancel", state_machine), acc)
+                _turn_error_log(ts, f"{start_method} response timed out")
                 state_machine.turn_completed()
-                return _stamp_drift({"error": f"{start_method} response timed out"}, acc)
+                return _stamp_drift({"error": f"{start_method} response timed out",
+                                     **_fail_meta(ts)}, acc)
 
         # Opt-in work-duration deadline exceeded (only reachable when timeout was set).
         if _interrupts_enabled():                    # #218: graceful interrupt + resumable partial
             return _stamp_drift(_finish_interrupt(manager, ts, turn_id, "timeout", state_machine), acc)
+        _turn_error_log(ts, f"turn timed out after {turn_timeout} s")
         state_machine.turn_completed()               # kill-switch: legacy bare error
-        return _stamp_drift({"error": f"turn timed out after {turn_timeout} s"}, acc)
+        return _stamp_drift({"error": f"turn timed out after {turn_timeout} s",
+                             **_fail_meta(ts)}, acc)
 
     except Exception as e:
+        _turn_error_log(ts, f"turn execution error: {e}")
         state_machine.turn_completed()
-        return _stamp_drift({"error": f"turn execution error: {e}"}, acc)
+        return _stamp_drift({"error": f"turn execution error: {e}", **_fail_meta(ts)}, acc)
+
+
+def _validate_effort_support(manager, model: str, efforts) -> "str | None":
+    """Pre-flight for the GATED reasoning efforts (max/ultra — not supported by every
+    model): check the requested efforts against the LIVE model/list catalog entry for
+    `model`; return an error string on a provable mismatch, else None.
+
+    Deliberately DYNAMIC — the catalog comes from codex itself; a hardcoded
+    model→efforts table is the #251 allowlist treadmill this server already deleted
+    once. Fail-OPEN on every uncertainty (manager without connection_request, fetch
+    error/timeout, paginated-away or unknown model id, malformed/empty efforts list):
+    codex stays the authority and a legit call is never bricked. The payoff of the
+    check is an actionable error BEFORE thread/start — i.e. before the 28-80s
+    first-thread cold start is wasted on an opaque API rejection.
+    """
+    try:
+        req = getattr(manager, "connection_request", None)
+        if req is None:
+            return None
+        catalog = req("model/list", {}, timeout=15.0)
+        entries = catalog.get("data") if isinstance(catalog, dict) else None
+        dict_entries = [e for e in entries or [] if isinstance(e, dict)]
+        # Exact `id` match takes precedence over the secondary `model` alias field —
+        # an alias entry listed earlier must not shadow the canonical entry (PR #315
+        # review P2). Only the FIRST page is examined: pagination-away = unknown =
+        # fail-open by design (catalog is 7 entries live; cursor-following is
+        # speculative complexity for a best-effort preflight).
+        entry = next((e for e in dict_entries if e.get("id") == model), None) \
+            or next((e for e in dict_entries if e.get("model") == model), None)
+        if entry is None:
+            return None  # unknown/paginated-away model ≠ invalid — let codex decide
+        raw = entry.get("supportedReasoningEfforts")
+        if not isinstance(raw, list) or not raw:
+            return None
+        supported = []
+        for s in raw:
+            eff = s.get("reasoningEffort") if isinstance(s, dict) else None
+            if not isinstance(eff, str):
+                # ANY malformed element = uncertainty about the FULL list (protocol
+                # drift?) — a surviving subset must not drive a rejection (P1).
+                return None
+            supported.append(eff)
+        bad = [e for e in efforts if e not in supported]
+        if bad:
+            return (f"effort {bad[0]!r} is not supported by model {model!r}; "
+                    f"supported: {', '.join(supported)} (live catalog — see "
+                    "codex_info query='models')")
+    except Exception:
+        return None  # catalog unavailable → fail-open, codex validates downstream
+    return None
 
 
 def codex_run_v2(
@@ -4154,10 +4391,34 @@ def codex_run_v2(
         return _stamp_drift(state_machine.busy_error(), acc)
 
     # ── Ensure child is alive ───────────────────────────────────────────────
+    setup_t0 = time.time()  # #322 PR2 (B7): ensure + thread setup = the cold-start window
     try:
         manager.ensure(isolation_argv)
     except Exception as e:
         return _stamp_drift({"error": f"app-server ensure failed: {e}"}, acc)
+
+    # ── Gated-effort preflight (max/ultra are per-model; low..xhigh universal) ──
+    # Validate BOTH channels codex will see: the turn-level `effort` arg (codex_run;
+    # wins at turn/start) and a config-routed model_reasoning_effort (codex_review
+    # routing + raw config passthrough; wins at thread/start). Runs only when a GATED
+    # effort is requested AND the effective model is known from the call — with
+    # `model` omitted the effective model is the user's config.toml default, not
+    # resolvable without a ~71K config/read per call → documented fail-open.
+    cfg_args = args.get("config")
+    if not isinstance(cfg_args, dict):
+        cfg_args = {}
+    # isinstance(str) filters BEFORE the set: raw config can carry garbage (a JSON
+    # array under model_reasoning_effort would make the set literal raise TypeError
+    # outside the helper's fail-open boundary — PR #315 review P2); garbage keeps
+    # passing through to codex verbatim, exactly as pre-preflight.
+    gated_efforts = sorted(
+        {v for v in (effort_val, cfg_args.get("model_reasoning_effort"))
+         if isinstance(v, str) and v in GATED_EFFORTS})
+    model_eff = model_val or cfg_args.get("model")
+    if gated_efforts and isinstance(model_eff, str):
+        preflight_err = _validate_effort_support(manager, model_eff, gated_efforts)
+        if preflight_err:
+            return _stamp_drift({"error": preflight_err}, acc)
 
     # ── Thread setup ────────────────────────────────────────────────────────
     if thread_id is not None:
@@ -4249,6 +4510,9 @@ def codex_run_v2(
         "model_val": model_val, "mode": mode, "thread_id": thread_id,
         "review_target": review_target,
         "file_changes": {},   # #277 (C16): itemId → {changes:[{diff,kind,path}], turn_id} from patchUpdated
+        # #322 PR2 (B7): ensure + thread setup wall-clock; cold_spawn = ensure() spawned
+        "setup_ms": int((turn_start_t - setup_t0) * 1000),
+        "cold_spawn": bool(getattr(manager, "last_ensure_spawned", False)),
     }
 
     # #277: the turn-pump loop is an INNER generator (_drive_turn). codex_run_v2 stays dict-returning
@@ -4295,11 +4559,14 @@ def _classify_error_notification(params: dict) -> tuple:
 
 def _build_result_meta(manager, usage_snapshot: dict, turn_start_t: float,
                        mcp_mode: str, mcp_servers_enabled: list, effort_val,
-                       model_val, status: str) -> dict:
+                       model_val, status: str, ts: dict | None = None) -> dict:
     """Build the ADDITIVE result metadata (usage/codex/timing/status).
 
     `status` is "completed" on success or "failed" on a terminal turn failure (F11) —
     a failed turn still consumed tokens, so usage/timing observability matters there too.
+    `ts` (kw-only-ish, optional) contributes setup timing (#322 PR2 B7): setup_ms =
+    ensure+thread-setup wall-clock, cold_spawn = whether ensure() spawned a child —
+    the 28-80s cold-start vs ~1s warm split was previously measured nowhere.
     """
     tm = getattr(manager, "_last_thread_meta", {}) or {}
     # Wire: usage_snapshot is params.tokenUsage = {last, total}, each a TokenUsageBreakdown
@@ -4321,7 +4588,11 @@ def _build_result_meta(manager, usage_snapshot: dict, turn_start_t: float,
             "mcp_mode": mcp_mode,
             "mcp_servers_enabled": mcp_servers_enabled,
         },
-        "timing": {"duration_ms": int((time.time() - turn_start_t) * 1000)},
+        "timing": dict(
+            {"duration_ms": int((time.time() - turn_start_t) * 1000)},
+            **({"setup_ms": ts["setup_ms"], "cold_spawn": bool(ts.get("cold_spawn"))}
+               if ts and ts.get("setup_ms") is not None else {}),
+        ),
         "status": status,
     }
 

@@ -487,3 +487,142 @@ class TestCrossStateIsolation:
         assert result.returncode == 0, f"stderr: {result.stderr}"
         assert (review_via_flag / "state.json").exists()
         assert not (review_via_env / "state.json").exists()
+
+
+class TestFixedFpInvariant:
+    """#314: `fixed`/`fp` on round N are dispositions of round N-1's findings
+    (SKILL.md Step 6 sets BULLDOZER_FIXED when launching the NEXT round), so
+    the sanity warning must compare against the PREVIOUS history entry.
+    The old same-round comparison fired on every healthy converging review
+    (findings 3→2 with 3 fixes = cry-wolf)."""
+
+    def _append_round(self, review_dir, round_num, findings, fixed, fp=0,
+                      verdict="NO-GO"):
+        return run_script(
+            ["--review-dir", str(review_dir), str(round_num), verdict,
+             str(findings), str(fixed), str(fp), "artifact", "standard",
+             "codex/x"],
+            env_override={"BULLDOZER_REVIEW_DIR": None},
+        )
+
+    def test_converging_review_emits_no_warning(self, tmp_path):
+        """Issue #314 repro: r1 findings=3 → 3 fixed → r2 findings=2.
+        fixed+fp (3) <= previous round's findings (3) → healthy, silent."""
+        review = tmp_path / "review"
+        r1 = self._append_round(review, 1, findings=3, fixed=0)
+        assert r1.returncode == 0, f"stderr: {r1.stderr}"
+        r2 = self._append_round(review, 2, findings=2, fixed=3)
+        assert r2.returncode == 0, f"stderr: {r2.stderr}"
+        assert "warning: fixed+fp" not in r2.stderr, (
+            "converging review must not warn (cry-wolf, #314); "
+            f"stderr: {r2.stderr!r}"
+        )
+
+    def test_genuine_overcount_still_warns(self, tmp_path):
+        """fixed+fp exceeding the PREVIOUS round's findings is a real desync
+        — the warning must survive the #314 fix."""
+        review = tmp_path / "review"
+        r1 = self._append_round(review, 1, findings=2, fixed=0)
+        assert r1.returncode == 0, f"stderr: {r1.stderr}"
+        r2 = self._append_round(review, 2, findings=2, fixed=2, fp=1)
+        assert r2.returncode == 0, f"stderr: {r2.stderr}"
+        assert "warning: fixed+fp" in r2.stderr, (
+            f"fixed+fp=3 > previous findings=2 must warn; stderr: {r2.stderr!r}"
+        )
+        assert "previous round" in r2.stderr, (
+            "warning must name its baseline (previous round's findings); "
+            f"stderr: {r2.stderr!r}"
+        )
+
+    def test_first_round_has_no_baseline_no_warning(self, tmp_path):
+        """Round 1 has no previous entry — nothing to compare against."""
+        review = tmp_path / "review"
+        r1 = self._append_round(review, 1, findings=0, fixed=5)
+        assert r1.returncode == 0, f"stderr: {r1.stderr}"
+        assert "warning: fixed+fp" not in r1.stderr, (
+            f"no previous round → no baseline → no warning; stderr: {r1.stderr!r}"
+        )
+
+    def test_same_round_rerun_uses_prior_round_baseline(self, tmp_path):
+        """Codex review #330 r1 (P2): a wrapper re-run of round N appends a
+        SECOND round-N entry — history[-1] is then the current round itself,
+        not round N-1. The baseline must be the latest entry with
+        round < round_num, or the rerun re-fires the cry-wolf warning."""
+        review = tmp_path / "review"
+        r1 = self._append_round(review, 1, findings=3, fixed=0)
+        assert r1.returncode == 0, f"stderr: {r1.stderr}"
+        r2 = self._append_round(review, 2, findings=2, fixed=3)
+        assert r2.returncode == 0, f"stderr: {r2.stderr}"
+        rerun = self._append_round(review, 2, findings=2, fixed=3)
+        assert rerun.returncode == 0, f"stderr: {rerun.stderr}"
+        assert "warning: fixed+fp" not in rerun.stderr, (
+            "round-2 rerun must compare against round 1 (findings=3), not the "
+            f"prior round-2 entry (findings=2); stderr: {rerun.stderr!r}"
+        )
+
+    def test_same_round_rerun_genuine_overcount_still_warns(self, tmp_path):
+        """The rerun path must not silence a REAL desync either."""
+        review = tmp_path / "review"
+        r1 = self._append_round(review, 1, findings=2, fixed=0)
+        assert r1.returncode == 0, f"stderr: {r1.stderr}"
+        r2 = self._append_round(review, 2, findings=2, fixed=3)
+        assert "warning: fixed+fp" in r2.stderr, f"stderr: {r2.stderr!r}"
+        rerun = self._append_round(review, 2, findings=2, fixed=3)
+        assert rerun.returncode == 0, f"stderr: {rerun.stderr}"
+        assert "warning: fixed+fp" in rerun.stderr, (
+            f"fixed+fp=3 > round-1 findings=2 must warn on rerun too; "
+            f"stderr: {rerun.stderr!r}"
+        )
+
+    def test_out_of_order_rerun_baseline_is_highest_prior_round(self, tmp_path):
+        """Codex review #330 r2 (P2): a rerun of an OLDER round appends after
+        newer rounds (history rounds 1,2,3,2) — an append-order reverse scan
+        would baseline round 4 against the trailing round-2 entry instead of
+        round 3. Baseline must be the HIGHEST round < round_num (latest
+        duplicate of it). Both failure directions covered."""
+        # Direction 1: missed real overcount (trailing r2 findings=2 masks
+        # r3 findings=1).
+        review = tmp_path / "missed"
+        for rnd, f, fx in ((1, 3, 0), (2, 2, 3), (3, 1, 2), (2, 2, 3)):
+            r = self._append_round(review, rnd, findings=f, fixed=fx)
+            assert r.returncode == 0, f"stderr: {r.stderr}"
+        r4 = self._append_round(review, 4, findings=0, fixed=2)
+        assert r4.returncode == 0, f"stderr: {r4.stderr}"
+        assert "warning: fixed+fp" in r4.stderr, (
+            "fixed+fp=2 > round-3 findings=1 must warn even after an "
+            f"out-of-order round-2 rerun; stderr: {r4.stderr!r}"
+        )
+        # Direction 2: false warning (trailing r2 findings=2 masks r3
+        # findings=5).
+        review = tmp_path / "false_warn"
+        for rnd, f, fx in ((1, 3, 0), (2, 2, 3), (3, 5, 2), (2, 2, 3)):
+            r = self._append_round(review, rnd, findings=f, fixed=fx)
+            assert r.returncode == 0, f"stderr: {r.stderr}"
+        r4 = self._append_round(review, 4, findings=1, fixed=3)
+        assert r4.returncode == 0, f"stderr: {r4.stderr}"
+        assert "warning: fixed+fp" not in r4.stderr, (
+            "fixed+fp=3 <= round-3 findings=5 must stay silent even after an "
+            f"out-of-order round-2 rerun; stderr: {r4.stderr!r}"
+        )
+
+    def test_corrupt_previous_findings_skips_check_without_crash(self, tmp_path):
+        """Previous entry with non-int findings (legacy/corrupt) — skip the
+        advisory check cleanly instead of crashing or false-warning."""
+        review = tmp_path / "review"
+        review.mkdir(parents=True)
+        state = {
+            "round": 1, "artifact": "test-artifact", "depth": "standard",
+            "started_at": "2026-05-28T00:00:00+00:00", "reviewer": "codex/test",
+            "findings_total": 0, "fixed_total": 0, "false_positives": 0,
+            "history": [
+                {"round": 1, "verdict": "NO-GO", "findings": None,
+                 "fixed": 0, "fp": 0, "timestamp": "2026-05-28T00:00:00+00:00"},
+            ],
+        }
+        (review / "state.json").write_text(json.dumps(state))
+        r2 = self._append_round(review, 2, findings=1, fixed=2)
+        assert r2.returncode == 0, f"stderr: {r2.stderr}"
+        assert "Traceback" not in r2.stderr, f"stderr: {r2.stderr!r}"
+        assert "warning: fixed+fp" not in r2.stderr, (
+            f"non-int baseline → check skipped, no warning; stderr: {r2.stderr!r}"
+        )

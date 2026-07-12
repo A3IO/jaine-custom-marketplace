@@ -360,13 +360,13 @@ Or SSH tunnel (run cdp.py locally): `ssh -L 9222:localhost:9222 kosm4`
 
 ## Logging
 
-All actions → `~/.claude/hooks/bulldozer-look.log`:
+Canonical grammar via the shared helper (`lib/bulldozer_log.py`, #322) → `~/.claude/hooks/bulldozer-look.log` (env override `BULLDOZER_LOOK_LOG`; 5MB rotation to `.1`):
 ```
-2026-05-11T03:30:00+0700 | event=screenshot | channel=cdp | path=/tmp/page.jpg | size=92847
-2026-05-11T03:30:05+0700 | event=js | channel=applescript | expr=document.title
-2026-05-11T03:30:10+0700 | event=open | url=http://localhost:9401
+2026-07-11T09:31:18+07:00 | event=navigate | session=6b48be89 | port=9355 | channel=cdp | url=file:///... | wait=load | elapsed_ms=79 | ok=yes
+2026-07-11T09:31:19+07:00 | event=click | session=6b48be89 | port=9355 | channel=cdp | ref=4781 | trusted=yes
+2026-07-11T09:54:57+07:00 | event=click | session=6b48be89 | port=9399 | ok=no | exit=1
 ```
-Note: `channel=` is present on commands with CDP/AppleScript fallback (screenshot, js, navigate, reload, click, fill, wait). Commands that don't record a channel (open, console, network, pdf, viewport, window) omit it.
+Every line carries `session=` and `port=` (`target=` when `--target` is active) — `/look` (9333) vs `/drive` lanes are attributable. **Redaction (#322 D2):** the log never carries JS source or URL query/fragment/userinfo — `js` (and `assert --js`) logs `expr_len=`/`expr_sha=` (12-hex sha256), `navigate`/`open`/`screenshot` log the URL as origin+path with a `?<redacted>` marker when a query/fragment was dropped (payload-bearing schemes — `data:`/`javascript:`/`blob:`/`view-source:`/unknown — are hashed wholesale), and a `--target` selector containing `?`/`#`/`@` is hashed too (id-prefix and host/path selectors stay readable). Don't mine this log for page parameters — by design they are not there. **Failure contract:** every non-zero exit of a DISPATCHED command appends a final `event=<cmd> | … | ok=no | exit=N` line (unhandled crashes log `exit=crash`), so a dispatched invocation succeeded iff it produced no fail line. Pre-dispatch rejections — unknown command name, malformed global flags (`--target` without a selector) — exit non-zero WITHOUT a line (deliberate: a garbage `event=` token would pollute the vocabulary; stderr carries the diagnostic). Success lines are per-command: `channel=` appears on commands with a CDP/AppleScript fallback (screenshot, js, navigate, reload, click, fill, wait, title) and on `status` (reports the active channel); `normalize-url` logs no success line (internal launch.sh helper — its failures still hit the dispatcher line).
 
 Review: `column -t -s'|' ~/.claude/hooks/bulldozer-look.log`
 

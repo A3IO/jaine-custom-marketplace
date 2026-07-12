@@ -10,6 +10,13 @@ from datetime import datetime, timezone
 VALID_REPLACE_VERDICTS = {"GO", "NO-GO"}
 
 
+def _session_token():
+    """Token-normalized 8-char session id (canonical grammar rule) or NA."""
+    import re
+    sid = re.sub(r"[^A-Za-z0-9_-]", "_", os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
+    return sid[:8] or "NA"
+
+
 def replace_extraction(state_file: Path, round_num: int, k: int, verdict: str) -> int:
     """Update existing history[round=N] entry: set findings=K, verdict=VERDICT,
     clear manual_extraction_pending; delta-correct findings_total.
@@ -108,8 +115,38 @@ def replace_extraction(state_file: Path, round_num: int, k: int, verdict: str) -
             except OSError:
                 pass
         return 1
+    _log_reconciled_line(round_num, k, verdict, state.get("artifact") or "",
+                         target.get("session"))
     print(json.dumps(state, indent=2))
     return 0
+
+
+def _log_reconciled_line(round_num: int, k: int, verdict: str, artifact: str = "",
+                         round_session: "str | None" = None) -> None:
+    """#322 D6: the round's bulldozer.log line stays FROZEN at verdict=UNKNOWN/
+    findings=0 (append-only audit trail) — append a CORRECTION line instead so a
+    naive log miner can detect + supersede the stale entry. Best-effort.
+    round_session = the session recorded on the ORIGINAL round entry (#327 r4):
+    a reconciliation from a resumed session must join to the frozen line's key,
+    not the current environment's. Entries created BEFORE session persistence
+    shipped have no session key — the current-session fallback is the best
+    available proxy (reconciliation almost always runs in the round's own
+    session, right after the wrapper's exit 11) and is accepted (#327 r5)."""
+    try:
+        # canonical helper (lib/bulldozer_log.py): sanitization, rotation, one
+        # writer for the stable log (Copilot #327). append_line never raises.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
+        from bulldozer_log import append_line
+        lf = Path(os.environ.get("BULLDOZER_LOG")
+                  or Path.home() / ".claude" / "hooks" / "bulldozer.log")
+        sid = round_session if isinstance(round_session, str) and round_session else None
+        append_line(lf, "reconciled", session=sid, round=round_num,
+                    artifact=artifact, findings=k, verdict=verdict)
+    except Exception as e:
+        try:  # the warning itself is best-effort — a broken stderr must not turn a
+            print(f"warning: could not write reconciled line: {e}", file=sys.stderr)
+        except Exception:  # successful reconcile into a false failure (#327 r4)
+            pass
 
 
 def main():
@@ -186,8 +223,6 @@ def main():
     if findings < 0 or fixed < 0 or fp < 0:
         print(f"error: counts must be >= 0 (got findings={findings}, fixed={fixed}, fp={fp})", file=sys.stderr)
         sys.exit(1)
-    if fixed + fp > findings:
-        print(f"warning: fixed+fp ({fixed + fp}) exceeds findings ({findings})", file=sys.stderr)
 
     verdict = pos[1]
     artifact = pos[5] if len(pos) > 5 else ""
@@ -226,6 +261,30 @@ def main():
             "history": []
         }
 
+    # #314: fixed/fp are dispositions of the PREVIOUS round's findings
+    # (SKILL.md Step 6 sets BULLDOZER_FIXED when launching round N+1), so the
+    # advisory desync check compares against the previous round's entry —
+    # comparing against the CURRENT round's findings fired on every healthy
+    # converging review (findings 3→2 with 3 fixes). Baseline = the HIGHEST
+    # round < round_num, latest duplicate of it — NOT history[-1] (a re-run
+    # of round N appends a second round-N entry, #330 r1) and NOT the last
+    # appended prior-round entry (a rerun of an OLDER round lands after newer
+    # ones — history rounds 1,2,3,2 — and would shadow round 3, #330 r2).
+    # No such entry (round 1 / fresh state) or a non-int baseline
+    # (legacy/corrupt entry) → nothing to compare, skip silently.
+    prev = None
+    for e in state["history"]:
+        if (isinstance(e, dict)
+                and isinstance(e.get("round"), int)
+                and not isinstance(e.get("round"), bool)
+                and e["round"] < round_num
+                and (prev is None or e["round"] >= prev["round"])):
+            prev = e
+    prev_findings = prev.get("findings") if prev is not None else None
+    if (isinstance(prev_findings, int) and not isinstance(prev_findings, bool)
+            and fixed + fp > prev_findings):
+        print(f"warning: fixed+fp ({fixed + fp}) exceeds previous round's findings ({prev_findings})", file=sys.stderr)
+
     state["round"] = round_num
     state["findings_total"] += findings
     state["fixed_total"] += fixed
@@ -238,6 +297,7 @@ def main():
         "findings": findings,
         "fixed": fixed,
         "fp": fp,
+        "session": _session_token(),  # #327 r4: the reconciled line reuses the ROUND's session
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     if args.manual_extraction_pending:

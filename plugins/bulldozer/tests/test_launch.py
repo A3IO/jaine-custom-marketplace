@@ -1105,3 +1105,88 @@ def test_look_skill_md_resolves_scripts_without_requiring_plugin_root_env():
     # no raw ${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/... invocation may remain:
     assert "${CLAUDE_PLUGIN_ROOT}/skills/look/scripts/" not in skill
     assert 'jq -r .version "$CLAUDE_PLUGIN_ROOT/.claude-plugin/plugin.json"' not in skill
+
+
+# ── #160: the daily profile belongs to port 9333 and to nothing else ──────────
+# The three opt-in gates (automation / insecure / cert-spki) already refuse a profile
+# that resolves to the daily one — but a PLAIN lane (no flag) had no gate at all, so
+# `CDP_PORT=9334 LOOK_PROFILE_DIR=/0/.jaine/.browser/profile` built its KILL_MATCH from
+# the DAILY profile and pkill'ed the user's live browser (the kill is scoped by
+# --user-data-dir, not by port). Gate it unconditionally, at profile-resolution time.
+
+DAILY_PROFILE = "/0/.jaine/.browser/profile"
+
+
+def test_plain_lane_rejects_daily_profile():
+    """#160: a non-9333 lane pointed at the daily profile must fail loud — no flag needed
+    to trip the gate. Left ungated, its pkill match is the daily browser's own argv."""
+    r = _run_launch(env_override={"CDP_PORT": "9334", "LOOK_PROFILE_DIR": DAILY_PROFILE})
+    assert r.returncode != 0, "plain lane on the daily profile must be refused"
+    assert "daily" in r.stderr.lower()
+
+
+def test_plain_lane_rejects_daily_profile_alias():
+    """#160: canonicalized, like the other gates — a trailing slash / '/./' / '//' or a
+    symlink must not sneak the daily profile past the check."""
+    for alias in (DAILY_PROFILE + "/", "/0/.jaine/.browser/./profile",
+                  "/0/.jaine/.browser//profile"):
+        r = _run_launch(env_override={"CDP_PORT": "9334", "LOOK_PROFILE_DIR": alias})
+        assert r.returncode != 0, "daily-profile alias {!r} must fail loud".format(alias)
+        assert "daily" in r.stderr.lower()
+
+
+CASE_ALIASES = ("/0/.JAINE/.browser/profile", "/0/.jaine/.BROWSER/profile",
+                "/0/.jaine/.browser/PROFILE")
+
+
+def _case_alias_is_the_daily_dir():
+    """Is this host actually case-insensitive AND carrying the daily profile? Only there
+    is a case alias the SAME directory — elsewhere it is a distinct (or absent) path and
+    the gate is right to let it through (codex #160 r2, P2: don't assert host state)."""
+    try:
+        return all(os.path.samefile(a, DAILY_PROFILE) for a in CASE_ALIASES)
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not _case_alias_is_the_daily_dir(),
+                    reason="needs the daily profile on a case-insensitive volume")
+def test_plain_lane_rejects_daily_profile_case_alias():
+    """#160 (codex P1, verified live): /0 is case-insensitive APFS — `/0/.JAINE/.browser/
+    profile` IS the daily profile dir on disk, but os.path.realpath does NOT normalize case,
+    so a realpath-only gate compares them unequal and lets the alias through. The gate must
+    compare filesystem IDENTITY (samefile), not canonical strings."""
+    for alias in CASE_ALIASES:
+        r = _run_launch(env_override={"CDP_PORT": "9334", "LOOK_PROFILE_DIR": alias})
+        assert r.returncode != 0, "case alias {!r} must fail loud".format(alias)
+        assert "daily" in r.stderr.lower()
+
+
+def test_plain_lane_rejects_daily_profile_via_symlink(tmp_path):
+    """#160: realpath-based, not string-based — a symlink to the daily profile is the
+    alias the string gates would miss."""
+    link = tmp_path / "sneaky-profile"
+    link.symlink_to(DAILY_PROFILE)
+    r = _run_launch(env_override={"CDP_PORT": "9334", "LOOK_PROFILE_DIR": str(link)})
+    assert r.returncode != 0, "symlink to the daily profile must fail loud"
+    assert "daily" in r.stderr.lower()
+
+
+def test_daily_profile_still_allowed_on_9333():
+    """#160 must not break the daily browser itself: port 9333 + the daily profile is the
+    ONE legitimate pairing, whether derived or passed explicitly."""
+    r = _run_launch()                                            # derived
+    assert r.returncode == 0, "default daily lane broke: {}".format(r.stderr)
+    cfg, _ = _parse_dryrun(r.stdout)
+    assert cfg["profile"] == DAILY_PROFILE
+
+    r = _run_launch(env_override={"CDP_PORT": "9333", "LOOK_PROFILE_DIR": DAILY_PROFILE})
+    assert r.returncode == 0, "explicit daily profile on 9333 must stay allowed: {}".format(r.stderr)
+
+
+def test_isolated_lanes_unaffected_by_the_daily_gate():
+    """#160 regression floor: an ordinary isolated lane (derived or explicit) still launches."""
+    r = _run_launch(env_override={"CDP_PORT": "9334"})           # derived profile-9334
+    assert r.returncode == 0, "derived isolated lane broke: {}".format(r.stderr)
+    r = _run_launch(env_override={"CDP_PORT": "9334", "LOOK_PROFILE_DIR": "/tmp/lane-x"})
+    assert r.returncode == 0, "explicit isolated lane broke: {}".format(r.stderr)

@@ -890,3 +890,30 @@ def test_click_ref_child_frame(jaine_browser):
     cr = run_cdp(["click", "--ref", ref])
     assert cr.returncode == 0
     assert "clicked" in cr.stdout.lower()
+
+
+# ── #322 PR6 D2: log redaction (behavioral proof against a live browser) ──
+
+
+def test_navigate_log_redacts_query_string(test_page_url, tmp_path):
+    """navigate must not persist query/fragment values into the long-lived log."""
+    log = tmp_path / "look.log"
+    r = run_cdp(["navigate", test_page_url + "?bdzsecret=hunter2"],
+                env_override={"BULLDOZER_LOOK_LOG": str(log)})
+    assert r.returncode == 0, r.stderr
+    text = log.read_text()
+    assert "hunter2" not in text, "query value leaked into the log"
+    assert "?<redacted>" in text, "redaction marker missing"
+    assert "event=navigate" in text
+
+
+def test_js_log_hashes_expression(test_page_url, tmp_path):
+    """js must log length+hash of the expression, never its source."""
+    log = tmp_path / "look.log"
+    expr = "'bdzmarker_' + 'hunter2'"
+    r = run_cdp(["js", expr], env_override={"BULLDOZER_LOOK_LOG": str(log)})
+    assert r.returncode == 0, r.stderr
+    text = log.read_text()
+    assert "hunter2" not in text, "JS source leaked into the log"
+    assert "expr_len={}".format(len(expr)) in text
+    assert "expr_sha=" in text

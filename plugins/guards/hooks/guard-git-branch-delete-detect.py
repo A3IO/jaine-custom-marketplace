@@ -12,9 +12,24 @@ hooks/git_lexer.py, while the semantic merge-check is preserved.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
+
+# Cap every git subprocess so a pathological repo context can never hang the hook
+# past Claude Code's 60s budget (#309: a --git-dir/GIT_DIR/env -C context whose HEAD
+# is a writer-less FIFO blocks git's open() forever). Overridable for fast tests.
+_GIT_TIMEOUT_S = float(os.environ.get("GUARD_GIT_TIMEOUT_S", "10"))
+
+
+class _GitTimeout(Exception):
+    """A verification git call exceeded _GIT_TIMEOUT_S (#309).
+
+    Raised out of run_git so main() can fail CLOSED for the matched destructive
+    command: a merely-slow (not hung) repo would let the real branch delete/reset
+    complete and destroy work, so a timeout must block, not allow.
+    """
 
 from git_lexer import (
     tokenize,
@@ -232,25 +247,37 @@ def branch_delete_operands(rest: list[str]) -> list[str] | None:
     delete_seen = False
     operands: list[str] = []
 
-    for tok in rest:
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
         if tok in ("-r", "--remotes"):
             return None
         if tok in ("-d", "-D", "--delete"):
             delete_seen = True
+            i += 1
             continue
         if tok in ("-f", "--force"):
+            i += 1
+            continue
+        if tok in _BRANCH_ARG_OPTS:
+            # required-arg option consumes its value, exactly as the force-move path
+            # does (#309): `git branch -D --sort <key> X` deletes X, not <key>.
+            i += 2
             continue
         if tok.startswith("--"):
+            i += 1
             continue
         if tok.startswith("-"):
             if "r" in tok[1:]:
                 return None
             if "d" in tok or "D" in tok:
                 delete_seen = True
+            i += 1
             continue
 
         if delete_seen:
             operands.append(_strip_heads(tok))
+            i += 1
             continue
         return None
 
@@ -265,6 +292,14 @@ def branch_delete_operands(rest: list[str]) -> list[str] | None:
 _BRANCH_ARG_OPTS = {
     "-u", "--set-upstream-to", "--sort", "--format", "--contains", "--no-contains",
     "--merged", "--no-merged", "--points-at",
+}
+
+# `git branch` modes that only edit tracking config / description — the branch tip is
+# NEVER reset, so `-f` is inert and the command is not a force-move (#309, verified live:
+# `git branch -f -u <u> <b>` leaves <b>'s tip UNCHANGED). Their presence (spaced, glued
+# `--set-upstream-to=`, or the clustered short `-u`, e.g. `-fu`) means "not a force-move".
+_BRANCH_SET_UPSTREAM_MODES = {
+    "-u", "--set-upstream-to", "--unset-upstream", "--edit-description",
 }
 
 
@@ -285,6 +320,8 @@ def branch_force_move_operand(rest: list[str]) -> str | None:
         if tok in ("-d", "-D", "--delete", "-m", "-M", "-c", "-C",
                    "--move", "--copy", "--list", "-l", "-r", "--remotes"):
             return None
+        if tok in _BRANCH_SET_UPSTREAM_MODES or tok.startswith("--set-upstream-to="):
+            return None  # set-upstream/edit mode never resets the tip (#309)
         if tok in ("-f", "--force"):
             force_seen = True
             i += 1
@@ -298,6 +335,8 @@ def branch_force_move_operand(rest: list[str]) -> str | None:
         if tok.startswith("-"):
             if any(ch in "dDmMcClr" for ch in tok[1:]):
                 return None
+            if "u" in tok[1:]:
+                return None  # clustered set-upstream (e.g. -fu <u> <b>) — not a force-move
             if "f" in tok[1:]:
                 force_seen = True
             i += 1
@@ -317,22 +356,34 @@ def force_create_operand(rest: list[str], short: str, long: "str | None") -> str
     `-fBname` — parse-options binds the value to the LAST short opt of a bundle;
     red-team r2, verified live) and, for switch, `--force-create[=NAME]`
     spellings. Returns None when no force-create flag is present (`-b`/plain
-    forms create-or-fail — nothing is lost). Case-sensitive, first-arg-taker-wins:
-    in `-bB feat/x` the lowercase -b binds 'B' as ITS branch name (git creates
+    forms create-or-fail — nothing is lost). Within a bundle it is first-arg-taker-
+    wins: in `-bB feat/x` the lowercase -b binds 'B' as ITS branch name (git creates
     branch B, verified live) — non-forcing, so the scan stops there.
+
+    ACROSS repeated flags it is LAST-wins: git's parse-options resolves a repeated
+    value-flag to the last occurrence (`git checkout -B a -B b` resets b — verified
+    live), so a decoy safe/new first operand must not hide the real last one (#309). A
+    lowercase create flag anywhere (`-b`, or mixed with `-B`) makes git create-or-error
+    and reset nothing — return None.
     """
     flag_char = short[1]
     soft_char = flag_char.lower()
+    last: str | None = None
     i = 0
     while i < len(rest):
         tok = rest[i]
         if long is not None:
             if tok == long:
                 if i + 1 < len(rest):
-                    return _strip_heads(rest[i + 1])
-                return None
+                    last = _strip_heads(rest[i + 1])
+                    i += 2
+                    continue
+                i += 1
+                continue
             if tok.startswith(long + "="):
-                return _strip_heads(tok.split("=", 1)[1])
+                last = _strip_heads(tok.split("=", 1)[1])
+                i += 1
+                continue
         if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
             for pos in range(1, len(tok)):
                 ch = tok[pos]
@@ -341,12 +392,12 @@ def force_create_operand(rest: list[str], short: str, long: "str | None") -> str
                 if ch == flag_char:
                     glued = tok[pos + 1:]
                     if glued:
-                        return _strip_heads(glued)
-                    if i + 1 < len(rest):
-                        return _strip_heads(rest[i + 1])
-                    return None
+                        last = _strip_heads(glued)
+                    elif i + 1 < len(rest):
+                        last = _strip_heads(rest[i + 1])
+                    break
         i += 1
-    return None
+    return last
 
 
 def push_delete_operands(rest: list[str]) -> list[str] | None:
@@ -403,13 +454,22 @@ def run_git(context_args: list[str], *args: str) -> subprocess.CompletedProcess[
     UnicodeDecodeError — that would be swallowed by main()'s fail-open catch and
     silently allow an unmerged-branch delete the guard exists to block.
     """
-    return subprocess.run(
-        ["git", *context_args, *args],
-        capture_output=True,
-        text=True,
-        errors="replace",
-        check=False,
-    )
+    argv = ["git", *context_args, *args]
+    try:
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        # A context/repo that never yields in time (FIFO HEAD, or a genuinely slow
+        # repo, #309) must not stall the hook. Surface it so main() fails CLOSED for
+        # the matched destructive command — allowing here would let a slow-but-valid
+        # check pass while the real branch delete/reset destroys unmerged work.
+        raise _GitTimeout
 
 
 def _git_ok(context_args: list[str], *args: str) -> bool:
@@ -427,6 +487,17 @@ def block_unverifiable_operand(branch: str) -> None:
     print(f"BLOCKED: cannot verify branch operand '{branch}' before deletion.", file=sys.stderr)
     print("Use literal branch names so the guard can check git history.", file=sys.stderr)
     print("If you already verified this is safe, re-run prefixed:", file=sys.stderr)
+    print("  GUARD_BRANCH_DELETE_OK=1 <same command>", file=sys.stderr)
+    sys.exit(2)
+
+
+def block_verify_timed_out(branch: str) -> None:
+    print(
+        f"BLOCKED: could not verify branch '{branch}' within {_GIT_TIMEOUT_S:.0f}s "
+        "(git check timed out).",
+        file=sys.stderr,
+    )
+    print("Retry once the repository responds, or if you verified this is safe:", file=sys.stderr)
     print("  GUARD_BRANCH_DELETE_OK=1 <same command>", file=sys.stderr)
     sys.exit(2)
 
@@ -610,7 +681,11 @@ def main() -> None:
         for br in operands:
             if "$" in br:
                 block_unverifiable_operand(br)
-            if check_branch_delete(br, context_args):
+            try:
+                unsafe = check_branch_delete(br, context_args)
+            except _GitTimeout:
+                block_verify_timed_out(br)  # matched destructive, unverifiable -> fail closed
+            if unsafe:
                 sys.exit(2)
 
     sys.exit(0)

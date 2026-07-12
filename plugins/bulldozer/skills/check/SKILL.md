@@ -58,7 +58,7 @@ If the snippet exits non-zero, tell the user to check `codex --version` and `cod
 **1c. Ask user** — via AskUserQuestion, show 4 models. Selection rules (in order):
 1. **ALWAYS** include current global model from `~/.codex/config.toml` (line 1: `model = "..."`)
 2. **ALWAYS** include last used model from `.bulldozer/config.md` (if different from global)
-3. Fill remaining slots from: gpt-5.5, gpt-5.3-codex-spark, gpt-5.4-mini (skip gpt-5.4 and gpt-5.3-codex — redundant)
+3. Fill remaining slots from: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna (skip gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex-spark — superseded by the 5.6 line)
 4. If global = last used, you get 3 slots for the above
 
 This guarantees the user's configured model is never hidden by priority sorting.
@@ -512,7 +512,7 @@ A bare `GO` line (without the LEDGER_PATCH block) is auto-synthesized by the par
 schema: review-ledger/v1
 artifact: "path/to/artifact"
 depth: standard
-model: gpt-5.5
+model: gpt-5.6-sol
 rounds:
   - round: 1
     date: "2026-05-12"
@@ -585,10 +585,19 @@ findings:
 
 **Deterministic log file:** `~/.claude/hooks/bulldozer.log`
 
-Every round appends one line (append-only, never truncated):
+Four line shapes share the file, discriminated by `event=` (#322 PR4):
+
 ```
-2026-05-09T10:30:00+03:00 | session=bf5a38d6 | round=1 | artifact=docs/specs/auth.md | verdict=NO-GO | findings=8 | fixed=7 | fp=1 | reviewer=codex/gpt-5.5 | project=/path/to/repo
+2026-07-11T12:30:00+07:00 | event=round | session=bf5a38d6 | round=1 | artifact=docs/specs/auth.md | verdict=NO-GO | findings=8 | fixed=7 | fp=1 | reviewer=codex/gpt-5.6-sol | depth=standard | duration_s=42 | project=/path/to/repo
+2026-07-11T12:29:03+07:00 | event=invoke | session=bf5a38d6 | round=0 | artifact= | verdict= | findings=0 | fixed=0 | fp=0 | reviewer= | project=/path/to/repo
+2026-07-11T12:31:10+07:00 | event=wrapper-fail | session=bf5a38d6 | round=1 | artifact=docs/specs/auth.md | reviewer=codex/gpt-5.6-sol | depth=standard | exit=71 | reason=codex exec crashed ...
+2026-07-11T12:40:00+07:00 | event=reconciled | session=bf5a38d6 | round=1 | findings=4 | verdict=NO-GO
 ```
+
+- `event=round` — one per completed round (append-only, never truncated). `depth=` is recorded here; `duration_s=` is the codex exec wall-clock when the wrapper measured it. `reviewer=` is canonically `codex/<model>` (a bare model id gets the prefix).
+- `event=invoke` — the lean start-marker from the UserPromptSubmit hook (#318); empty payload fields by design.
+- `event=wrapper-fail` — every wrapper/parser STOP (exit 2-5, 64, 70, 71) leaves this durable trace (previously stderr-only — the gap-class #320 closed for the MCP server).
+- `event=reconciled` — appended by `update-state.py --mode=replace-extraction`: the original round line stays FROZEN at `verdict=UNKNOWN | findings=0` (append-only trail), this correction line carries the reconciled count/verdict so miners supersede, not trust, the frozen line.
 
 To review history: `column -t -s'|' ~/.claude/hooks/bulldozer.log`
 
@@ -598,7 +607,7 @@ Optional `.bulldozer/config.md` in project root:
 
 ```yaml
 ---
-reviewer_model: gpt-5.5
+reviewer_model: gpt-5.6-sol
 audit_model: sonnet
 ---
 ```

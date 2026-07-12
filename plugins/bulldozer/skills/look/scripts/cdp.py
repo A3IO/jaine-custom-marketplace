@@ -67,8 +67,9 @@ target id, its 12-char prefix (as shown by `tabs`/`status`), or a url substring.
 Requires the CDP/websocket channel (the AppleScript fallback drives the active tab).
 Log: ~/.claude/hooks/bulldozer-look.log
 """
-import json, sys, os, time, base64, subprocess
+import json, sys, os, time, base64, hashlib, subprocess
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen
 from urllib.error import URLError
 
@@ -82,7 +83,8 @@ except ValueError:
     sys.exit(1)
 
 CDP_BASE = "http://localhost:{}".format(CDP_PORT)
-LOG_FILE = os.path.expanduser("~/.claude/hooks/bulldozer-look.log")
+LOG_FILE = os.environ.get("BULLDOZER_LOOK_LOG") or os.path.expanduser(
+    "~/.claude/hooks/bulldozer-look.log")
 # SP1 (#164): AppleScript/Quartz app name. Drive lanes set "Google Chrome for
 # Testing"; default stays the stock daily browser. All 9 callsites read this symbol.
 # Same guard launch.sh applies: the name is spliced into AppleScript string
@@ -96,16 +98,83 @@ if any(c in CHROME_APP for c in ('"', "\\", "\n")):
 TARGET = None
 
 # --- Logging ---
+# Canonical grammar via the shared helper (#322 PR1). On import failure the line is
+# DROPPED (one warning) — never appended raw, so unsanitized/multiline records can't
+# re-enter the log (spec: 2026-07-11-bulldozer-log-grammar-design.md).
+_PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.realpath(__file__)))))  # realpath: survive symlinked skill dirs
+sys.path.insert(0, os.path.join(_PLUGIN_ROOT, "lib"))
+try:
+    from bulldozer_log import append_line as _append_line
+except Exception:  # ANY import-time failure (SyntaxError incl.) — /look must stay usable
+    _append_line = None
+_HELPER_WARNED = False
+
 
 def log(event, **kw):
+    global _HELPER_WARNED
+    if _append_line is None:
+        if not _HELPER_WARNED:
+            print("warning: bulldozer_log helper unavailable — log line dropped",
+                  file=sys.stderr)
+            _HELPER_WARNED = True
+        return
+    fields = {"port": CDP_PORT}
+    if TARGET is not None:
+        fields["target"] = _redact_target(TARGET)
+    fields.update(kw)
+    _append_line(LOG_FILE, event, **fields)
+
+
+# D2 (#322): the log is long-lived and unencrypted — JS source and URL
+# query/fragment/userinfo carry secrets (tokens, basic-auth), so log() values
+# for them are redacted at the call site: JS → length+hash, URL → origin+path.
+
+
+def _sha12(text):
+    # surrogatepass: undecodable argv bytes arrive as lone surrogates
+    # (surrogateescape) — strict utf-8 would raise mid-log and turn a
+    # completed command into an exit=crash (codex #329 r1)
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+
+
+# Schemes whose path part is location, not payload. data:/javascript:/blob:
+# (and anything unknown) carry the document/script itself in .path; view-source:
+# nests a FULL url (incl. userinfo/query) in .path — all hashed wholesale,
+# never logged verbatim (codex #329 r1+r2).
+_LOCATION_SCHEMES = frozenset((
+    "", "http", "https", "file", "ws", "wss", "about", "chrome",
+    "chrome-extension", "devtools",
+))
+
+
+def _redact_target(sel):
+    """--target may be a URL substring — ?/#/@ mark query/fragment/userinfo
+    territory where secrets live; such selectors are hashed wholesale (codex
+    #329 r3). Id-prefixes and host/path substrings (the common cases) stay
+    readable."""
+    if any(c in sel for c in "?#@"):
+        return "<redacted:len={},sha={}>".format(len(sel), _sha12(sel))
+    return sel[:120]
+
+
+def _redact_url(url):
+    """scheme://host:port/path survives (minable); userinfo, query and fragment
+    are dropped — one `?<redacted>` marker records that something was there.
+    Scheme-relative strings (about:blank) round-trip unchanged."""
     try:
-        parts = [time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event={}".format(event)]
-        parts.extend("{}={}".format(k, v) for k, v in kw.items())
-        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-        with open(LOG_FILE, "a") as f:
-            f.write(" | ".join(parts) + "\n")
-    except OSError:
-        pass
+        parts = urlsplit(url)
+    except ValueError:
+        return "unparseable:len={}".format(len(url))
+    if parts.scheme.lower() not in _LOCATION_SCHEMES:
+        return "{}:<redacted:len={},sha={}>".format(parts.scheme, len(url), _sha12(url))
+    netloc = parts.netloc.rpartition("@")[2]  # strip user:pass@
+    base = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    if parts.query or parts.fragment:
+        # marker appended AFTER the cap so truncation can't eat it — a
+        # redacted-query URL must stay distinguishable from a long path
+        return base[:109] + "?<redacted>"
+    return base[:120]
 
 # --- Channel detection ---
 
@@ -526,14 +595,19 @@ def cmd_status(args):
         len(pages), CDP_PORT, ws, channel()))
     for t in pages:
         print("  {} {}".format(t["id"][:12], t.get("url", "?")[:80]))
+    log("status", tabs=len(pages), channel=channel())
     return 0
 
 def cmd_tabs(args):
-    tabs = cdp_get("/json/list") or []
-    for t in tabs:
-        if t.get("type") == "page":
-            print("{}  {:40s}  {}".format(
-                t["id"][:12], t.get("title", "?")[:40], t.get("url", "?")[:60]))
+    tabs = cdp_get("/json/list")
+    if tabs is None:  # unreachable ≠ zero tabs — fail like cmd_status (#324 r3)
+        print("ERROR: Browser not running on CDP port " + str(CDP_PORT), file=sys.stderr)
+        return 1
+    pages = [t for t in tabs if t.get("type") == "page"]
+    for t in pages:
+        print("{}  {:40s}  {}".format(
+            t["id"][:12], t.get("title", "?")[:40], t.get("url", "?")[:60]))
+    log("tabs", count=len(pages))
 
 def _image_dimensions(path):
     """Read W×H from a JPEG or PNG file by parsing its header. Returns (w, h) or None.
@@ -707,7 +781,7 @@ def cmd_screenshot(args):
         img = base64.b64decode(data)
         with open(path, "wb") as f:
             f.write(img)
-        log("screenshot", channel="cdp", path=path, size=len(img), url=tab.get("url", "?")[:80], clip=bool(clip), scale=scale_override, bind=bind)
+        log("screenshot", channel="cdp", path=path, size=len(img), url=_redact_url(tab.get("url", "?")), clip=bool(clip), scale=scale_override, bind=bind)
         if bind:
             # Bind the capture to its navigation: final URL + loaderId + wall-clock,
             # read over the SAME ws_url as the capture (no tab drift). The loaderId
@@ -796,7 +870,7 @@ def cmd_js(args):
                 desc = (r.get("result", {}).get("result", {}) or {}).get("description",
                     (r.get("result", {}).get("result", {}) or {}).get("type", "undefined"))
                 print(desc)
-            log("js", channel="cdp", ref=ref_val, expr=expr[:80])
+            log("js", channel="cdp", ref=ref_val, expr_len=len(expr), expr_sha=_sha12(expr))
             return 0
         except (websocket.WebSocketException, json.JSONDecodeError, OSError) as e:
             print("WebSocket I/O error: {}".format(e), file=sys.stderr)
@@ -823,7 +897,7 @@ def cmd_js(args):
             print(val if isinstance(val, str) else json.dumps(val, ensure_ascii=False))
         else:
             return 1
-    log("js", channel=channel(), expr=expr[:80])
+    log("js", channel=channel(), expr_len=len(expr), expr_sha=_sha12(expr))
     return 0
 
 def normalize_url(url):
@@ -911,7 +985,7 @@ def cmd_navigate(args):
         else:
             if not as_navigate(url):
                 return 1
-        log("navigate", channel=channel(), url=url[:80])
+        log("navigate", channel=channel(), url=_redact_url(url))
         print("Navigated to " + url)
         return 0
 
@@ -923,26 +997,28 @@ def cmd_navigate(args):
     tab = get_tab(TARGET)
     res = ws_navigate_and_wait(tab["webSocketDebuggerUrl"], url, wait_event, timeout_s)
     if res is None:
-        log("navigate", channel="cdp", url=url[:80], wait=wait_event,
-            ok="transport_fail")
+        # ok= is a strict yes/no vocabulary (dispatcher contract); the detail
+        # rides in reason= (Copilot #329 — was ok="transport_fail")
+        log("navigate", channel="cdp", url=_redact_url(url), wait=wait_event,
+            ok="no", reason="transport_fail")
         return 1
     # Verdict markers go to STDOUT (review pack C: one grammar for the whole
     # verify-core — stdout carries the machine-readable verdict, stderr only
     # tool errors).
     if not res["ok"]:
         print("NAVIGATE_FAIL: {}".format(res["reason"]))
-        log("navigate", channel="cdp", url=url[:80], wait=wait_event, ok="no")
+        log("navigate", channel="cdp", url=_redact_url(url), wait=wait_event, ok="no")
         return 1
     final_url = res["final_url"]
     if expect_url is not None and expect_url not in final_url:
         print("NAVIGATE_URL_MISMATCH: expected '{}' in '{}'".format(
             expect_url, final_url))
-        log("navigate", channel="cdp", url=url[:80], wait=wait_event,
+        log("navigate", channel="cdp", url=_redact_url(url), wait=wait_event,
             ok="no", mismatch="yes")
         return 1
     print("Navigated to {} ({} fired in {}ms, loader={})".format(
         final_url, wait_event, res["elapsed_ms"], res["loader_id"] or "?"))
-    log("navigate", channel="cdp", url=url[:80], wait=wait_event,
+    log("navigate", channel="cdp", url=_redact_url(url), wait=wait_event,
         elapsed_ms=res["elapsed_ms"], ok="yes")
     return 0
 
@@ -961,7 +1037,7 @@ def cmd_open(args):
         print("ERROR: could not open tab", file=sys.stderr)
         return 1
     print("Opened {} in tab {}".format(url, r.get("id", "?")[:12]))
-    log("open", url=url[:80])
+    log("open", url=_redact_url(url))
     return 0
 
 def cmd_title(args):
@@ -974,6 +1050,7 @@ def cmd_title(args):
     else:
         val = as_js_main_world("document.title")
         print(val or "?")
+    log("title", channel=channel())
     return 0
 
 def cmd_html(args):
@@ -982,7 +1059,11 @@ def cmd_html(args):
         result = cdp_js("document.documentElement.outerHTML", tab["webSocketDebuggerUrl"])
         if result is None:
             return 1
-        print(result.get("value", ""))
+        html = result.get("value", "")
+        print(html)
+        # encoded size, not chars; "replace" matches stdout's error policy — a lone
+        # UTF-16 surrogate from CDP must not crash the size accounting (#324 P2 ×2)
+        log("html", bytes=len(html.encode("utf-8", "replace")))
     else:
         print("ERROR: html requires websocket-client (too large for AppleScript bridge)", file=sys.stderr)
         return 1
@@ -1314,6 +1395,7 @@ def cmd_assert(args):
         else:
             ref_pred = "return true;"
             what = "present-ref: ref={}".format(ref_val)
+        what_log = what  # ref labels carry no user JS — log as-is (D2 parity)
 
         tab = get_tab(TARGET)
         import websocket
@@ -1382,7 +1464,7 @@ def cmd_assert(args):
                             print("ASSERT_PASS {} held {}ms (total {}ms{})".format(
                                 what, int(held_ms), total,
                                 ", flapped {}x first".format(flaps) if flaps else ""))
-                            log("assert", what=what[:60], result="pass",
+                            log("assert", what=what_log[:60], result="pass",
                                 held_ms=int(held_ms), flaps=flaps)
                             return 0
                     else:
@@ -1406,7 +1488,7 @@ def cmd_assert(args):
             reason = "true but held only {}ms < stable {}ms at timeout".format(
                 int(longest_ms), stable_ms)
         print("ASSERT_FAIL {} — {}".format(what, reason))
-        log("assert", what=what[:60], result="fail", flaps=flaps)
+        log("assert", what=what_log[:60], result="fail", flaps=flaps)
         return 1
     if not args:
         print("Usage: cdp.py assert [--js] EXPR_OR_SELECTOR [--visible|--actionable] "
@@ -1440,6 +1522,9 @@ def cmd_assert(args):
     else:
         expr = "!!document.querySelector({})".format(json.dumps(selector))
         what = "present: " + selector
+    # D2 (#322): --js `what` carries user JS source — the log gets a hashed twin;
+    # selectors are not secret-bearing and stay readable. stdout keeps `what`.
+    what_log = "js:len={},sha={}".format(len(selector), _sha12(selector)) if is_js else what
 
     tab = get_tab(TARGET)
     import websocket
@@ -1497,7 +1582,7 @@ def cmd_assert(args):
                         print("ASSERT_PASS {} held {}ms (total {}ms{})".format(
                             what, int(held_ms), total,
                             ", flapped {}x first".format(flaps) if flaps else ""))
-                        log("assert", what=what[:60], result="pass",
+                        log("assert", what=what_log[:60], result="pass",
                             held_ms=int(held_ms), flaps=flaps)
                         return 0
                 else:
@@ -1521,7 +1606,7 @@ def cmd_assert(args):
         reason = "true but held only {}ms < stable {}ms at timeout".format(
             int(longest_ms), stable_ms)
     print("ASSERT_FAIL {} — {}".format(what, reason))
-    log("assert", what=what[:60], result="fail", flaps=flaps)
+    log("assert", what=what_log[:60], result="fail", flaps=flaps)
     return 1
 
 def cmd_reload(args):
@@ -2540,8 +2625,28 @@ def main(argv):
     if TARGET is not None and not has_websocket():
         print("ERROR: --target requires the CDP/websocket channel (the AppleScript/native "
               "fallback drives the active tab and cannot honor a target id)", file=sys.stderr)
+        log(cmd, ok="no", exit=1)
         return 1
-    return COMMANDS[cmd](rest[1:]) or 0
+    # B6 (#322): every non-zero exit of a dispatched command leaves a durable
+    # trace — success is inferable from the absence of a fail line. get_tab()
+    # and friends fail loud via sys.exit, so SystemExit must be caught here or
+    # those terminations would bypass the guarantee (codex review #324 P1).
+    try:
+        rc = COMMANDS[cmd](rest[1:]) or 0
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else 1
+        if rc != 0:
+            log(cmd, ok="no", exit=rc)
+        raise
+    except KeyboardInterrupt:
+        log(cmd, ok="no", exit="interrupted")  # Ctrl-C mid-command still leaves a trace
+        raise
+    except Exception:
+        log(cmd, ok="no", exit="crash")  # unhandled crash still leaves a trace
+        raise  # traceback behavior unchanged
+    if rc != 0:
+        log(cmd, ok="no", exit=rc)
+    return rc
 
 
 if __name__ == "__main__":

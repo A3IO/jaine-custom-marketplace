@@ -55,7 +55,7 @@ Claude не принимает видео и не слышит аудио — Ge
 11. **Gemini недетерминирован в языке ответа** — форсить «ответь на русском» в промпте, если нужен RU.
 12. **MCP reload:** `/reload-plugins` подхватывает изменения MCP-сервера в живую сессию (полный релогин не нужен). Но изменения кода сервера требуют переподключения сервера (рестарт процесса).
 13. **jaine-plugins = worktree-доктрина.** Плагин на ветке `jaine-media/main` (worktree), НЕ на main-хабе. `create-plugin.sh` ПУШИТ к A3IO + триггерит CI (outward!) — публиковать только по явной команде через `publish-plugin.sh`.
-14. **git-hook: прямые коммиты в `jaine-media/main` ЗАПРЕЩЕНЫ** (PR-only doctrine). Коммить в feature-ветку `jaine-media/feat/*` (хук сам предлагает manual `git checkout -b jaine-media/feat/...`). Текущая работа на `jaine-media/feat/initial-scaffold` (локально, без push). НЕ обходить `--no-verify` (это safeguard, не препятствие). Мёрдж feat→main — через PR (`create-pr.sh`) при созревании/публикации.
+14. **git-hook: прямые коммиты в `jaine-media/main` ЗАПРЕЩЕНЫ** (PR-only doctrine). Коммить в feature-ветку `jaine-media/feat/*` (хук сам предлагает manual `git checkout -b jaine-media/feat/...`). Scaffold отгружен (ветка запушена и влита; worktree на `jaine-media/main`) — текущая работа идёт per-issue ветками `jaine-media/feat/*` → PR. НЕ обходить `--no-verify` (это safeguard, не препятствие). Мёрдж feat→main — через PR (`create-pr.sh`) при созревании/публикации.
 
 ## Спайк-результаты (де-рисковано, см. `reference/`)
 

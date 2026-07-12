@@ -1167,16 +1167,29 @@ def test_logging_never_raises_when_log_unwritable(tmp_path, monkeypatch):
 
 
 def test_consult_hook_is_lean_marker():
-    """The UserPromptSubmit consult hook writes a lean start-marker — no always-empty
+    """The UserPromptSubmit consult invoke-line is a lean start-marker — no always-empty
     verdict=/tokens=/model= fields (the substantive completion line is written by
-    consult_panel.py now, so the hook only records that an invocation started)."""
+    consult_panel.py now, so the hook only records that an invocation started).
+    #318: the line template moved from an inline hooks.json command into
+    hooks/log_skill_invoke.py (matcher is ignored on UserPromptSubmit)."""
+    import importlib.util
+
     hooks = json.loads((PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
     ups = hooks["hooks"]["UserPromptSubmit"]
-    consult = next(h for h in ups if "bulldozer:consult" in h["matcher"])
-    cmd = consult["hooks"][0]["command"]
-    assert "event=consult-invoke" in cmd
-    for empty in ("verdict=", "tokens=", "model="):
-        assert empty not in cmd, f"lean marker must drop always-empty {empty!r}"
+    assert any(
+        "log_skill_invoke.py" in h["command"] for entry in ups for h in entry["hooks"]
+    ), "UserPromptSubmit must wire the invoke-logger script"
+    spec = importlib.util.spec_from_file_location(
+        "log_skill_invoke", PLUGIN_ROOT / "hooks" / "log_skill_invoke.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    log_name, event, payload = mod.FORMATS["consult"]
+    assert event == "consult-invoke"
+    kv = payload("/some/project")
+    for empty in ("verdict", "tokens", "model"):
+        assert empty not in kv, f"lean marker must drop always-empty {empty!r}"
+    assert kv == {"project": "/some/project"}  # marker payload stays lean (#318)
 
 
 # ── dogfood findings: isolation/robustness fixes (P0+P1) ──
@@ -1475,6 +1488,30 @@ def test_skill_md_all_verdict_prompts_anchored():
     instruct the anchored `VERDICT:` line — the old prose `Verdict: GO / NO-GO`
     drifts from the classifier."""
     assert "Verdict: GO / NO-GO / MINOR-FIXES" not in _SKILL_MD
+
+
+def test_skill_md_web_panel_requires_background_execution():
+    """#313: --web panels routinely run 600–660 s wall-clock (per-model 600 s
+    timeout + the SERIAL research-compressor + summarizer after the triad),
+    colliding with Claude Code's hard 10-min foreground Bash cap (SIGKILL at
+    600 s). SKILL.md must instruct backgrounding for --web and must not
+    undersell the web lane as fitting a foreground call."""
+    assert "run_in_background" in _SKILL_MD
+    assert "(research runs ~3 min)" not in _SKILL_MD  # the undersell behind #313
+
+
+def test_skill_md_routes_research_requests_away():
+    """#260: every consult cell wraps the question in critique (find-holes) or
+    verdict framing — a 'find papers / search and return results' request gets
+    its QUERY critiqued (the literal max-8-points holes list), not executed.
+    SKILL.md must carry the routing note so consumers stop expecting a search
+    runner (verified live: agy leg, zero tool calls, prompt critique only).
+    The frontmatter must not re-invite what the body excludes: the bare
+    'search the web' trigger routed raw research requests INTO consult before
+    the body was ever read (codex review #331 r2)."""
+    assert "NOT a research runner" in _SKILL_MD
+    assert "'search the web'" not in _SKILL_MD
+    assert "Do NOT use for literature/paper search" in _SKILL_MD
 
 
 # ── #142 cleanup: model-descriptor registry ──
@@ -2096,3 +2133,105 @@ def test_wrap_web_verdict_keeps_verdict_tail_last():
     assert w.rstrip().endswith("VERDICT: MINOR-FIXES")   # anchored verdict line intact
     assert "search the web" in w.lower()                  # still invites research
     assert "cite" in w.lower()                            # still asks to cite (moved to header)
+
+
+# ── #322 PR3: per-leg outcomes, resolved model ids, legtimes, error-path logging ──
+
+
+def test_completion_line_survivors_ratio_and_failures():
+    panel.run_panel("Q", runner=_make_fake_runner([], fail={"grok"}))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "survivors=2/3" in line, line
+    assert "failures=Grok:simulated_failure" in line, line
+
+
+def test_completion_line_all_ok_has_full_ratio_and_empty_failures():
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "survivors=3/3" in line and "failures= " in line + " ", line
+
+
+def test_completion_line_carries_resolved_model_ids():
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "agy_model=" in line, line          # _AGY_MODEL, sanitized
+    assert "codex_effort=medium" in line, line  # the silent build_codex_cmd default
+
+
+def test_completion_line_has_per_leg_times():
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert re.search(r"legtimes=[A-Za-z]+:\d+\.\d+", line), line
+
+
+def test_main_repo_validation_error_still_logs_error_line(tmp_path):
+    rc = panel.main(["Q", "--repo", str(tmp_path / "missing")],
+                    runner=_make_fake_runner([]))
+    assert rc == 2
+    assert panel.CONSULT_LOG.exists(), "pre-run_panel exceptions must leave an ERROR line"
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "verdict=ERROR" in line, line
+
+
+def test_log_write_failure_warns_on_stderr(monkeypatch, capsys):
+    monkeypatch.setattr(panel, "_LOG_WARNED", False, raising=False)  # once-per-process flag
+    monkeypatch.setattr(panel, "CONSULT_LOG",
+                        panel.Path("/nonexistent-root/x/consult.log"), raising=False)
+    panel.run_panel("Q", runner=_make_fake_runner([]))  # must not raise
+    assert "could not write consult log" in capsys.readouterr().err
+
+
+def test_session_field_normalized(monkeypatch):
+    # adversarial env session must not split the pipe grammar or leak raw bytes:
+    # token-normalize ([^A-Za-z0-9_-] → _) THEN [:8] → 'x___bad-'
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "x |\nbad-session-value")
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    lines = panel.CONSULT_LOG.read_text().splitlines()
+    assert len(lines) == 1, lines
+    assert "| session=x___bad- |" in lines[0], lines[0]
+
+
+def test_log_write_failure_with_broken_stderr_never_raises(monkeypatch):
+    # detached process: stderr closed → the warning itself must not escape (#326 r2)
+    class Broken:
+        def write(self, *_):
+            raise ValueError("stderr closed")
+        def flush(self):
+            raise ValueError("stderr closed")
+
+    monkeypatch.setattr(panel, "CONSULT_LOG",
+                        panel.Path("/nonexistent-root/x/consult.log"), raising=False)
+    monkeypatch.setattr(panel.sys, "stderr", Broken())
+    out, ok = panel.run_panel("Q", runner=_make_fake_runner([]))  # must not raise
+    assert ok
+
+
+def test_log_write_warning_fires_once_per_process(monkeypatch, capsys):
+    monkeypatch.setattr(panel, "CONSULT_LOG",
+                        panel.Path("/nonexistent-root/x/consult.log"), raising=False)
+    monkeypatch.setattr(panel, "_LOG_WARNED", False, raising=False)
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    assert capsys.readouterr().err.count("could not write consult log") == 1
+
+
+def test_pre_run_error_record_keeps_full_schema(tmp_path):
+    panel.main(["Q", "--repo", str(tmp_path / "missing")], runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "survivors=0/0" in line and "failures=" in line and "legtimes=" in line, line
+
+
+def test_cli_validation_failure_still_logs_error_line(monkeypatch):
+    monkeypatch.setattr(panel, "_LOG_WARNED", False, raising=False)
+    import pytest as _pytest
+    with _pytest.raises(SystemExit):
+        panel.main(["Q", "--web", "nonexistent-model"], runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "verdict=ERROR" in line and "survivors=0/0" in line, line
+
+
+def test_help_exit_writes_no_error_line():
+    import pytest as _pytest
+    with _pytest.raises(SystemExit):
+        panel.main(["-h"], runner=_make_fake_runner([]))
+    assert not panel.CONSULT_LOG.exists(), "help is a successful exit, not telemetry"

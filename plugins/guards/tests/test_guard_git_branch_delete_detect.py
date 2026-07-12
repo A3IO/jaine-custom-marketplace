@@ -973,15 +973,16 @@ def test_branch_force_move_merged_allowed(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_branch_force_move_upstream_flag_eats_arg(tmp_path: Path) -> None:
-    """#299: `-u <upstream>` consumes its argument — the branch operand is the
-    first REAL positional, not the upstream ref."""
+def test_branch_force_move_upstream_flag_not_a_force_move(tmp_path: Path) -> None:
+    """#309 (corrects #299): `-u <upstream>` puts `git branch` in set-upstream mode —
+    the branch tip is never reset regardless of `-f` (verified UNCHANGED live), so this
+    is NOT a force-move and must be allowed. The prior test pinned the false-block."""
     repo, env = _make_multi_orphan_repo(tmp_path)
     _make_unmerged_branch(repo, env, "feat/fmup")
 
     result = _run_hook(repo, env, "git branch -f -u prodx/main feat/fmup")
 
-    assert result.returncode == 2, result.stderr
+    assert result.returncode == 0, result.stderr
 
 
 def test_branch_force_rename_out_of_scope_allowed(tmp_path: Path) -> None:
@@ -1373,6 +1374,122 @@ def test_local_branch_literally_named_heads_blocks(tmp_path: Path) -> None:
     assert result.returncode == 2, result.stderr
 
 
+# --- #309 multi-angle review findings -------------------------------------------------
+
+def test_checkout_force_create_repeated_last_wins_blocks(tmp_path: Path) -> None:
+    """#309: git resolves a repeated `-B` to the LAST occurrence — a decoy safe/new
+    first operand must not hide the genuinely-unmerged last one."""
+    repo, env = _make_multi_orphan_repo(tmp_path)
+    _make_unmerged_branch(repo, env, "feat/last")
+
+    result = _run_hook(repo, env, "git checkout -B totally-new-safe -B feat/last")
+
+    assert result.returncode == 2, result.stderr
+
+
+def test_checkout_force_create_repeated_glued_last_wins_blocks(tmp_path: Path) -> None:
+    """#309: the glued `-Bname` repeated form resolves to the last occurrence too."""
+    repo, env = _make_multi_orphan_repo(tmp_path)
+    _make_unmerged_branch(repo, env, "feat/lastglue")
+
+    result = _run_hook(repo, env, "git checkout -Btotally-new-safe -Bfeat/lastglue")
+
+    assert result.returncode == 2, result.stderr
+
+
+def test_switch_force_create_repeated_last_wins_blocks(tmp_path: Path) -> None:
+    """#309: switch's `-C` repeated form is the checkout twin."""
+    repo, env = _make_multi_orphan_repo(tmp_path)
+    _make_unmerged_branch(repo, env, "feat/lastsw")
+
+    result = _run_hook(repo, env, "git switch -C totally-new-safe -C feat/lastsw")
+
+    assert result.returncode == 2, result.stderr
+
+
+def test_switch_long_force_create_repeated_last_wins_blocks(tmp_path: Path) -> None:
+    """#309: repeated `--force-create=` resolves to the last occurrence."""
+    repo, env = _make_multi_orphan_repo(tmp_path)
+    _make_unmerged_branch(repo, env, "feat/lastlong")
+
+    result = _run_hook(
+        repo, env,
+        "git switch --force-create=totally-new-safe --force-create=feat/lastlong",
+    )
+
+    assert result.returncode == 2, result.stderr
+
+
+def test_force_create_repeated_last_operand_fresh_branch_allowed(tmp_path: Path) -> None:
+    """#309 last-wins the other direction: when the LAST `-B` targets a fresh branch
+    git resets nothing, even though an earlier `-B` named an unmerged branch — ALLOW."""
+    repo, env = _make_multi_orphan_repo(tmp_path)
+    _make_unmerged_branch(repo, env, "feat/decoy")
+
+    result = _run_hook(repo, env, "git checkout -B feat/decoy -B totally-fresh")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_branch_set_upstream_glued_not_a_force_move_allowed(tmp_path: Path) -> None:
+    """#309: `--set-upstream-to=<u>` puts branch in set-upstream mode — the tip is never
+    reset regardless of `-f` (verified UNCHANGED live), so it is not a force-move."""
+    repo, env = _make_multi_orphan_repo(tmp_path)
+    _make_unmerged_branch(repo, env, "feat/suglue")
+
+    result = _run_hook(repo, env, "git branch --force --set-upstream-to=prodx/main feat/suglue")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_branch_unset_upstream_with_force_allowed(tmp_path: Path) -> None:
+    """#309: `--unset-upstream` with `-f` only edits tracking config — non-destructive."""
+    repo, env = _make_multi_orphan_repo(tmp_path)
+    _make_unmerged_branch(repo, env, "feat/unsetup")
+
+    result = _run_hook(repo, env, "git branch -f --unset-upstream feat/unsetup")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_branch_delete_sort_arg_not_misread_as_operand(tmp_path: Path) -> None:
+    """#309: in delete mode `--sort <key>` consumes its value (verified live); a local
+    unmerged branch that shares the key's name must not be read as a delete operand."""
+    repo, env = _make_multi_orphan_repo(tmp_path)
+    _make_unmerged_branch(repo, env, "committerdate")
+    _make_merged_branch(repo, env, "feat/merged")
+
+    # fixture sanity: committerdate really is unmerged (a direct delete blocks)
+    guard = _run_hook(repo, env, "git branch -D committerdate")
+    assert guard.returncode == 2, guard.stderr
+
+    # the real command deletes only the merged feat/merged; --sort eats committerdate
+    result = _run_hook(repo, env, "git branch -D --sort committerdate feat/merged")
+    assert result.returncode == 0, result.stderr
+
+
+def test_run_git_context_fifo_head_blocks_without_hanging(tmp_path: Path) -> None:
+    """#309: a `--git-dir` context whose HEAD is a writer-less FIFO must not hang the
+    detector — run_git carries a timeout. Since detection already matched a destructive
+    command it could not clear, a verify timeout fails CLOSED (block), not open: a slow
+    (not hung) repo would let the real `git branch -D` complete and destroy work."""
+    repo, env = _make_multi_orphan_repo(tmp_path)
+    fakegit = tmp_path / "fakegit"
+    fakegit.mkdir()
+    os.mkfifo(fakegit / "HEAD")
+    env = dict(env, GUARD_GIT_TIMEOUT_S="3")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, DETECT, f"git --git-dir={fakegit} branch -D someunmerged"],
+            cwd=repo, env=env, text=True, capture_output=True, check=False, timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        raise AssertionError("detector hung on FIFO HEAD context — run_git has no timeout")
+
+    assert result.returncode == 2, result.stderr
+
+
 TestCallable = Callable[[Path], None]
 
 
@@ -1450,7 +1567,7 @@ TESTS: list[tuple[str, TestCallable]] = [
     ("test_branch_force_move_long_flag_blocks", test_branch_force_move_long_flag_blocks),
     ("test_branch_force_move_missing_branch_allowed", test_branch_force_move_missing_branch_allowed),
     ("test_branch_force_move_merged_allowed", test_branch_force_move_merged_allowed),
-    ("test_branch_force_move_upstream_flag_eats_arg", test_branch_force_move_upstream_flag_eats_arg),
+    ("test_branch_force_move_upstream_flag_not_a_force_move", test_branch_force_move_upstream_flag_not_a_force_move),
     ("test_branch_force_rename_out_of_scope_allowed", test_branch_force_rename_out_of_scope_allowed),
     ("test_checkout_force_create_unmerged_blocks", test_checkout_force_create_unmerged_blocks),
     ("test_checkout_force_create_glued_blocks", test_checkout_force_create_glued_blocks),
@@ -1485,6 +1602,15 @@ TESTS: list[tuple[str, TestCallable]] = [
     ("test_xargs_replstr_lookalike_not_an_assignment", test_xargs_replstr_lookalike_not_an_assignment),
     ("test_sudo_prompt_lookalike_not_an_assignment", test_sudo_prompt_lookalike_not_an_assignment),
     ("test_local_branch_literally_named_heads_blocks", test_local_branch_literally_named_heads_blocks),
+    ("test_checkout_force_create_repeated_last_wins_blocks", test_checkout_force_create_repeated_last_wins_blocks),
+    ("test_checkout_force_create_repeated_glued_last_wins_blocks", test_checkout_force_create_repeated_glued_last_wins_blocks),
+    ("test_switch_force_create_repeated_last_wins_blocks", test_switch_force_create_repeated_last_wins_blocks),
+    ("test_switch_long_force_create_repeated_last_wins_blocks", test_switch_long_force_create_repeated_last_wins_blocks),
+    ("test_force_create_repeated_last_operand_fresh_branch_allowed", test_force_create_repeated_last_operand_fresh_branch_allowed),
+    ("test_branch_set_upstream_glued_not_a_force_move_allowed", test_branch_set_upstream_glued_not_a_force_move_allowed),
+    ("test_branch_unset_upstream_with_force_allowed", test_branch_unset_upstream_with_force_allowed),
+    ("test_branch_delete_sort_arg_not_misread_as_operand", test_branch_delete_sort_arg_not_misread_as_operand),
+    ("test_run_git_context_fifo_head_blocks_without_hanging", test_run_git_context_fifo_head_blocks_without_hanging),
 ]
 
 

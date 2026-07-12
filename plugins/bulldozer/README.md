@@ -91,7 +91,7 @@ Each review gets an isolated directory — no collisions between sessions or art
 ## Log Format
 
 ```
-2026-05-09T10:30:00+03:00 | session=bf5a38d6 | round=1 | artifact=spec.md | verdict=NO-GO | findings=8 | fixed=7 | fp=1 | reviewer=codex/gpt-5.5 | project=/path
+2026-05-09T10:30:00+03:00 | session=bf5a38d6 | round=1 | artifact=spec.md | verdict=NO-GO | findings=8 | fixed=7 | fp=1 | reviewer=codex/gpt-5.6-sol | project=/path
 ```
 
 View: `column -t -s'|' ~/.claude/hooks/bulldozer.log`

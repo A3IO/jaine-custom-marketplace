@@ -4,9 +4,18 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..",
                                 "skills", "drive", "scripts"))
 import cookie_seed  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_drive_log(tmp_path, monkeypatch):
+    """#328 r3: cookie_seed.main() writes an audit line — unit tests must not
+    mutate the user's real ~/.claude/hooks/bulldozer-drive.log."""
+    monkeypatch.setenv("BULLDOZER_DRIVE_LOG", str(tmp_path / "drive-audit.log"))
 
 
 class TestDomainMatches:

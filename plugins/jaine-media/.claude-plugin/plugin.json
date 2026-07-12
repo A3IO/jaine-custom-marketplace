@@ -1,6 +1,6 @@
 {
   "name": "jaine-media",
-  "version": "2026.06.22.2",
+  "version": "2026.07.04",
   "description": "Media understanding — analyze video & audio (local files or YouTube/web URLs), extract frames, fetch & prepare media.",
   "author": { "name": "JAINE", "email": "jaine@local" },
   "keywords": ["gemini", "video", "audio", "media", "mcp", "ffmpeg", "frame", "transcribe"]

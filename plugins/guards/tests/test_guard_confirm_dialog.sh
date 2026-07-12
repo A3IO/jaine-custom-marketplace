@@ -59,6 +59,15 @@ else
     echo "FAIL: CR poisoned log: $(LC_ALL=C cat -v "$CRLOG")"; fail=$((fail + 1))
 fi
 
+# #311: "Allow" must be the AppleScript default button (highlighted, Enter-activated). The
+# osascript stub can't see the dialog, so assert the invariant at the source level — this
+# catches a silent revert to the old default button "Deny".
+if grep -q 'default button "Allow"' "$ENGINE"; then
+    echo "PASS: AppleScript default button is Allow (#311)"; pass=$((pass + 1))
+else
+    echo "FAIL: AppleScript default button is not Allow (#311)"; fail=$((fail + 1))
+fi
+
 rm -rf "$STUB"
 echo "=== $pass passed, $fail failed ==="
 [ "$fail" -eq 0 ]

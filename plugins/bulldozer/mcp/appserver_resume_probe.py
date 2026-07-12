@@ -40,11 +40,15 @@ import glob
 import json
 import os
 import select
+import shutil
 import subprocess
 import sys
 import time
 
-CODEX = os.environ.get("JAINE_CODEX_BIN", "/opt/homebrew/bin/codex")
+# Same resolution order as codex_server._resolve_codex_bin (#227): env override →
+# bare-name PATH search → absolute fallback. A hardcoded default broke when the
+# brew cask was replaced by a ~/.local/bin install (caught by the 0.144 re-verify).
+CODEX = os.environ.get("JAINE_CODEX_BIN") or shutil.which("codex") or "/opt/homebrew/bin/codex"
 SCRATCH = "/tmp/codex-resume-probe-scratch"
 CODEWORD = "BANANA-4242-ZEBRA"
 DEADLINE_PER_TURN = 180  # seconds

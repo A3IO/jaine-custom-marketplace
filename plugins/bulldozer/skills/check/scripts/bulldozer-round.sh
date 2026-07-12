@@ -68,10 +68,33 @@ PROJECT_ROOT=""
 # R2-F1 (hotfix dogfood round 2): value-taking flags at end of argv used to
 # bail with raw exit 1 because case bodies read `$2` directly under set -u.
 # require_value aborts with 64 BEFORE the unbound-variable error fires.
+# #322 A3: a wrapper/parser failure previously went to stderr ONLY — the exact
+# gap-class #320 closed for the MCP server. One best-effort line per failure,
+# fail-open (a logging failure never blocks the STOP). Values sanitized so the
+# pipe grammar survives; reason capped at 160 chars.
+_bdz_log() {
+    # canonical helper (lib/bulldozer_log.py): sanitization (UTF-8-safe truncation,
+    # newline/pipe), 5MB rotation, session= from env — one writer, not four (Copilot #327).
+    # stderr NOT discarded: the helper's once-per-process warning is the only
+    # signal that the durable record itself was lost (#327 r7)
+    local event="$1"; shift
+    local lf="${BULLDOZER_LOG:-${HOME:-}/.claude/hooks/bulldozer.log}"   # ${HOME:-}: set -u must not preempt the caller's exit code (#327 r3)
+    [[ "$lf" == /.claude/* ]] && return 0   # no HOME, no default log home — skip telemetry, keep fail-open
+    python3 "${SCRIPT_DIR}/../../../lib/bulldozer_log.py" "$lf" "$event" "$@" || true
+}
+
+_log_wrapper_fail() {
+    local code="$1"; local reason="$2"
+    _bdz_log wrapper-fail \
+        "round=${ROUND:-}" "artifact=${ARTIFACT:-}" "reviewer=${REVIEWER:-}" \
+        "depth=${DEPTH:-}" "exit=${code}" "reason=${reason}"
+}
+
 require_value() {
     local flag="$1"; local remaining="$2"
     if (( remaining < 2 )); then
         echo "error: $flag requires a value" >&2
+        _log_wrapper_fail 64 "$flag requires a value"
         exit 64
     fi
 }
@@ -96,6 +119,7 @@ _emit_stop() {
             echo "      ${line}"
         done
     } >&2
+    _log_wrapper_fail "$code" "$reason"   # #322 A3: durable trace for every STOP
     exit "$code"
 }
 
@@ -189,6 +213,7 @@ while [[ $# -gt 0 ]]; do
         *)
             echo "error: unknown flag: $1" >&2
             usage >&2
+            _log_wrapper_fail 64 "unknown flag: $1"
             exit 64
             ;;
     esac
@@ -206,6 +231,7 @@ missing=()
 if (( ${#missing[@]} > 0 )); then
     echo "error: missing required flag(s): ${missing[*]}" >&2
     usage >&2
+    _log_wrapper_fail 64 "missing required flag(s): ${missing[*]}"
     exit 64
 fi
 
@@ -216,6 +242,7 @@ fi
 # (( ROUND >= max_rounds )) pivot guard. Reject at preflight (EX_USAGE).
 if [[ ! "$ROUND" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: --round must be a positive integer (1-based), got: $ROUND" >&2
+    _log_wrapper_fail 64 "--round must be a positive integer, got: $ROUND"
     exit 64
 fi
 
@@ -231,6 +258,7 @@ fi
 # permitting multi-segment models. MODEL = everything after the first slash.
 if [[ ! "$REVIEWER" =~ ^[^/]+/.+$ ]]; then
     echo "error: --reviewer must be in form 'provider/model' (got: $REVIEWER)" >&2
+    _log_wrapper_fail 64 "--reviewer must be provider/model, got: $REVIEWER"
     exit 64
 fi
 MODEL="${REVIEWER#*/}"
@@ -243,6 +271,7 @@ MODEL="${REVIEWER#*/}"
 # with parser-no-LEDGER). Combined check covers both failure shapes.
 if [[ ! -f "$PROMPT_FILE" || ! -r "$PROMPT_FILE" ]]; then
     echo "error: --prompt-file must be a readable regular file: $PROMPT_FILE" >&2
+    _log_wrapper_fail 64 "--prompt-file not a readable file: $PROMPT_FILE"
     exit 64
 fi
 
@@ -277,6 +306,7 @@ case "$depth_cfg_exit" in
     0) : ;;
     2)
         echo "error: --depth must be one of the keys in depth-config.json (got: $DEPTH)" >&2
+        _log_wrapper_fail 64 "--depth not in depth-config.json: $DEPTH"
         exit 64
         ;;
     *)
@@ -426,7 +456,9 @@ fi
 # FOREGROUND ONLY (NEVER run_in_background) — -o is written LAST by codex,
 # polling is unreliable. stderr merged into FULL_LOG for crash diagnostics.
 codex_exit=0
+codex_start=$SECONDS   # #322 B4: codex exec wall-clock → duration_s= in the round line
 codex "${codex_args[@]}" - < "$codex_stdin" > "$FULL_LOG" 2>&1 || codex_exit=$?
+CODEX_DURATION_S=$(( SECONDS - codex_start ))
 
 if (( codex_exit != 0 )); then
     # Map codex non-zero to wrapper exit 71 (sysexits.h EX_OSERR-style
@@ -450,6 +482,7 @@ if (( codex_exit != 0 )); then
             echo "         (full log not readable: ${FULL_LOG})"
         fi
     } >&2
+    _log_wrapper_fail 71 "codex exec crashed (codex exit ${codex_exit})"
     exit 71
 fi
 
@@ -518,10 +551,12 @@ FIXED="${BULLDOZER_FIXED:-0}"
 FP="${BULLDOZER_FP:-0}"
 if [[ ! "$FIXED" =~ ^[0-9]+$ ]]; then
     echo "error: BULLDOZER_FIXED must be a non-negative integer (got: '$FIXED')" >&2
+    _log_wrapper_fail 64 "BULLDOZER_FIXED not a non-negative integer: $FIXED"
     exit 64
 fi
 if [[ ! "$FP" =~ ^[0-9]+$ ]]; then
     echo "error: BULLDOZER_FP must be a non-negative integer (got: '$FP')" >&2
+    _log_wrapper_fail 64 "BULLDOZER_FP not a non-negative integer: $FP"
     exit 64
 fi
 
@@ -578,6 +613,7 @@ case "$parser_exit" in
         BULLDOZER_REVIEW_DIR="$REVIEW_DIR" BULLDOZER_DEPTH="$DEPTH" \
             bash "$LOG_ROUND" "$ROUND" "$ARTIFACT" "UNKNOWN" \
                 "0" "$FIXED" "$FP" "$REVIEWER" "$PROJECT_ROOT" "true" \
+                "${CODEX_DURATION_S:-}" \
                 > /dev/null || manual_log_exit=$?
         if (( manual_log_exit != 0 )); then
             _emit_stop 70 "log-round.sh failed during manual-extraction logging (exit ${manual_log_exit})." \
@@ -666,7 +702,8 @@ VERDICT="${parser_out#*|}"
 log_round_exit=0
 BULLDOZER_REVIEW_DIR="$REVIEW_DIR" BULLDOZER_DEPTH="$DEPTH" \
     bash "$LOG_ROUND" "$ROUND" "$ARTIFACT" "$VERDICT" \
-        "$findings_count" "$FIXED" "$FP" "$REVIEWER" "$PROJECT_ROOT" \
+        "$findings_count" "$FIXED" "$FP" "$REVIEWER" "$PROJECT_ROOT" "" \
+        "${CODEX_DURATION_S:-}" \
         > /dev/null || log_round_exit=$?
 
 if (( log_round_exit != 0 )); then
@@ -765,5 +802,11 @@ if [[ -n "$pivot_trigger" ]]; then
     else
         echo "PIVOT: max rounds reached without GO. See ${PIVOT_FILE} for AskUserQuestion options." >&2
     fi
+    # #322 D7: durable pivot record — pivot rate / trigger mix per depth becomes
+    # minable (the exit-10 signal itself lives only in the ephemeral caller).
+    _bdz_log pivot \
+        "round=${ROUND}" "artifact=${ARTIFACT}" "depth=${DEPTH}" \
+        "trigger=${pivot_trigger}" "findings=${findings_count}" \
+        "max_rounds=${max_rounds:-}" "project=${PROJECT_ROOT:-}"
     exit 10
 fi

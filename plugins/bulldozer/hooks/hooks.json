@@ -2,29 +2,11 @@
   "hooks": {
     "UserPromptSubmit": [
       {
-        "matcher": "^/bulldozer:check\\b",
         "hooks": [
           {
             "type": "command",
-            "command": "echo \"$(date -Iseconds) | event=invoke | round=0 | artifact= | verdict= | findings=0 | fixed=0 | fp=0 | reviewer= | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)\" >> ~/.claude/hooks/bulldozer.log"
-          }
-        ]
-      },
-      {
-        "matcher": "^/bulldozer:look\\b",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo \"$(date -Iseconds) | event=look-invoke | url= | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)\" >> ~/.claude/hooks/bulldozer-look.log"
-          }
-        ]
-      },
-      {
-        "matcher": "^/bulldozer:consult\\b",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo \"$(date -Iseconds) | event=consult-invoke | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)\" >> ~/.claude/hooks/bulldozer-consult.log"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/log_skill_invoke.py\"",
+            "timeout": 5
           }
         ]
       }

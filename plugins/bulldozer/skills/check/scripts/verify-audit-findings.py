@@ -18,6 +18,7 @@ crashes the round.
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -98,7 +99,25 @@ def main(argv):
 
     survivors = [f for f in findings if isinstance(f, dict) and survives(f, args.project_root)]
     Path(args.out).write_text(json.dumps({"findings": survivors}, indent=2), encoding="utf-8")
+    _log_effectiveness(len(findings), len(survivors), args.project_root)
     return 0
+
+
+def _log_effectiveness(proposed, survived, project):
+    """#322 D7: one durable line per E1 pre-clean — auditor effectiveness
+    (proposed vs quote-verified survivors) becomes minable. Best-effort: a
+    logging failure must never break this script's fail-open exit-0 contract."""
+    try:
+        # canonical helper (lib/bulldozer_log.py): sanitization, rotation, one
+        # writer for the stable log (Copilot #327). append_line never raises.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
+        from bulldozer_log import append_line
+        lf = os.environ.get("BULLDOZER_LOG") or os.path.expanduser(
+            "~/.claude/hooks/bulldozer.log")
+        append_line(lf, "audit", proposed=proposed, survived=survived, project=project)
+    except Exception:
+        print("warning: bulldozer_log helper unavailable — audit line dropped",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":

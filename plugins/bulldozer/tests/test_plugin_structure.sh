@@ -206,9 +206,12 @@ check "skills/look/scripts/launch.sh" "$PLUGIN_ROOT/skills/look/scripts/launch.s
 
 echo
 echo "--- Hooks completeness ---"
-check_content "hooks.json has check matcher" "$PLUGIN_ROOT/hooks/hooks.json" "bulldozer:check"
-check_content "hooks.json has look matcher" "$PLUGIN_ROOT/hooks/hooks.json" "bulldozer:look"
-check_content "hooks.json has consult matcher" "$PLUGIN_ROOT/hooks/hooks.json" "bulldozer:consult"
+# #318: matcher is ignored on UserPromptSubmit — filtering lives in log_skill_invoke.py, not hooks.json
+check_content "hooks.json wires invoke-logger script" "$PLUGIN_ROOT/hooks/hooks.json" "log_skill_invoke.py"
+check "hooks/log_skill_invoke.py" "$PLUGIN_ROOT/hooks/log_skill_invoke.py"
+check_content "invoke-logger filters check" "$PLUGIN_ROOT/hooks/log_skill_invoke.py" "check"
+check_content "invoke-logger filters look" "$PLUGIN_ROOT/hooks/log_skill_invoke.py" "look"
+check_content "invoke-logger filters consult" "$PLUGIN_ROOT/hooks/log_skill_invoke.py" "consult"
 
 echo
 echo "--- Plugin description ---"

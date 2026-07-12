@@ -22,11 +22,25 @@ Hardening from the 2026-06-14 find-holes experiment (swarm + opus baseline on th
 Known static limits (cannot fix without executing the script — see README): aliased/computed
 fan-out (`const p=parallel; p(...)`), partial routing (1-of-N agents routed), JSON-quoted
 `{"model":...}`, scriptPath TOCTOU/decoy. Fail-open everywhere; each fail-open path logs a
-DISTINCT decision so the log never shows a false 'safe'.
+DISTINCT decision so the log never shows a false 'safe' (incl. unparseable stdin →
+ALLOW_PARSE_ERROR and a misrouted non-Workflow tool → SKIP_NOT_WORKFLOW, #322 D4).
+
+Log format (#322 C5/F6): one pipe-KV line per decision via lib/bulldozer_log.py —
+`{ts} | event=decision | session=… | decision=… | signals… | project=…` — replacing
+the pre-2026-07-12 multi-line YAML records (miners of the old epoch: records before
+that date are `---`-separated YAML).
 """
-import sys, json, os, re, datetime
+import sys, json, os, re
 
 LOG = os.environ.get("WORKFLOW_HOOK_LOG") or os.path.expanduser("~/.claude/hooks/require-workflow-skill.log")
+# Canonical writer (#322 C5): sanitization, rotation, session= from env. Import
+# fail-open — a guardrail hook must never block a Workflow over its own telemetry.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+try:
+    from bulldozer_log import append_line as _append_line
+except Exception:
+    _append_line = None
+_HELPER_WARNED = False
 ESCAPE = "workflow-routing-ok"
 # The env bypass premise is "everything pinned to a CHEAP model" → safe from the opus-burst.
 # So bypass ONLY for a haiku/sonnet pin; opus/fable (or any value naming them) pins everything
@@ -97,16 +111,33 @@ def strip(src):
     return "".join(code), "\n".join(comments)
 
 
-def log(decision, **sig):
+def log(decision, project=None, **sig):
+    global _HELPER_WARNED
+    if _append_line is None:
+        if not _HELPER_WARNED:
+            print("warning: bulldozer_log helper unavailable — decision line dropped",
+                  file=sys.stderr)
+            _HELPER_WARNED = True
+        return
+    fields = {"decision": decision}
+    fields.update(sig)
+    if project:
+        fields["project"] = project  # F6: join key to the per-skill invoke lines
+    _append_line(LOG, "decision", **fields)
+
+
+def resolve_project(data):
+    """Project root for the F6 `project=` field: git toplevel of the hook's cwd
+    (same normalization as log_skill_invoke.py, so lines join across logs),
+    falling back to the raw cwd. None when the payload carries no usable cwd."""
+    cwd = data.get("cwd") if isinstance(data, dict) else None
+    if not isinstance(cwd, str) or not cwd:
+        return None
     try:
-        with open(LOG, "a") as f:
-            f.write("---\n")
-            f.write(f"timestamp: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n")
-            f.write(f"decision: {decision}\n")
-            if sig:
-                f.write("  " + "  ".join(f"{k}: {v}" for k, v in sig.items()) + "\n")
+        from log_skill_invoke import resolve_project as _rp  # sibling hook module
+        return _rp(cwd)
     except Exception:
-        pass
+        return cwd
 
 
 def emit_allow():
@@ -126,13 +157,22 @@ def main():
     try:
         data = json.loads(raw)
     except Exception:
-        return  # unparseable top level / not JSON → not our concern, silent allow
+        # the matcher guarantees Workflow-tool JSON here — a parse failure is a
+        # broken CC contract, not out-of-scope traffic (#322 D4). Still silent
+        # on stdout (allow); the log is the only place the anomaly surfaces.
+        log("ALLOW_PARSE_ERROR", note="stdin not JSON")
+        return
+    project = resolve_project(data)
     if not isinstance(data, dict) or data.get("tool_name") != "Workflow":
+        # dead under the hooks.json matcher — a line here means the hook got
+        # registered with a broader matcher somewhere (#322 D4)
+        tool = data.get("tool_name") if isinstance(data, dict) else type(data).__name__
+        log("SKIP_NOT_WORKFLOW", project=project, tool=str(tool))
         return  # not the Workflow tool → silent (exit 0, no output)
 
     ti = data.get("tool_input")
     if not isinstance(ti, dict):
-        log("ALLOW_UNPARSED", note="tool_input not an object")
+        log("ALLOW_UNPARSED", project=project, note="tool_input not an object")
         emit_allow(); return
 
     script = ti.get("script") or ""
@@ -142,13 +182,14 @@ def main():
             script = open(os.path.expanduser(str(ti["scriptPath"]))).read()
             origin = "scriptPath"
         except Exception as e:
-            log("ALLOW_UNREADABLE", scriptPath=str(ti.get("scriptPath")), error=type(e).__name__)
+            log("ALLOW_UNREADABLE", project=project,
+                scriptPath=str(ti.get("scriptPath")), error=type(e).__name__)
             emit_allow(); return
     if not script:
-        log("ALLOW_NAMED", note="named/resume — no script body to inspect")
+        log("ALLOW_NAMED", project=project, note="named/resume — no script body to inspect")
         emit_allow(); return
     if not isinstance(script, str):  # truthy non-string (dict/list/int) → strip() would crash
-        log("ALLOW_UNPARSED", note=f"script not a string ({type(script).__name__})")
+        log("ALLOW_UNPARSED", project=project, note=f"script not a string ({type(script).__name__})")
         emit_allow(); return
 
     code, comments = strip(script)
@@ -172,9 +213,9 @@ def main():
     else:
         decision = "ALLOW"
 
-    log(decision, fanout=int(fanout), model_count=model_count, throttle=int(throttle),
-        escape=int(escape), env=(env or "unset"), env_cheap=int(env_cheap),
-        enforce=int(ENFORCE), origin=origin)
+    log(decision, project=project, fanout=int(fanout), model_count=model_count,
+        throttle=int(throttle), escape=int(escape), env=(env or "unset"),
+        env_cheap=int(env_cheap), enforce=int(ENFORCE), origin=origin)
 
     emit_deny() if decision == "DENY" else emit_allow()
 

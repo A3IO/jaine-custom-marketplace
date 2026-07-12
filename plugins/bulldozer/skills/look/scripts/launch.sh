@@ -5,6 +5,14 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# #322 A1: lane lifecycle audit → bulldozer-drive.log (env override BULLDOZER_DRIVE_LOG).
+# Non-9333 lanes only (the daily browser is /look's, not a drive lane). Canonical
+# writer (sanitization/rotation/session); fail-open — never blocks the launch.
+_log_lane() {
+  [[ "${CDP_PORT:-9333}" == "9333" ]] && return 0
+  python3 "$SCRIPT_DIR/../../../lib/bulldozer_log.py"     "${BULLDOZER_DRIVE_LOG:-${HOME:-}/.claude/hooks/bulldozer-drive.log}" "$@" || true
+}
+
 # Backslash-escape ERE metacharacters so an arbitrary profile path matches
 # literally in pkill -f (A.5). Realistic path metachars: . [ ] ( ) { } ^ $ * + ? |
 # (a backslash/newline path is rejected fail-loud at profile resolution — see guard).
@@ -29,12 +37,26 @@ PY
 }
 
 # Canonical "does this profile resolve to the daily profile?" check — shared by the
-# insecure gate (R1-F1) and the automation gate (R1-C). Echoes 1/0; fail-CLOSED:
-# canonicalization error → 1 (treated AS the daily profile).
+# unconditional daily-profile gate (#160) and the insecure (R1-F1) / automation (R1-C) /
+# cert-spki gates. Echoes 1/0; fail-CLOSED: any error → 1 (treated AS the daily profile).
+#
+# Identity (samefile), not canonical STRING: /0 is case-insensitive APFS, where
+# /0/.JAINE/.browser/profile IS the daily directory — yet realpath preserves the caller's
+# casing, so a string compare calls them different and lets the alias through (codex P1,
+# reproduced live). samefile stats both, so case aliases, symlinks and hardlinks all
+# collapse to the same inode. Falls back to the realpath compare when a path does not
+# exist (samefile would raise) — a nonexistent dir cannot BE the live daily profile.
 _resolves_to_daily_profile() {
   python3 - "$1" <<'PY' 2>/dev/null || echo 1
 import os, sys
-print(1 if os.path.realpath(sys.argv[1]) == os.path.realpath("/0/.jaine/.browser/profile") else 0)
+p, daily = sys.argv[1], "/0/.jaine/.browser/profile"
+try:
+    if os.path.exists(p) and os.path.exists(daily):
+        print(1 if os.path.samefile(p, daily) else 0)
+    else:
+        print(1 if os.path.realpath(p) == os.path.realpath(daily) else 0)
+except OSError:
+    print(1)
 PY
 }
 
@@ -73,6 +95,20 @@ fi
 # Fail loud rather than silently garble the kill pattern (no-silent-fallback principle).
 if [[ "$PROFILE_DIR" == *\\* || "$PROFILE_DIR" == *$'\n'* ]]; then
   echo "ERROR: LOOK_PROFILE_DIR must not contain a backslash or newline (got: $PROFILE_DIR)" >&2
+  exit 1
+fi
+
+# ── The daily profile belongs to port 9333 and to NOTHING else (#160) ──
+# KILL_MATCH is scoped by --user-data-dir, not by port: a non-9333 lane whose profile
+# resolves to the daily one pkills the user's LIVE browser. The three opt-in gates
+# (automation/insecure/cert-spki) each rejected this, but a plain lane had no gate —
+# so the flagless recipe was the destructive one. Unconditional, at resolution time.
+# String compare (!= "0"), not (( )): a malformed capture would make (( )) fail OPEN.
+if (( CDP_PORT != 9333 )) && [[ "$(_resolves_to_daily_profile "$PROFILE_DIR")" != "0" ]]; then
+  echo "ERROR: profile resolves to the DAILY browser's profile (/0/.jaine/.browser/profile)" >&2
+  echo "       on a non-9333 lane (port=$CDP_PORT profile=$PROFILE_DIR). This lane's restart" >&2
+  echo "       kills by --user-data-dir, so it would kill the user's live browser. Refusing." >&2
+  echo "       Use the daily lane (CDP_PORT=9333) or an isolated LOOK_PROFILE_DIR." >&2
   exit 1
 fi
 
@@ -437,6 +473,7 @@ if [[ ! -x "$CHROME_BIN" ]]; then
   if (( AUTOMATION )); then
     echo "       Install the pinned Chrome for Testing: bash skills/look/scripts/update-cft.sh" >&2
   fi
+  _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=Chrome binary missing: $CHROME_BIN"
   exit 1
 fi
 
@@ -446,7 +483,18 @@ mkdir -p "$PROFILE_DIR" "$(dirname "$LOG")"
 # mktemp profile did not exist moments ago, so no process can match — the pkill
 # would always no-op and the sleep would waste 1s per lane (code-review, PR #178).
 if (( ! EPHEMERAL )); then
-  pkill -f -- "$KILL_MATCH" 2>/dev/null
+  if pkill -f -- "$KILL_MATCH" 2>/dev/null; then
+    # a prior lane on this profile was signaled — close its lifecycle so it does
+    # not read as leaked (#328 r7), but only once the process is CONFIRMED gone:
+    # a delivered SIGTERM is not a terminated process (#328 r8)
+    for _k in 1 2 3 4 5; do
+      pgrep -f -- "$KILL_MATCH" >/dev/null 2>&1 || break
+      sleep 0.3
+    done
+    if ! pgrep -f -- "$KILL_MATCH" >/dev/null 2>&1; then
+      _log_lane lane-stop "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=replaced by new launch"
+    fi
+  fi
   sleep 1
 fi
 
@@ -479,6 +527,7 @@ if (( EPHEMERAL )); then
   done
   if [[ ! -s "$_dtap" ]]; then
     echo "LANE_FAIL: DevToolsActivePort not written within 10s (profile $PROFILE_DIR)" >&2
+    _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=DevToolsActivePort not written within 10s"
     kill "$CHROME_PID" 2>/dev/null
     rm -rf "$PROFILE_DIR"
     exit 1
@@ -489,6 +538,7 @@ if (( EPHEMERAL )); then
   # not as 10 cryptic curl failures (code-review, PR #178).
   if ! [[ "$CDP_PORT" =~ ^[0-9]{1,5}$ ]]; then
     echo "LANE_FAIL: DevToolsActivePort line 1 is not a port (got: $CDP_PORT)" >&2
+    _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=DevToolsActivePort line 1 not a port"
     kill "$CHROME_PID" 2>/dev/null
     rm -rf "$PROFILE_DIR"
     exit 1
@@ -502,6 +552,7 @@ if (( EPHEMERAL )); then
   done
   if (( ! _eph_ok )); then
     echo "LANE_FAIL: CDP on port $CDP_PORT never answered /json/version" >&2
+    _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=CDP never answered /json/version"
     kill "$CHROME_PID" 2>/dev/null
     rm -rf "$PROFILE_DIR"
     exit 1
@@ -559,6 +610,8 @@ fi
 
 if kill -0 "$CHROME_PID" 2>/dev/null; then
   echo "JAINE Browser started (PID $CHROME_PID, CDP :$CDP_PORT)"
+  _log_lane lane-start "port=$CDP_PORT" "profile=$PROFILE_DIR" "headless=$HEADLESS" \
+    "automation=$AUTOMATION" "ephemeral=$EPHEMERAL" "insecure=$INSECURE" "pid=$CHROME_PID"
   if (( EPHEMERAL )); then
     # SP4 §2.1 contract — parseable final lines for delegation consumers.
     echo "CDP_PORT=$CDP_PORT"
@@ -568,6 +621,7 @@ if kill -0 "$CHROME_PID" 2>/dev/null; then
   fi
 else
   echo "ERROR: Chrome failed to start — check $LOG" >&2
+  _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=Chrome failed to start"
   if (( EPHEMERAL )); then
     # Mirror the LANE_FAIL cleanups: Chrome passed liveness but died before the
     # contract — the mktemp profile must not leak (code-review, PR #178).
