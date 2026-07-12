@@ -1,6 +1,6 @@
 ---
 name: look
-description: Use when you need to see a web page, verify UI visually, take a screenshot, capture a region of the page, execute JS in a real browser, click elements, fill forms, check console errors, or monitor network requests. Triggers on "open in browser", "take screenshot", "capture region", "check if X is aligned", "what does this look like", "захватить область", "run JS", "click button", "fill form", visual verification, UI detail check.
+description: Use when you need to see a web page, verify UI visually, take a screenshot, capture a region of the page, execute JS in a real browser, click elements, fill forms, check console errors, or monitor network requests. Triggers on "open in browser", "take screenshot", "capture region", "check if X is aligned", "what does this look like", "захватить область", "run JS", "click button", "fill form", visual verification, UI detail check. Port 9333 is the USER'S LIVE browser — use it only when the task needs their cookies/logins/co-browsing, and pin every command with --target; an agent-own task (file://, localhost preview, UI iteration) ALWAYS goes to an isolated lane instead.
 argument-hint: "[URL] [task description]"
 allowed-tools: ["Bash", "Read"]
 ---
@@ -34,16 +34,24 @@ python3 "$CDP" status
 sleep 5
 ```
 
-3. If browser was already ONLINE and a URL was parsed, navigate:
+3. If browser was already ONLINE and a URL was parsed: an ONLINE 9333 is the user's
+LIVE browser — its active tab may be theirs, so do NOT `navigate` it. `open` your own
+tab (see "Shared or isolated" below):
 ```bash
-python3 "$CDP" navigate "<parsed URL>"
+python3 "$CDP" open "<parsed URL>"        # output: "Opened <url> in tab <id12>"
 sleep 2
 ```
+Shell state does NOT persist across Bash calls (#221) — a `TARGET=` variable set here
+is GONE in the next call. Either run `open` and the commands that use the tab in ONE
+Bash call, or copy the printed `<id12>` LITERALLY into every later `--target`.
 Skip step 3 if you just launched the browser in step 2 (it already opened the URL).
 
-4. Screenshot + show:
+4. Screenshot + show. On 9333 pin it — the active tab is never yours. That includes
+the fresh-launch arm: step 2 put the user's daily browser on their screen, and they
+can grab it during the wait; its only tab is yours, take its `<id12>` from `tabs`:
 ```bash
-python3 "$CDP" screenshot /tmp/jaine-look.jpg
+python3 "$CDP" --target <id12> screenshot /tmp/jaine-look.jpg   # 9333 (either arm)
+python3 "$CDP" screenshot /tmp/jaine-look.jpg                   # isolated lane only
 ```
 Then Read the screenshot file to see it.
 
@@ -66,7 +74,7 @@ Auto-detected: `cdp.py status` shows active channel. Fallback is transparent —
 
 ## Shared or isolated — decide BEFORE your first command
 
-**Port 9333** = the user's live browser (cookies, logins, co-browsing). Use `open` + `--target` to work in a new tab; do NOT `navigate` the active tab away from the user's page.
+**Port 9333** = the user's live browser (cookies, logins, co-browsing). `open` your own tab, note its id, then pin EVERY command with `--target <id>` — **the active tab is never yours**: the user can switch it between your calls. Both live recurrences of this bug were routine unpinned commands, not navigation — a `reload` and a `js location.hash=…` executed in the user's page (#187). `navigate` without `--target` is the same bug at its loudest: it yanks the user's active tab to your URL.
 
 **Your own task** (file://, localhost preview, UI iteration) → launch an **isolated lane** (`CDP_PORT=0 --automation` for ephemeral, or a named port). This keeps you from touching the user's session.
 
@@ -82,6 +90,8 @@ LAUNCH="$BULLDOZER_DIR/skills/look/scripts/launch.sh"
 # Global flag — pin every command in the call to one tab (CDP/websocket only):
 #   python3 "$CDP" --target SEL CMD ...   SEL = full target id, its 12-char prefix
 #   (as shown by `tabs`/`status`), or a url substring. Ambiguous/unknown → fail loud.
+# All examples below are shown UNPINNED for brevity — that form is safe on an
+# isolated lane only. On shared 9333, prepend --target per the shared-mode rule.
 
 # Status & tabs
 python3 "$CDP" status                    # ONLINE/OFFLINE + channel info
@@ -261,6 +271,8 @@ unaffected.
 - **Layout/color/visual/pixels** (alignment, overlapping, canvas content, CSS styling) → `screenshot`. Do NOT replace screenshot with ax for visual checks — ax has no geometry.
 - **Interaction after reading** → `ax` then `click/fill/key --ref N` (ref from snapshot). No CSS selectors needed.
 
+**assert on shadow DOM / reactive frameworks (#172):** two selector classes give systematic false-negatives — the poll loop is fine, the selector is wrong for the DOM. (1) **Shadow DOM** (e.g. wavesurfer v7 renders its canvas in a shadow root): `document.querySelector` does not pierce shadow boundaries, so `assert "dialog[open] canvas"` is never true. Cheapest read: `ax` — the snapshot pierces shadow roots and marks them `[shadow=open]`/`[shadow=closed]`. To assert, go through the root explicitly: `assert --js "!!document.querySelector('waveform-element')?.shadowRoot?.querySelector('canvas')"`. (2) **Alpine/Vue `x-if`** removes and re-inserts the element during the reactive cycle — it can be absent for a frame, so a DOM-presence assert flaps (`unstable: flapped Nx`). Assert on the reactive STATE instead — escape `\$data` or the shell eats it before cdp.py sees it: `assert --js "Alpine.\$data(document.querySelector('[x-data]')).showPopup === true" --stable 300`. Fuller patterns: drive SKILL.md → "Assert patterns for modern frameworks".
+
 **screenshot:**
 - `--full-page` — verify below-fold content (long pages, tables, grids). Omit for quick viewport checks.
 - `--clip X Y W H` — capture a CSS-pixel region (mutually exclusive with `--full-page`). Use for UI-detail verification. Output dimensions are W × H × native DPR by default — pair with `--scale 1` for exact W×H CSS-pixel output.
@@ -287,6 +299,9 @@ python3 "$CDP" screenshot /tmp/result.jpg
 ```
 
 ## Workflows
+
+Sequences below are unpinned — isolated-lane form. On shared 9333, `open` your own
+tab first and carry `--target <id12>` through every command (shared-mode rule above).
 
 ### Screenshot → Read → See
 ```bash

@@ -849,3 +849,78 @@ class TestReadmeLogFormat:
         section = self._readme().split("## Log Format", 1)[1].split("\n## ", 1)[0]
         assert re.search(r"scoped to the look channel", section), \
             "README must scope the redaction guarantee to the channel that implements it"
+
+
+class TestLookDocResidue187And172:
+    """#187-doc + #172-look: the doc halves both probes found unshipped (2026-07-12).
+
+    #187: b55242e added the 'Shared or isolated' section but (a) never touched the
+    frontmatter description (the issue explicitly asks for a compressed form there)
+    and (b) pinned only `navigate`, while both live recurrences were an unpinned
+    `reload` and `js location.hash` in the user's tab. #172: the drive half shipped
+    ('Assert patterns for modern frameworks'), the look half has zero mentions of
+    shadow/Alpine — and look never documents ax's `[shadow=…]` markers, the cheapest
+    route past a shadow-DOM assert."""
+
+    def _look(self):
+        return (PLUGIN_ROOT / "skills" / "look" / "SKILL.md").read_text()
+
+    def _description(self):
+        text = self._look()
+        frontmatter = text.split("---", 2)[1]
+        for line in frontmatter.splitlines():
+            if line.startswith("description:"):
+                return line
+        raise AssertionError("no description: line in look frontmatter")
+
+    def test_frontmatter_description_compresses_shared_vs_isolated(self):
+        """#187 Proposal B asks for the rule 'и сжатую форму — в frontmatter
+        description'. The agent picks shared-vs-isolated BEFORE reading the body —
+        the description is the only text guaranteed to be in context at that point."""
+        desc = self._description()
+        assert "9333" in desc, "description never names the shared port"
+        assert "isolated lane" in desc.lower(), "description never names the isolated alternative"
+
+    def test_shared_mode_pins_every_command_not_just_navigate(self):
+        """#187 comment 2: the agent knew the navigate rule and still slipped on a
+        routine reload — the rule must cover EVERY command, by name including the
+        two that actually recurred (reload, js)."""
+        section = self._look().split("## Shared or isolated", 1)[1].split("\n## ", 1)[0]
+        assert "the active tab is never yours" in section
+        assert re.search(r"EVERY command", section), \
+            "shared-mode rule still scoped to navigate only"
+        assert "reload" in section and "js" in section, \
+            "the recurred commands (reload, js) are not named"
+
+    def test_assert_shadow_and_reactive_note_present(self):
+        """#172: assert false-negatives on shadow DOM (wavesurfer) and Alpine x-if
+        flaps. Workarounds + the ax [shadow=…] markers must be findable from look's
+        own reference, with a pointer to drive's fuller section."""
+        text = self._look()
+        assert "shadowRoot" in text, "shadow-DOM assert workaround absent"
+        assert "[shadow=" in text, "ax shadow markers undocumented in look"
+        assert "Alpine" in text, "reactive-framework (Alpine) assert pattern absent"
+        assert "Assert patterns for modern frameworks" in text, \
+            "no pointer to drive's fuller #172 section"
+
+    def test_quick_invoke_online_path_opens_and_pins(self):
+        """codex review of PR #337 (P1): the numbered Quick Invoke workflow is the
+        first executable text an agent follows; with 9333 already ONLINE its step 3
+        said bare `navigate` — reproducing #187 against the user's active tab while
+        the prose below forbade exactly that. The ONLINE arm must open its own tab
+        and pin it."""
+        text = self._look()
+        quick = text.split("## Quick Invoke", 1)[1].split("\n## ", 1)[0]
+        online_arm = quick.split("already ONLINE", 1)[1].split("Skip step 3", 1)[0]
+        assert '"$CDP" open' in online_arm, "ONLINE arm does not open its own tab"
+        assert "--target" in quick, "Quick Invoke never pins the opened tab"
+        assert 'navigate "<parsed URL>"' not in online_arm, \
+            "ONLINE arm still navigates the user's active tab"
+        # codex round 2: a TARGET= shell var dies between Bash calls (#221) — the
+        # workflow must say so and offer the literal-id form; and the pinned
+        # screenshot must be shown as the 9333 form for BOTH arms (a fresh launch
+        # puts the user's daily browser on their screen — they can grab it).
+        assert "ONE" in quick and "LITERALLY" in quick, \
+            "no cross-Bash-call persistence warning for the pinned target"
+        assert "--target <id12> screenshot" in quick, \
+            "no pinned screenshot form in the workflow"
