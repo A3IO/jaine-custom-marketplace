@@ -90,11 +90,57 @@ Each review gets an isolated directory — no collisions between sessions or art
 
 ## Log Format
 
+The canonical grammar (issue #322), produced by the shared writer `lib/bulldozer_log.py`:
+
 ```
-2026-05-09T10:30:00+03:00 | session=bf5a38d6 | round=1 | artifact=spec.md | verdict=NO-GO | findings=8 | fixed=7 | fp=1 | reviewer=codex/gpt-5.6-sol | project=/path
+{ts} | event={event} | session={sid} | k1=v1 | k2=v2 …
 ```
 
+`event=` and `session=` come first, in that order; the rest are event-specific `k=v`
+pairs. Timestamps are ISO-8601 with a colon offset. Values are sanitized (no newline, no
+` | `), so every line stays greppable and `cut`-able.
+
+**Two producers are NOT on the shared writer yet** — a miner must handle their shapes or
+skip them explicitly (do not assume `event=` is present on every line):
+
+| Producer | Shape it emits | Difference |
+|---|---|---|
+| `mcp/codex_server.py` (`_drift_warn`) | `{ts} | TURN_OK | model=… | effort=…` | event is **positional**, no `event=`, no `session=`, timestamp has no offset |
+| `consult_panel.py` (`_log_completion`) | `{ts} | session=… | round=1 | verdict=… | models=…` | no `event=` key (its `consult-invoke` lines DO use the helper) |
+| `consult/SKILL.md` (inline single-codex flow) | `{ts} | session=… | round=1 | verdict=… | model=…` | a bare `echo >>` from the skill itself — no `event=`, and **`model=` singular** where the panel writes `models=` plural |
+
+```
+2026-07-12T17:25:03+07:00 | event=round | session=3d3b6182 | round=4 | artifact=specs/design.md | verdict=NO-GO | findings=1 | fixed=3 | fp=0 | reviewer=codex/gpt-5.6-sol | depth=standard | duration_s=364 | project=/path
+2026-07-12T17:25:03+07:00 | event=pivot | session=3d3b6182 | round=4 | artifact=specs/design.md | depth=standard | trigger=max_rounds_reached | findings=1 | max_rounds=3 | project=/path
+```
+
+**Stable channels** — all under `~/.claude/hooks/` (never in the plugin cache, which is
+wiped on every update):
+
+| Log | Written by | Carries |
+|---|---|---|
+| `bulldozer.log` | /check wrappers | `event=round`, `pivot`, `reconciled`, `audit`, `wrapper-fail` |
+| `bulldozer-codex.log` | the codex MCP bridge | `TURN_OK`, `TURN_ERROR`, `INTERRUPT`, `PARK`, `APPROVAL`, `INFO_ERROR`, `WARNING` |
+| `bulldozer-consult.log` | consult + panel legs | per-leg outcomes, resolved model ids |
+| `bulldozer-look.log` | `cdp.py` | per-command outcomes (`port=`, `target=`; URLs and JS are **redacted** — origin+path only, `expr_sha=` for JS) |
+| `bulldozer-drive.log` | drive lanes | lane lifecycle, cookie-seed audit, tripped circuit-breakers |
+| `require-workflow-skill.log` | the Workflow guardrail hook | routing decisions (`project=`, `session=`) |
+
+**Redaction is scoped to the look channel**, where it is implemented (`cdp.py`: URLs are
+reduced to origin+path with a `?<redacted>` marker; JS becomes `expr_len=`/`expr_sha=`).
+The other producers only strip newlines and ` | ` — so a codex `TURN_ERROR` message or a
+warning payload CAN still carry a full URL with its query string. Do not treat
+"no secrets in the logs" as a plugin-wide guarantee.
+
+Mining code should key off `event=` where it exists, never off line position.
+
 View: `column -t -s'|' ~/.claude/hooks/bulldozer.log`
+Full grammar + rationale: `docs/superpowers/specs/2026-07-11-bulldozer-log-grammar-design.md`.
+
+> **Note (2026-07-12):** no log miner or HTML report exists in this repo yet. This section
+> is the contract to build one against — not a description of an existing consumer. Lines
+> written before 2026-07-11 predate the grammar (no `event=` key); `require-workflow-skill.log`
+> additionally has a YAML-era prefix. A miner must tolerate both, or start at the cutover.
 
 ## How It Works
 

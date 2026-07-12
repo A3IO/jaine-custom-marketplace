@@ -2,7 +2,7 @@
 name: drive
 description: Drives product testing in an isolated Chrome-for-Testing browser with a self-verify core — navigate-that-waits, console error gate, stability-window assertions, trusted clicks, navigation-bound screenshots, opt-in cookie-seed auth. ALWAYS invoke for "протестируй UI", "проверь в браузере что работает", "прогони e2e по странице", "drive the app", "run a browser test", "verify this page works". Do NOT use for looking at the user's own daily browser or his real logins — that is /bulldozer:look (stock Chrome, port 9333). Supports autonomous (headless, runs to completion) and co-pilot (headful, human checkpoints) modes.
 argument-hint: [URL] [test task]
-allowed-tools: ["Bash", "Read", "AskUserQuestion"]
+allowed-tools: ["Bash", "Read", "Write", "AskUserQuestion"]
 ---
 
 # JAINE Drive — Product Testing on an Isolated CfT Lane
@@ -23,7 +23,8 @@ allowed-tools: ["Bash", "Read", "AskUserQuestion"]
 - **Playwright is NOT built** (SP0 bounded-both verdict): cdp.py is the default
   engine. If a real test demonstrably hits a cdp.py wall (rich locators,
   actionability beyond `assert --actionable`, PW-only features), STOP and file an
-  issue — do not hack around it. "Might be nicer" is not a wall.
+  issue — do not hack around it. "Might be nicer" is not a wall. The recipe is in
+  **Feedback** at the bottom of this file — use it; do not guess the labels.
 
 ## Parse `$ARGUMENTS`
 
@@ -379,3 +380,102 @@ the old `js querySelector → click SELECTOR` pattern with zero CSS selectors.
 - The same gate error after 3 fix iterations → circuit-breaker: report, don't loop.
 - You are about to point cdp.py at port 9333 from this skill → that is /look's
   daily browser; drive NEVER touches it.
+
+## Feedback
+
+If you hit friction while driving — a documented behavior that isn't real, a missing
+capability, an unhelpful error, or the **engine wall** — file a GitHub issue so it gets
+fixed. Use the command below verbatim: the labels are part of the convention, not a
+guess (a consumer session once filed with `bulldozer` alone and the rest had to be added
+by hand afterwards — #186).
+
+**Create issue when:**
+1. **Engine wall (the SP0 doctrine step)** — a real test demonstrably needs something
+   `cdp.py` cannot do (rich locators, actionability beyond `assert --actionable`, a
+   Playwright-only feature). Show the test that is blocked. "Might be nicer" is NOT a wall.
+2. SKILL.md describes behavior X, the lane does Y.
+3. A verify-core primitive is wrong: a gate that misses a real error, an `assert` that
+   flaps on a stable element, a `screenshot --bind` loader that never matches.
+4. The lane itself misbehaves — launch fails, teardown leaves a browser, cookie-seed
+   lands nothing.
+5. You had to work around the standard path to finish the task.
+
+**Do NOT create issue when:** your own bad selector/arguments; a genuinely broken product
+under test (that is the FINDING, report it to the user); a limitation this file documents
+as known.
+
+**Command — two steps. Do NOT inline the body into the shell.**
+
+The body carries text you copied from the page under test: a FAIL line, a console error,
+a stack trace. That text is UNTRUSTED — a page can put `` `…` `` or `$(…)` in an error
+message, and a shell-expanded heredoc would execute it as you. So the body goes to a file
+via the **Write tool** (no shell involved), and only then to `gh`.
+
+**Step 0 — take a private path** (two drive sessions can file at once; a fixed
+`/tmp/drive-issue.md` would let one overwrite the other's evidence mid-flight):
+
+```bash
+mktemp -d /tmp/drive-issue-XXXXXX    # prints e.g. /tmp/drive-issue-v8vdhC
+```
+
+A **directory**, not a file, and the X's must be the LAST characters — two BSD-`mktemp`
+traps, both silent: `mktemp /tmp/x-XXXXXX.md` exits 0 and prints the template *verbatim*
+(BSD substitutes trailing X's only — so every session would collide on the same path
+again), and the file form CREATES the file, which makes the Write tool refuse it as an
+existing file it has not read.
+
+**Step 1 — Write the body to `<printed-dir>/body.md`** (Write tool, verbatim text, no
+shell; the file does not exist yet, so Write is clean):
+
+```markdown
+## What I was doing
+{test task + target URL}
+
+## What I expected
+{expected behavior}
+
+## What happened
+{actual behavior, the exact FAIL line / gate output — paste it, do not paraphrase}
+
+## Empirics
+- Lane: port {CDP_PORT}, profile {LANE_PROFILE}, mode {autonomous|co-pilot}
+- Reproducing command: {the cdp.py invocation}
+- Log: {relevant lines from ~/.claude/hooks/bulldozer-drive.log}
+
+## Workaround used
+{what was done instead, or "none — blocked"}
+
+## Environment
+- Skill: drive
+```
+
+**Step 2 — append the environment facts and file it** (only trusted, self-generated values
+are expanded here):
+
+```bash
+BODY=<printed-dir>/body.md               # ← the dir mktemp printed in step 0
+{ printf -- '- Plugin version: %s\n' \
+    "$(jq -r .version "$(ls -dt ~/.claude/plugins/cache/*/bulldozer/*/.claude-plugin/plugin.json 2>/dev/null | head -1)" 2>/dev/null || echo unknown)"
+  printf -- '- Project: %s\n' "$(pwd)"; } >> "$BODY"     # BODY = the step-0 path
+
+gh issue create --repo A3IO/jaine-plugins \
+  --label "feedback,bulldozer,drive" \
+  --title "[feedback/drive] short description" \
+  --body-file "$BODY"
+```
+
+**For an engine wall (trigger #1)** the label set and title differ — use this invocation,
+not the one above:
+
+```bash
+gh issue create --repo A3IO/jaine-plugins \
+  --label "enhancement,bulldozer,drive" \
+  --title "feat(drive): <capability> — cdp.py wall" \
+  --body-file "$BODY"
+```
+
+The body MUST carry the blocked test — a wall is a demonstrated failure, not an opinion.
+Delete the temp dir once `gh` has accepted the issue.
+
+After creating the issue, tell the user:
+> "Я завела issue по drive: {URL}. Продолжить с workaround или сначала пофиксим?"

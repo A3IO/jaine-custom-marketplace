@@ -698,3 +698,154 @@ def test_skill_md_resolves_scripts_without_requiring_plugin_root_env():
     # the OLD raw forms that break with an empty var must be gone:
     assert '"${CLAUDE_PLUGIN_ROOT}/skills/check/scripts/bulldozer-round.sh"' not in text
     assert 'jq -r .version "$CLAUDE_PLUGIN_ROOT/.claude-plugin/plugin.json"' not in text
+
+
+class TestFeedbackRecipeConvention:
+    """#186: a doctrine step that says 'file an issue' must ship the RECIPE next to it.
+
+    The precedent that motivated the issue: a consumer session hit the doctrine step,
+    guessed the labels, and filed #185 with `bulldozer` only — the skill-label and the
+    kind-label were added post-hoc by a second session. `drive` was the one skill whose
+    doctrine says 'STOP and file an issue' (the engine-wall rule) while carrying no
+    Feedback section at all — i.e. the headline example of the issue was itself the gap.
+    """
+
+    SKILLS = ["check", "look", "drive", "consult", "workflow-swarms"]
+
+    def _skill(self, name):
+        return (PLUGIN_ROOT / "skills" / name / "SKILL.md").read_text()
+
+    @pytest.mark.parametrize("skill", SKILLS)
+    def test_every_skill_carries_a_feedback_recipe(self, skill):
+        """No skill may tell a session to file an issue without saying how."""
+        text = self._skill(skill)
+        assert "## Feedback" in text, "{}: no Feedback section".format(skill)
+        assert "gh issue create" in text, "{}: Feedback section has no command".format(skill)
+
+    @pytest.mark.parametrize("skill", SKILLS)
+    def test_recipe_pins_the_full_label_set(self, skill):
+        """`bulldozer` + the skill label + a kind label — the convention #185 missed.
+        Labels must be LITERAL in the recipe, not left to `gh label list` guesswork."""
+        text = self._skill(skill)
+        recipe = text.split("## Feedback", 1)[1]
+        assert "bulldozer" in recipe, "{}: recipe omits the bulldozer label".format(skill)
+        assert skill in recipe, "{}: recipe omits its own skill label".format(skill)
+        assert re.search(r"feedback|enhancement", recipe), \
+            "{}: recipe omits the kind label".format(skill)
+
+    def test_drive_engine_wall_doctrine_points_at_the_recipe(self):
+        """The engine-wall rule ('a demonstrated cdp.py wall files an issue') is the
+        doctrine step #186 names — it must resolve to a recipe, not to a guess."""
+        text = self._skill("drive")
+        assert "STOP and file an" in text, "the engine-wall doctrine step vanished"
+        recipe = text.split("## Feedback", 1)[1]
+        assert "cdp.py" in recipe, "drive's Feedback section must cover the engine wall"
+
+    def test_drive_engine_wall_variant_is_executable_with_its_own_labels(self):
+        """codex #186 r1 (P2): the prose said 'same labels plus enhancement' while the only
+        runnable command carried three labels — a session told to run it verbatim would file
+        the capability request without the kind label. The variant must be its own command."""
+        recipe = self._skill("drive").split("## Feedback", 1)[1]
+        walls = [b for b in recipe.split("```") if "cdp.py wall" in b and "gh issue create" in b]
+        assert walls, "no executable engine-wall invocation"
+        assert "enhancement" in walls[0], "engine-wall command omits the enhancement label"
+
+    def test_drive_grants_the_write_tool_its_recipe_needs(self):
+        """codex #186 r2 (P1): the safe recipe builds the body with the Write tool, but the
+        frontmatter listed only Bash/Read/AskUserQuestion — a contradiction that invites the
+        agent back onto the shell path this fix removed."""
+        head = self._skill("drive").split("---")[1]
+        assert re.search(r'allowed-tools:.*"Write"', head), \
+            "drive's recipe needs Write; the frontmatter must grant it"
+
+    def test_drive_body_path_is_unique_per_invocation(self):
+        """codex #186 r2 (P2): drive fans out across lanes and subagents. A fixed
+        /tmp/drive-issue.md lets one session overwrite another's evidence between Write,
+        append and gh — filing the wrong page's failure."""
+        recipe = self._skill("drive").split("## Feedback", 1)[1]
+        assert "mktemp" in recipe, "the issue-body path must be unique per invocation"
+        assert "--body-file /tmp/drive-issue.md" not in recipe, "fixed body path still wired to gh"
+        # codex #186 r3 (P2), reproduced live: BSD mktemp substitutes TRAILING X's only —
+        # `mktemp /tmp/x-XXXXXX.md` exits 0 and prints the template VERBATIM, so the
+        # "unique" path collides for every session, silently. And the file form CREATES the
+        # file, which the Write tool then refuses as an unread existing file. -d + a fresh
+        # file inside dodges both.
+        cmds = [ln.split("#")[0].strip() for ln in recipe.splitlines()
+                if ln.strip().startswith("mktemp")]
+        # codex #186 r4: assert the command EXISTS before validating it — the prose also says
+        # "mktemp", so a loop over zero command lines would report green vacuously.
+        assert cmds, "the recipe explains mktemp but ships no runnable mktemp command"
+        for cmd in cmds:
+            assert cmd.endswith("XXXXXX"), \
+                "BSD mktemp only substitutes TRAILING X's; template collides: {!r}".format(cmd)
+            assert " -d " in cmd, "mktemp must make a DIR — the file form blocks the Write tool"
+
+    def test_drive_recipe_never_shell_expands_untrusted_evidence(self):
+        """codex #186 r1 (P1): drive pastes FAIL lines / console errors from the page UNDER
+        TEST into the issue body. A page can put $(…) or backticks in an error message, so an
+        unquoted heredoc into --body would execute it as the operator. The body must reach gh
+        through --body-file, never through a shell-expanded heredoc."""
+        recipe = self._skill("drive").split("## Feedback", 1)[1]
+        assert "--body-file" in recipe, "drive recipe must file the body from a file"
+        assert "--body \"$(cat <<" not in recipe, \
+            "drive recipe still builds --body via a shell-expanded heredoc"
+        assert "<<ISSUE" not in recipe, "drive recipe still carries an expanding heredoc"
+
+
+class TestReadmeLogFormat:
+    """#322 tail: the README is the first thing a future log-miner author reads. Its
+    `## Log Format` section still showed the PRE-#322 grammar (no `event=` key, one log),
+    which would send that author straight into writing a parser for a format that no
+    longer exists. There are no miners in the repo yet — this is the contract they will
+    be built against, so it has to be true."""
+
+    LOGS = ["bulldozer.log", "bulldozer-codex.log", "bulldozer-consult.log",
+            "bulldozer-look.log", "bulldozer-drive.log", "require-workflow-skill.log"]
+
+    def _readme(self):
+        return (PLUGIN_ROOT / "README.md").read_text()
+
+    def test_sample_line_carries_the_event_key(self):
+        """The canonical grammar is `{ts} | event={event} | session={sid} | k=v …` —
+        every sample line in the README must show it."""
+        section = self._readme().split("## Log Format", 1)[1].split("\n## ", 1)[0]
+        samples = [ln for ln in section.splitlines()
+                   if re.match(r"^\d{4}-\d{2}-\d{2}T", ln.strip())]
+        assert samples, "no sample log line in the README"
+        for ln in samples:
+            assert "| event=" in ln, "sample line predates #322 (no event= key): {}".format(ln)
+
+    def test_all_stable_logs_are_named(self):
+        """Six stable channels ship today; a miner author must not discover them by grep."""
+        section = self._readme().split("## Log Format", 1)[1].split("\n## ", 1)[0]
+        for log in self.LOGS:
+            assert log in section, "README's Log Format omits {}".format(log)
+
+    def test_points_at_the_grammar_spec_and_the_writer(self):
+        """Single source of truth, so the README cannot silently drift again."""
+        section = self._readme().split("## Log Format", 1)[1].split("\n## ", 1)[0]
+        assert "lib/bulldozer_log.py" in section
+        assert "2026-07-11-bulldozer-log-grammar-design.md" in section
+
+    def test_non_canonical_producers_are_named(self):
+        """codex #186 r1 (P2): two writers are NOT on the shared helper — verified against
+        the live logs: codex emits `ts | TURN_OK | k=v` (positional event, no session=, no
+        offset) and consult_panel's completion line has no event=. A miner told 'every line
+        uses the grammar' would silently DISCARD current records, not just old history."""
+        section = self._readme().split("## Log Format", 1)[1].split("\n## ", 1)[0]
+        assert "NOT on the shared writer" in section, \
+            "README still implies every line goes through lib/bulldozer_log.py"
+        assert "codex_server.py" in section, "README hides the codex log's positional-event shape"
+        assert "consult_panel.py" in section, "README hides consult's un-migrated completion line"
+        # codex #186 r2 (P2): a THIRD producer — consult/SKILL.md echoes completion lines
+        # itself, with `model=` SINGULAR where the panel writes `models=` plural. A miner
+        # supporting only the panel shape would drop every inline single-codex consult.
+        assert "consult/SKILL.md" in section, "README hides the inline consult writer"
+        assert "singular" in section, "README must warn about model= vs models="
+
+    def test_redaction_claim_is_scoped_to_where_it_exists(self):
+        """codex #186 r1 (P2): URL/JS redaction lives in cdp.py ONLY. Claiming it plugin-wide
+        would tell a reader that bulldozer-codex.log is safe to share — it is not."""
+        section = self._readme().split("## Log Format", 1)[1].split("\n## ", 1)[0]
+        assert re.search(r"scoped to the look channel", section), \
+            "README must scope the redaction guarantee to the channel that implements it"
