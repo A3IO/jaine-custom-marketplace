@@ -277,3 +277,64 @@ def test_in_tree_subdir_still_read(tmp_path):
                              "quote": "present here", "anchor": {}}])
     assert rc == 0
     assert [f["id"] for f in s] == ["X"]
+
+
+def test_string_anchor_drop_reason_on_stderr(tmp_path):
+    """#184: an anchor-requiring class with a STRING anchor is dropped (fail-open
+    stays intact) but must SAY so on stderr — the incident hid 5 verbatim-present
+    findings behind the silent isinstance coercion and the audit looked clean."""
+    _doc(tmp_path, "spec.md", "A says up\nB says down")
+    fin = tmp_path / "e1-findings.json"
+    fin.write_text(json.dumps({"findings": [
+        {"id": "F1", "class": "internal_contradiction", "file": "spec.md",
+         "quote": "A says up", "anchor": "Section 3"},
+        {"id": "F2", "class": "cross_spec_drift", "file": "spec.md",
+         "quote": "B says down", "anchor": "see other spec"},
+    ]}))
+    out = tmp_path / "e1-verified.json"
+    r = _verify(fin, out, tmp_path)
+    assert r.returncode == 0
+    assert json.loads(out.read_text())["findings"] == []
+    for fid in ("F1", "F2"):
+        assert fid in r.stderr, "no drop reason for {} on stderr".format(fid)
+    assert "anchor" in r.stderr and "str" in r.stderr
+
+
+def test_string_anchor_tolerated_where_not_required(tmp_path):
+    """#184 companion: dead_ref/stale_term need no anchor sub-fields — a string
+    anchor there must neither drop the finding nor spam stderr."""
+    _doc(tmp_path, "spec.md", "see section 9 for details")
+    fin = tmp_path / "e1-findings.json"
+    fin.write_text(json.dumps({"findings": [
+        {"id": "F1", "class": "dead_ref", "file": "spec.md",
+         "quote": "see section 9", "anchor": "section 9"}]}))
+    out = tmp_path / "e1-verified.json"
+    r = _verify(fin, out, tmp_path)
+    assert r.returncode == 0
+    assert [f["id"] for f in json.loads(out.read_text())["findings"]] == ["F1"]
+    assert "WARNING" not in r.stderr, "tolerated class must not warn: " + r.stderr
+
+
+def test_warning_write_failure_stays_fail_open(tmp_path):
+    """PR #339 codex P2, reproduced live: with stderr a broken pipe, the #184
+    warning print raised EPIPE before the survivors file was written — exit 120,
+    no out file. The diagnostic must be best-effort: fail-open exit-0 + out file
+    ALWAYS, whatever stderr is."""
+    import os
+    _doc(tmp_path, "spec.md", "A says up")
+    fin = tmp_path / "e1-findings.json"
+    fin.write_text(json.dumps({"findings": [
+        {"id": "F1", "class": "internal_contradiction", "file": "spec.md",
+         "quote": "A says up", "anchor": "Section 3"}]}))
+    out = tmp_path / "e1-verified.json"
+    r, w = os.pipe()
+    os.close(r)  # reader gone → child's stderr writes hit EPIPE
+    try:
+        p = subprocess.run(
+            [sys.executable, str(VERIFY), "--findings", str(fin),
+             "--out", str(out), "--project-root", str(tmp_path)],
+            stderr=w, stdout=subprocess.PIPE, timeout=10)
+    finally:
+        os.close(w)
+    assert p.returncode == 0
+    assert json.loads(out.read_text())["findings"] == []

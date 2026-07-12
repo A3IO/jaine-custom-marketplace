@@ -12,6 +12,7 @@ Test strategy mirrors test_check_pipeline_integration.py:
 from __future__ import annotations
 
 import json
+import re
 import os
 import stat
 import subprocess
@@ -4010,3 +4011,55 @@ class TestCalibratedEarlyPivot:
             f"exhaustive round 4 (< 5) → no early pivot, exit 0, got "
             f"{result.returncode}\nstderr: {result.stderr}"
         )
+
+
+class TestCalibratedPivotProseSync:
+    """#133 F4: the B6 predicate's numbers live ONCE in bash
+    (CALIBRATED_PIVOT_MIN_ROUND / CALIBRATED_PIVOT_AVG_THRESHOLD) but the prose
+    re-hardcodes them in SKILL.md and the plugin-root CLAUDE.md. Nothing tied
+    them together — a re-tune would desync the manual exit-11 mirror from the
+    wrapper. This guard pins every prose mention to the bash constants."""
+
+    ROUND_RE = re.compile(r"(?:ROUND|round)\s*[>≥]=?\s*(\d+)")
+    THRESH_RE = re.compile(r"[>≥]=?\s*(\d+\.\d+)")
+
+    def _bash_constants(self):
+        text = (PLUGIN_ROOT / "skills" / "check" / "scripts" / "bulldozer-round.sh").read_text()
+        min_round = re.search(r"^CALIBRATED_PIVOT_MIN_ROUND=(\d+)$", text, re.M).group(1)
+        threshold = re.search(r"^CALIBRATED_PIVOT_AVG_THRESHOLD=(\d+\.\d+)$", text, re.M).group(1)
+        return min_round, threshold
+
+    def _pivot_lines(self, path):
+        """Return the calibrated CLAUSE of each mentioning line — the substring
+        from the first B6/calibrated marker on. Line-wide scanning is too greedy:
+        the wrapper-description line also carries the unrelated `ROUND >= 2`
+        trajectory-print threshold BEFORE its B6 clause."""
+        clauses = []
+        for ln in path.read_text().splitlines():
+            idxs = [i for i in (ln.find("B6"), ln.find("alibrated")) if i != -1]
+            if not idxs:
+                continue
+            clause = ln[min(idxs):]
+            if self.ROUND_RE.search(clause) or self.THRESH_RE.search(clause):
+                clauses.append(clause)
+        return clauses
+
+    def _assert_synced(self, path, min_lines):
+        min_round, threshold = self._bash_constants()
+        lines = self._pivot_lines(path)
+        assert len(lines) >= min_lines, \
+            "{}: expected >= {} calibrated-pivot mentions, found {} — guard gone vacuous".format(
+                path.name, min_lines, len(lines))
+        for ln in lines:
+            for got in self.ROUND_RE.findall(ln):
+                assert got == min_round, "{}: prose says round >= {}, bash says {}:\n{}".format(
+                    path.name, got, min_round, ln)
+            for got in self.THRESH_RE.findall(ln):
+                assert got == threshold, "{}: prose says >= {}, bash says {}:\n{}".format(
+                    path.name, got, threshold, ln)
+
+    def test_skill_md_prose_matches_bash_constants(self):
+        self._assert_synced(PLUGIN_ROOT / "skills" / "check" / "SKILL.md", 4)
+
+    def test_claude_md_prose_matches_bash_constants(self):
+        self._assert_synced(PLUGIN_ROOT / "CLAUDE.md", 1)

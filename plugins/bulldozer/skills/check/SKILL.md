@@ -185,7 +185,16 @@ round prompt, every round:
    just-shipped auditor stays unregistered until the consumer reloads — do the
    four-class locate **inline yourself** instead: read the artifact (and its sibling
    specs) and produce the SAME `{id, class, file, quote, anchor}` envelope, copying
-   every quote verbatim. (Inline is equivalent for correctness — the verifier below
+   every quote verbatim. `anchor` is a DICT, never a string — required keys per
+   class (`skills/check/data/e1-evidence-schema.json` → `anchor_by_class`):
+   `dead_ref`→`ref`, `internal_contradiction`→`quote_b` (the second conflicting
+   quote, verbatim), `cross_spec_drift`→`other_file`+`other_quote`,
+   `stale_term`→`exclude_section`. Produce a dict for EVERY class (that is the
+   schema contract); enforcement differs by class — on the two that need
+   sub-fields (`internal_contradiction`, `cross_spec_drift`) a string anchor
+   is a guaranteed drop and the verifier warns on stderr; on `dead_ref`/
+   `stale_term` it is tolerated but off-contract (#184).
+   (Inline is equivalent for correctness — the verifier below
    drops hallucinated quotes regardless of who located them; the subagent is only a
    cost-isolation optimization.) Either way, YOU write the envelope to
    `${REVIEW_DIR}/e1-findings-r${ROUND}.json` (the agent is read-only — it cannot write
@@ -238,7 +247,7 @@ BULLDOZER_DIR=$( { [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT
 wrapper_exit=$?
 ```
 
-The wrapper runs codex FOREGROUND with the right `-s read-only -m -o -C` flags + depth-specific reasoning effort, invokes `parse-ledger-patch.py` on the resulting `verdict-r${ROUND}.txt`, calls `log-round.sh` (which updates `state.json` and appends to `bulldozer.log`), prints the trajectory to stderr when `ROUND >= 2`, and on a pivot trigger — the flat `ROUND >= max_rounds && verdict != GO`, or the B6 calibrated exhaustive early-pivot (#128: `depth == exhaustive && ROUND >= 5 && verdict != GO && mean-last-3 findings >= 3.0`) — writes `pivot-r${ROUND}.json` with AskUserQuestion options and exits 10.
+The wrapper runs codex FOREGROUND with the right `-s read-only -m -o -C` flags + depth-specific reasoning effort, invokes `parse-ledger-patch.py` on the resulting `verdict-r${ROUND}.txt`, calls `log-round.sh` (which updates `state.json` and appends to `bulldozer.log`), prints the trajectory to stderr when `ROUND >= 2`, and on a pivot trigger — the flat `ROUND >= max_rounds && verdict != GO`, or the B6 calibrated exhaustive early-pivot (#128: `depth == exhaustive && ROUND >= 5 && verdict != GO && mean-last-3 findings >= 3.0`; numbers' source of truth = `CALIBRATED_PIVOT_MIN_ROUND`/`CALIBRATED_PIVOT_AVG_THRESHOLD` in `bulldozer-round.sh`, prose pinned to them by a drift-guard test, #133) — writes `pivot-r${ROUND}.json` with AskUserQuestion options and exits 10.
 
 stdout carries the final `state.json` contents so you can read trajectory or open findings without re-reading the file.
 

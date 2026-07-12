@@ -924,3 +924,23 @@ class TestLookDocResidue187And172:
             "no cross-Bash-call persistence warning for the pinned target"
         assert "--target <id12> screenshot" in quick, \
             "no pinned screenshot form in the workflow"
+
+
+class TestE1AnchorContractInEnvelope:
+    """#184: the envelope sentence in Step 1.7 is the ONLY contract the
+    main-session Claude has when serializing e1-findings (both the agent-dispatch
+    and inline branches — the agent returns text; Claude writes the JSON). It said
+    just '{id, class, file, quote, anchor}', so a string anchor looked valid —
+    and the verifier silently dropped 5 verbatim-present findings (fail-open)."""
+
+    def _step17(self):
+        text = (PLUGIN_ROOT / "skills" / "check" / "SKILL.md").read_text()
+        return text.split("{id, class, file, quote, anchor}", 1)[1][:900]
+
+    def test_anchor_documented_as_dict_with_per_class_keys(self):
+        after = self._step17()
+        assert "DICT" in after or "dict" in after, "anchor shape not stated"
+        for key in ("quote_b", "other_file", "other_quote", "ref", "exclude_section"):
+            assert key in after, "per-class anchor key {} undocumented".format(key)
+        assert "e1-evidence-schema.json" in after, \
+            "no pointer to the schema that defines anchor_by_class"

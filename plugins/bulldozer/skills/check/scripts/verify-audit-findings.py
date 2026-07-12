@@ -82,6 +82,22 @@ def survives(finding, root):
     return True
 
 
+def _warn(msg):
+    """Best-effort stderr diagnostic — a write failure must never break the
+    fail-open exit-0 contract (broken-pipe stderr reproduced exit 120 with no
+    survivors file, PR #339)."""
+    try:
+        print(msg, file=sys.stderr)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        # Swap in devnull: a caught EPIPE leaves the buffer dirty, and the
+        # interpreter's SHUTDOWN flush would re-raise it → exit 120 anyway.
+        try:
+            sys.stderr = open(os.devnull, "w")
+        except OSError:
+            pass
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--findings", required=True)
@@ -96,6 +112,18 @@ def main(argv):
             findings = []
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         findings = []  # fail-open (UnicodeDecodeError = non-UTF-8 findings file)
+
+    # #184: a string anchor on an anchor-requiring class is a guaranteed drop
+    # (survives() coerces it to {} and the required sub-fields come up empty).
+    # The drop stays fail-open, but it must be VISIBLE — the incident hid 5
+    # verbatim-present findings behind this and the audit looked clean.
+    for f in findings:
+        if isinstance(f, dict) and f.get("class") in ("internal_contradiction", "cross_spec_drift") \
+                and not isinstance(f.get("anchor"), dict):
+            _warn("WARNING: {} (class {}) will be dropped: anchor must be a dict with "
+                  "per-class sub-fields, got {} — see "
+                  "skills/check/data/e1-evidence-schema.json (anchor_by_class)".format(
+                      f.get("id", "<no id>"), f.get("class"), type(f.get("anchor")).__name__))
 
     survivors = [f for f in findings if isinstance(f, dict) and survives(f, args.project_root)]
     Path(args.out).write_text(json.dumps({"findings": survivors}, indent=2), encoding="utf-8")
