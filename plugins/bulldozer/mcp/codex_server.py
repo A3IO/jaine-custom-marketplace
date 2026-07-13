@@ -327,8 +327,14 @@ def _drift_warn(acc, code: str, detail: str) -> None:
         path = os.environ.get("BULLDOZER_CODEX_LOG") or os.path.expanduser(
             "~/.claude/hooks/bulldozer-codex.log")
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        # #344 facade: the ONE engine touch — a facade worker sets
+        # BULLDOZER_WORKER=N, stamping every audit line (TURN_OK/TURN_ERROR/
+        # APPROVAL/… all route through here) with its worker id. Unset → the
+        # line stays byte-identical to the single-bridge format.
+        worker = os.environ.get("BULLDOZER_WORKER")
+        suffix = f" | worker={worker}" if worker else ""
         with open(path, "a") as f:
-            f.write(f"{_now_iso()} | {code} | {detail}\n")
+            f.write(f"{_now_iso()} | {code} | {detail}{suffix}\n")
     except Exception:
         pass
 
