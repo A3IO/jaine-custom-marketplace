@@ -498,15 +498,42 @@ SERVER_INSTRUCTIONS = (
 )
 
 
+def _lane_instructions() -> str:
+    """The instructions manifest, lane-aware. When this process is a FAN-OUT LANE (a named
+    `claude mcp add codex-laneN --env BULLDOZER_LANE=N …` registration of this same server),
+    a concrete routing preamble LEADS the manifest — otherwise a fresh session sees several
+    identical codex servers and has no way to know the lanes exist FOR parallel subagent
+    dispatch (lane-pool, 2026-07-13: N lane registrations = N processes = true parallelism;
+    one subagent per lane, since subagents SHARE each registration's single connection).
+    No env → byte-identical to SERVER_INSTRUCTIONS (plugin server, consumer configs)."""
+    lane = (os.environ.get("BULLDOZER_LANE") or "").strip()
+    # Simple-integer validation (Copilot, PR #342): a non-numeric value ("lane1", "1-2", a
+    # newline) would advertise a tool name that cannot exist (mcp__codex-lanelane1__…) and
+    # could mangle the manifest — misconfiguration degrades to the plain instructions.
+    if not lane.isdigit():
+        return SERVER_INSTRUCTIONS
+    return (
+        f"FAN-OUT LANE {lane} (lane pool): use this server to run codex jobs IN PARALLEL from "
+        "subagents — assign ONE subagent per lane; a second concurrent call into the SAME lane "
+        "is rejected (`codex turn already in flight`). Parked approvals are LANE-LOCAL: if a "
+        f"codex_run here returns awaiting_approval, resume it with THIS lane's codex_approve "
+        f"(mcp__codex-lane{lane}__codex_approve) — any other server answers `parked turn "
+        "expired`. Route single interactive codex work through the primary bulldozer codex "
+        "server (or any idle lane).\n\n"
+        + SERVER_INSTRUCTIONS
+    )
+
+
 def _initialize_result(params: dict) -> dict:
     """Build the MCP initialize reply. Carries an `instructions` routing manifest — CC injects
     InitializeResult.instructions into the model's context on connect, giving it a server-level
-    map to discover/choose codex_review / codex_run / codex_info (#256)."""
+    map to discover/choose codex_review / codex_run / codex_info (#256); lane registrations
+    self-describe as fan-out lanes (BULLDOZER_LANE, above)."""
     return {
         "protocolVersion": params.get("protocolVersion", PROTO),
         "capabilities": {"tools": {}},
         "serverInfo": {"name": "bulldozer-codex", "version": _plugin_version()},
-        "instructions": SERVER_INSTRUCTIONS,
+        "instructions": _lane_instructions(),
     }
 
 

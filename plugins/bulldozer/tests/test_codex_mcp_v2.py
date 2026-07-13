@@ -8552,3 +8552,52 @@ def test_dialog_answer_after_deadline_is_a_timeout(monkeypatch):
         cap_s=0.0, wait_state=ws)                    # budget expires the instant we start
     assert status == "timeout", f"a late answer was honored: {(status, out)}"
     assert ws.get("timed_out") is True
+
+
+# --- lane discoverability: BULLDOZER_LANE self-describes in the MCP instructions ---
+
+def test_lane_env_prepends_fanout_preamble(monkeypatch):
+    """A fresh session sees three identical codex servers (plugin + lanes) and has no way to
+    know lane1/lane2 exist FOR parallel subagent fan-out. With BULLDOZER_LANE=N set (via the
+    lane's `claude mcp add --env`), the initialize instructions must LEAD with a concrete
+    routing preamble (CC injects InitializeResult.instructions on connect — the one channel
+    that reaches every session without reading docs)."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_LANE", "1")
+    res = cs._initialize_result({})
+    instr = res["instructions"]
+    assert instr.startswith("FAN-OUT LANE 1"), instr[:80]
+    assert "ONE subagent per lane" in instr
+    assert "codex turn already in flight" in instr        # names the failure a shared lane hits
+    # park affinity (codex review): the park token lives in THIS lane's process — approvals
+    # must be resumed via the SAME lane's codex_approve, or `parked turn expired`.
+    assert "mcp__codex-lane1__codex_approve" in instr
+    assert "parked turn expired" in instr
+    assert cs.SERVER_INSTRUCTIONS in instr                # base routing manifest preserved
+
+
+def test_no_lane_env_keeps_instructions_byte_identical(monkeypatch):
+    """Without the env (plugin server, consumer configs) the instructions are unchanged."""
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_LANE", raising=False)
+    res = cs._initialize_result({})
+    assert res["instructions"] == cs.SERVER_INSTRUCTIONS
+
+
+def test_blank_lane_env_keeps_instructions_byte_identical(monkeypatch):
+    """An empty/whitespace BULLDOZER_LANE must not produce a mangled 'FAN-OUT LANE ' header."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_LANE", "  ")
+    res = cs._initialize_result({})
+    assert res["instructions"] == cs.SERVER_INSTRUCTIONS
+
+
+def test_non_numeric_lane_env_falls_back_clean(monkeypatch):
+    """Copilot (PR #342): a non-integer BULLDOZER_LANE ('lane1', '1-2', newline garbage) would
+    advertise an impossible tool name (mcp__codex-lanelane1__codex_approve) and could mangle
+    the manifest — misconfiguration must degrade to the plain instructions, not a broken
+    preamble."""
+    import codex_server as cs
+    for bad in ("lane1", "1-2", "1\n2", "один"):
+        monkeypatch.setenv("BULLDOZER_LANE", bad)
+        assert cs._initialize_result({})["instructions"] == cs.SERVER_INSTRUCTIONS, bad
