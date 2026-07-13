@@ -38,6 +38,7 @@ import os
 import re
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -2142,13 +2143,16 @@ def _approval_decision_label(decision) -> str:
     return "other"
 
 
-def _log_approval_event(method, decision, wait_ms, timed_out, unattended=False, rule=None) -> None:
+def _log_approval_event(method, decision, wait_ms, timed_out, unattended=False, rule=None,
+                        ui=None) -> None:
     """Best-effort one-line record of a completed approval (#251 step-0).
 
     Reuses the stable codex log channel (BULLDOZER_CODEX_LOG / bulldozer-codex.log).
     NEVER raises — logging must never break an approval. When the unattended judge (#251)
     decided in-process, appends `| unattended=true | rule=<verdict>` so the operator can
     review what was auto-decided while away (attended lines keep the original format).
+    #340: when the native dialog answered, appends `| ui=dialog` (additive; cc-mode lines
+    stay byte-compatible with the pre-#340 format).
     """
     def _san(v):
         # Keep the line greppable for the #251 miner: a CC-controlled value (e.g. the
@@ -2157,6 +2161,8 @@ def _log_approval_event(method, decision, wait_ms, timed_out, unattended=False, 
         return str(v).replace("\n", " ").replace("\r", " ").replace("|", "/")
     try:
         extra = f" | unattended=true | rule={_san(rule)}" if unattended else ""
+        if ui and ui != "cc":
+            extra += f" | ui={_san(ui)}"
         # single shared writer (#322 PR2): same line format, one open/append path
         _drift_warn(None, "APPROVAL", (
             f"method={_san(method)} | "
@@ -2202,6 +2208,293 @@ def _unattended_active() -> bool:
         return bool(sentinel) and os.path.exists(sentinel)
     except Exception:
         return False
+
+
+# ── #340: approval UI — CC TUI elicitation (default) vs native macOS dialog ────────────
+# Engine borrowed from the proven guards confirm-dialog (plugins/guards/hooks/
+# guard-confirm-dialog.sh): text is never spliced into the script (no AppleScript injection) —
+# the BODY/TITLE travel in the child's ENV (read via `system attribute`), since argv would
+# publish a credential-bearing approval in the process table (round-6 P2); argv carries only
+# non-secret chrome (give-up integer, button names, display labels). Allow = default
+# button (Enter-activated — the guards #311 tradeoff: a stray Enter allows, silence still
+# fail-safe declines), timeout → decline, Basso beeper until answered. macOS caps a dialog
+# at 3 buttons, so the FULL label set (amendments / "Cancel the turn") lives behind
+# "Опции…" (choose from list). Applies ONLY to the label-enum arms of
+# _bridge_approval_dispatch; requestUserInput / mcpServer elicitation stay on the CC path
+# (arbitrary schemas can't be rendered as buttons).
+
+_APPROVAL_DIALOG_SENTINEL_DEFAULT = "~/.claude/bulldozer-approval-dialog"
+_DIALOG_TITLE = "🤖 Codex approval"
+_BTN_OPTIONS = "Опции…"
+_DIALOG_UNAVAILABLE = object()   # sentinel: dialog could not be SHOWN → fall back to CC
+
+# Buttons + the default button are passed IN (argv), because "Allow" must NOT be offered when
+# codex's availableDecisions omit plain `accept` (amendment-only shape): a bare Allow there would
+# synthesize an UNOFFERED decision (codex round-2 P1). `cancel button "Deny"` makes Esc dismiss
+# the dialog at all: AppleScript fires Escape ONLY when some button is designated the cancel
+# button (verified live 2026-07-13 — without it Esc was inert and the user had to click Deny).
+# Esc AND clicking Deny both raise -128 → _osascript_stage returns 'esc' → decline.
+_ENV_BODY = "BULLDOZER_DIALOG_BODY"      # the approval text — may carry a literal credential
+_ENV_TITLE = "BULLDOZER_DIALOG_TITLE"
+
+# The BODY travels in the child's ENVIRONMENT, never in argv: an approval message can quote a
+# codex command that contains a token (`curl -H "Authorization: Bearer …"`), and argv is world-
+# readable in the process table for the dialog's whole lifetime, while macOS does not expose one
+# uid's environment to another (codex round-6 P2). argv keeps only non-secret chrome: the give-up
+# integer, the button names, and (stage 2) the display labels — LBL_* constants, or a host/kind
+# from codex's own amendment offer; none is a credential.
+_DIALOG_STAGE1 = '''on run argv
+    set bodyText to system attribute "BULLDOZER_DIALOG_BODY"
+    set titleText to system attribute "BULLDOZER_DIALOG_TITLE"
+    set giveUp to (item 1 of argv) as integer
+    set defBtn to item 2 of argv
+    set btns to items 3 thru -1 of argv
+    set r to display dialog bodyText with title titleText buttons btns default button defBtn cancel button "Deny" with icon caution giving up after giveUp
+    if gave up of r then
+        return "GAVEUP"
+    end if
+    return button returned of r
+end run'''
+
+_DIALOG_STAGE2 = '''on run argv
+    set bodyText to system attribute "BULLDOZER_DIALOG_BODY"
+    set titleText to system attribute "BULLDOZER_DIALOG_TITLE"
+    set opts to items 1 thru -1 of argv
+    set pick to choose from list opts with title titleText with prompt bodyText default items {item 1 of opts}
+    if pick is false then
+        return "CANCELLED"
+    end if
+    return item 1 of pick
+end run'''
+
+
+def _approval_ui() -> str:
+    """'dialog' | 'cc' — which UI answers ATTENDED approvals (#340). env BULLDOZER_APPROVAL_UI
+    wins both ways ('dialog' arms it, explicit 'cc'/'tui' disarms — the test-suite hermeticity
+    hook); otherwise the sentinel file (BULLDOZER_APPROVAL_DIALOG_FILE, default
+    ~/.claude/bulldozer-approval-dialog) toggles dialog mode LIVE (touch/rm — the server env is
+    fixed at spawn, the file is not; mirrors the #277 unattended sentinel). Resolved FRESH per
+    approval. Default 'cc' → the pre-#340 elicitation path, byte-identical."""
+    env = (os.environ.get("BULLDOZER_APPROVAL_UI") or "").strip().lower()
+    if env == "dialog":
+        return "dialog"
+    if env in ("cc", "tui"):
+        return "cc"
+    sentinel = os.environ.get("BULLDOZER_APPROVAL_DIALOG_FILE") or os.path.expanduser(
+        _APPROVAL_DIALOG_SENTINEL_DEFAULT)
+    try:
+        if sentinel and os.path.exists(sentinel):
+            return "dialog"
+    except Exception:
+        pass
+    return "cc"
+
+
+def _warn_stderr(msg: str) -> None:
+    """Best-effort stderr diagnostic. A write failure must never break the caller — stderr can
+    be closed/broken (line-buffered → the newline flushes → EPIPE), and the #340 no-GUI fallback
+    warns BEFORE sending the CC elicitation, so a raising warn would leave codex's approval
+    unanswered (codex P2, reproduced). Swap in devnull after a failure: a CAUGHT EPIPE leaves the
+    buffer dirty and the interpreter's SHUTDOWN flush re-raises it (the PR #339 lesson)."""
+    try:
+        print(msg, file=sys.stderr)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        try:
+            sys.stderr = open(os.devnull, "w")
+        except OSError:
+            pass
+
+
+# The beeper is a DETACHED shell: if the server is SIGKILLed while a dialog is up,
+# `_dialog_label_elicit`'s finally never runs (codex P2, reproduced — the loop beeped on after
+# the parent died). So the loop is self-limiting on BOTH axes: it exits when its parent is gone
+# (`kill -0 $PPID` each cycle — PPID is captured before the parent can die) and it is hard-bounded
+# by an iteration cap. `start_new_session` puts it in its OWN process group so _stop_beeper can
+# kill the shell AND its in-flight afplay child together (terminate() alone would leave afplay).
+_BEEP_MAX_CYCLES = 1200                     # ~20 min at ~1s/cycle — a backstop, not the mechanism
+
+_BEEPER_SH = f"""
+parent=$PPID
+i=0
+while [ "$i" -lt {_BEEP_MAX_CYCLES} ]; do
+    afplay /System/Library/Sounds/Basso.aiff 2>/dev/null
+    sleep 0.5
+    kill -0 "$parent" 2>/dev/null || exit 0
+    i=$((i+1))
+done
+"""
+
+
+def _start_beeper():
+    """Guards-style attention beeper (Basso loop) while the dialog is up. Best-effort: a
+    missing afplay / spawn failure must never block an approval."""
+    try:
+        return subprocess.Popen(
+            ["/bin/sh", "-c", _BEEPER_SH],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except Exception:
+        return None
+
+
+def _stop_beeper(proc):
+    """Kill the beeper's whole process GROUP (the shell + any in-flight afplay)."""
+    if proc is None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=1)
+    except Exception:
+        pass
+
+
+def _osascript_stage(script, argv, cap_s, pump_fn=None, wait_state=None, env_payload=None):
+    """Run ONE osascript dialog stage NON-blockingly: Popen + poll loop that keeps the
+    approval-wait bookkeeping alive via pump_fn (#252 child drain, #269 CC-frame answering,
+    EOF/our-cancel/terminal detection — the pump sets the ts flags itself). Returns
+    (status, stdout_line):
+      'ok'          — the script returned a line (button name / list pick);
+      'timeout'     — cap expired or the dialog gave up (wait_state['timed_out'] set);
+      'esc'         — the user dismissed the dialog (AppleScript -128) — an ANSWER;
+      'aborted'     — the pump saw eof|cancel|terminal (dialog torn down);
+      'unavailable' — no osascript / no GUI: the dialog could not be shown at all.
+    Text reaches AppleScript via argv / env_payload, never spliced into the script (guards engine
+    rule — $(…)/backticks/quotes inside a codex command cannot execute or break the script).
+    env_payload (the approval BODY) is merged into the child's environment instead of argv, which
+    would publish it in the process table (codex round-6 P2)."""
+    child_env = None
+    if env_payload:
+        child_env = dict(os.environ)
+        child_env.update({k: str(v) for k, v in env_payload.items()})
+    try:
+        proc = subprocess.Popen(["osascript", "-", *[str(a) for a in argv]],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=child_env)
+        proc.stdin.write(script)
+        proc.stdin.close()
+    except (OSError, ValueError):
+        return ("unavailable", "")
+    try:
+        deadline = time.time() + cap_s
+        while proc.poll() is None:
+            if pump_fn is not None:
+                if pump_fn() in ("eof", "cancel", "terminal"):
+                    proc.terminate()
+                    return ("aborted", "")
+            else:
+                time.sleep(0.05)          # no pump (no drain ctx) — just pace the poll
+            if time.time() >= deadline:   # hard backstop: kills the dialog too
+                proc.terminate()
+                if wait_state is not None:
+                    wait_state["timed_out"] = True
+                return ("timeout", "")
+        out = (proc.stdout.read() or "").strip()
+        err = proc.stderr.read() or ""
+        # The loop pumps only WHILE the dialog is alive, so a CC EOF / our-turn cancel / terminal
+        # child frame landing in the instant the user clicks would otherwise go unseen and the
+        # decision would still be written to a dead bridge — the EOF-priority invariant (#218)
+        # must win over a dialog answer. One final non-blocking check (codex round-5 P2).
+        if pump_fn is not None and pump_fn() in ("eof", "cancel", "terminal"):
+            return ("aborted", "")
+        # …and an answer landing PAST the deadline is late, not valid: the loop exits on poll()
+        # without ever running its timeout branch when the process ends just after the last check
+        # (and stage 2 has no native `giving up after` at all). Fail-safe (codex round-7 P2).
+        if time.time() >= deadline:
+            if wait_state is not None:
+                wait_state["timed_out"] = True
+            return ("timeout", "")
+    finally:
+        try:
+            proc.kill()                   # no-op if already exited
+        except Exception:
+            pass
+    if proc.returncode != 0:
+        # -128 = "User canceled" (Esc/Cancel) — an answer, not an outage.
+        return ("esc", "") if "-128" in err else ("unavailable", "")
+    if out == "GAVEUP":
+        if wait_state is not None:
+            wait_state["timed_out"] = True
+        return ("timeout", "")
+    return ("ok", out)
+
+
+def _dialog_label_elicit(message, labels, deadline, allow_ok, pump_fn=None, wait_state=None):
+    """#340: native macOS approval dialog. Stage 1: Deny / Опции… [/ Allow] (Allow default,
+    Enter-activated). `allow_ok` — decided by the ARM from its label→decision MAP — says whether a
+    bare Allow really resolves to plain accept; when it does not (an amendment-only
+    `availableDecisions`, or a drifted decision string that collides with a display label and makes
+    dedupe rename the real accept — round-2 P1 / round-4 P3) the Allow button is DROPPED and Опции…
+    becomes the default, because synthesizing a decision codex never offered would be an invalid
+    protocol reply. Stage 2
+    ("Опции…"): choose-from-list with the FULL label set, so amendments and "Cancel the turn"
+    stay reachable.
+
+    `deadline` is the approval's ABSOLUTE deadline, owned by the caller and SHARED with the
+    CC-fallback wait — so the whole approval (both stages + any fallback) is bounded by ONE budget
+    (a stage that re-received the full timeout could double the wall-clock and blow the
+    bridge/client deadline — codex round-2 P2 / round-3 P2). A stage is never STARTED with an
+    exhausted budget (it could otherwise accept AFTER the deadline — round-3 P2): that declines,
+    audited as timed_out. Esc/Deny = decline (an answer); a stage-2 pick outside the label set =
+    decline (fail-safe, mirrors the perm arm's fail-closed posture). Returns a synthetic
+    elicitation-response frame ({'result': {action, content}}), None (decisive no-answer → the
+    arm's safe decline), or _DIALOG_UNAVAILABLE from EITHER stage (no dialog shown / GUI vanished
+    mid-flow → caller falls back to CC elicitation rather than rejecting the approval)."""
+    def _remaining():
+        return deadline - time.time()
+
+    def _out_of_time():
+        if wait_state is not None:
+            wait_state["timed_out"] = True
+        return None                        # → the arm's safe decline
+
+    buttons = ["Deny", _BTN_OPTIONS] + (["Allow"] if allow_ok else [])
+    default_btn = "Allow" if allow_ok else _BTN_OPTIONS
+
+    rem = _remaining()
+    if rem <= 0:
+        return _out_of_time()
+    # `giving up after` self-dismisses the dialog AT the deadline; the poll-loop cap is the
+    # backstop for a dialog that ignores it. AppleScript needs a >= 1 s integer.
+    give_up = max(1, min(int(rem), 3600))
+
+    beeper = _start_beeper()
+    try:
+        env_payload = {_ENV_BODY: message, _ENV_TITLE: _DIALOG_TITLE}
+        status, out = _osascript_stage(
+            _DIALOG_STAGE1, [give_up, default_btn, *buttons],
+            cap_s=rem, pump_fn=pump_fn, wait_state=wait_state, env_payload=env_payload)
+        if status == "unavailable":
+            return _DIALOG_UNAVAILABLE
+        if status in ("timeout", "aborted"):
+            return None
+        if status == "esc" or out == "Deny":
+            return {"result": {"action": "decline", "content": None}}
+        if out == "Allow" and allow_ok:
+            return {"result": {"action": "accept", "content": {}}}
+        if out != _BTN_OPTIONS:
+            return {"result": {"action": "decline", "content": None}}   # unexpected → fail-safe
+        rem2 = _remaining()
+        if rem2 <= 0:                      # stage 1 ate the whole budget → no stage 2 (r3 P2)
+            return _out_of_time()
+        status2, out2 = _osascript_stage(
+            _DIALOG_STAGE2, [*labels],
+            cap_s=rem2, pump_fn=pump_fn, wait_state=wait_state, env_payload=env_payload)
+        if status2 == "unavailable":       # GUI vanished between the stages → CC, not a decline
+            return _DIALOG_UNAVAILABLE
+        if status2 in ("timeout", "aborted"):
+            return None
+        if status2 == "ok" and out2 in labels:
+            return {"result": {"action": "accept", "content": {"label": out2}}}
+        return {"result": {"action": "decline", "content": None}}   # CANCELLED / esc / junk
+    finally:
+        _stop_beeper(beeper)
 
 
 # read/search tools that, as the LEADING verb, make destructive/network-looking ARGS harmless
@@ -2734,7 +3027,7 @@ def bridge_approval(method: str, params: dict, cc_write_fn, cc_read_fn,
         method, params, cc_write_fn, cc_read_fn, timeout, acc, narrative, wait_state,
         drain_ctx=drain_ctx)
     _log_approval_event(method, decision, int((time.time() - t0) * 1000),
-                        wait_state["timed_out"])
+                        wait_state["timed_out"], ui=wait_state.get("ui"))
     return decision
 
 
@@ -2751,89 +3044,154 @@ def _bridge_approval_dispatch(method: str, params: dict, cc_write_fn, cc_read_fn
     """
     eid = _next_bridge_id()
 
+    # Shared approval-wait bookkeeping (#252/#269) — unpacked ONCE, used by both the
+    # CC-elicitation wait (read_correlated) and the #340 native-dialog pump.
+    _reactor = drain_ctx.get("reactor") if drain_ctx else None
+    _ts = drain_ctx.get("ts") if drain_ctx else None
+    _cc_id = drain_ctx.get("cc_id") if drain_ctx else None
+    drain_active = _reactor is not None and _ts is not None
+
+    def _approval_reply(mid, result=None, error=None):
+        # #269: answer an id-bearing CC request via the approval path's writer (cc_write_fn),
+        # same JSON-RPC 2.0 envelope as the module `reply` / turn-pump path.
+        cc_write_fn({"jsonrpc": "2.0", "id": mid,
+                     ("error" if error else "result"): (error if error else result)})
+
+    def _wait_step(resolve_eid=None, read_timeout=0.05):
+        """ONE iteration of the approval wait: drain the child (#252), read+route one CC frame
+        (#269), detect stdin EOF / our-turn cancel / terminal child. Returns (kind, payload):
+        'resolved' (payload = the elicitation response frame; only when resolve_eid is given),
+        'eof' | 'terminal' | 'cancel' (the ts flags are set exactly as before), or (None, None)
+        for a transient/handled frame. Extracted VERBATIM from the old read_correlated loop
+        body so the CC path and the #340 dialog pump share one bookkeeping implementation."""
+        pending_terminal = None
+        if drain_active:
+            # #252: drain child stdout (child-only, non-blocking). NOTIFICATIONS accumulate via
+            # the shared handler. A NON-notification (turn/start ACK, another server request) is
+            # BUFFERED for the turn loop to re-process — dropping it would falsely time out a
+            # pre-ACK approval (codex P1). A terminal frame is HELD so a same-iteration EOF can
+            # win (codex P2) before we surface it. Non-dict frames are skipped (reviewer F3).
+            for cf in _reactor.pump(timeout=0.0):
+                if not isinstance(cf, dict) or "__cc__" in cf:
+                    continue
+                if classify(cf) != "notification":
+                    _ts.setdefault("drained_frames", []).append(cf)
+                    continue
+                _res = _handle_child_frame(cf, _ts)
+                if _res is not None:
+                    pending_terminal = _res
+        frame = cc_read_fn(timeout=read_timeout)
+        if frame is _CC_EOF:                 # CC stdin closed (#218) → EOF wins (even over a held terminal)
+            if drain_active:
+                _ts["eof_during_approval"] = True
+            return ("eof", None)
+        if pending_terminal is not None:    # terminal child this iteration = turn over (no EOF) → surface it
+            _ts["terminal_during_approval"] = pending_terminal
+            return ("terminal", None)
+        if frame is not None:
+            # Shape-first: ONLY a RESPONSE whose id matches resolves the elicitation.
+            if (resolve_eid is not None and frame.get("id") == resolve_eid
+                    and classify(frame) == "response"):
+                return ("resolved", frame)
+            # A mid-approval cancel for our turn (interrupts enabled, cc_id known) → flag + decline.
+            if (drain_active and _cc_id is not None
+                    and frame.get("method") == "notifications/cancelled"
+                    and (frame.get("params") or {}).get("requestId") == _cc_id
+                    and _interrupts_enabled()):
+                _ts["cancel_during_approval"] = True
+                return ("cancel", None)
+            # #269: otherwise an id-bearing CC request (ping/tools/list/tools/call) MUST be
+            # answered or CC blocks on it (the turn-pump path enforces the same contract via
+            # _route_cc_frame). It answers requests and no-ops notifications / responses /
+            # foreign-or-disabled cancels; its interrupt/teardown return is irrelevant here
+            # (our-turn cancel + EOF are handled above).
+            _route_cc_frame(frame, cc_id=_cc_id, reply_fn=_approval_reply)
+        # transient (None) / skipped frame → caller retries
+        return (None, None)
+
     def read_correlated(eid: int, timeout: float):
-        """Wait for the CC elicitation reply (id==eid response). With drain_ctx active (#252),
-        ALSO drain the codex child each iteration so a flooding child can't deadlock, and detect
-        a mid-approval cancel / stdin EOF / terminal-child frame — each sets a `ts` flag and ends
-        the wait via the per-method `None` decline below, which the turn loop acts on after writing
-        that decline. drain_ctx=None → behavior is byte-identical to before."""
-        _reactor = drain_ctx.get("reactor") if drain_ctx else None
-        _ts = drain_ctx.get("ts") if drain_ctx else None
-        _cc_id = drain_ctx.get("cc_id") if drain_ctx else None
-        drain_active = _reactor is not None and _ts is not None
-
-        def _approval_reply(mid, result=None, error=None):
-            # #269: answer an id-bearing CC request via the approval path's writer (cc_write_fn),
-            # same JSON-RPC 2.0 envelope as the module `reply` / turn-pump path.
-            cc_write_fn({"jsonrpc": "2.0", "id": mid,
-                         ("error" if error else "result"): (error if error else result)})
-
+        """Wait for the CC elicitation reply (id==eid response) — the pre-#340 loop, now a thin
+        driver over _wait_step. With drain_ctx active (#252) it ALSO drains the codex child each
+        iteration and detects a mid-approval cancel / stdin EOF / terminal-child frame — each
+        sets a `ts` flag and ends the wait via the per-method `None` decline below, which the
+        turn loop acts on after writing that decline. drain_ctx=None → byte-identical behavior."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            pending_terminal = None
-            if drain_active:
-                # #252: drain child stdout (child-only, non-blocking). NOTIFICATIONS accumulate via
-                # the shared handler. A NON-notification (turn/start ACK, another server request) is
-                # BUFFERED for the turn loop to re-process — dropping it would falsely time out a
-                # pre-ACK approval (codex P1). A terminal frame is HELD so a same-iteration EOF can
-                # win (codex P2) before we surface it. Non-dict frames are skipped (reviewer F3).
-                for cf in _reactor.pump(timeout=0.0):
-                    if not isinstance(cf, dict) or "__cc__" in cf:
-                        continue
-                    if classify(cf) != "notification":
-                        _ts.setdefault("drained_frames", []).append(cf)
-                        continue
-                    _res = _handle_child_frame(cf, _ts)
-                    if _res is not None:
-                        pending_terminal = _res
             remaining = max(0.0, deadline - time.time())
-            frame = cc_read_fn(timeout=min(remaining, 0.05) if drain_active else remaining)
-            if frame is _CC_EOF:                 # CC stdin closed (#218) → EOF wins (even over a held terminal)
-                if drain_active:
-                    _ts["eof_during_approval"] = True
+            kind, payload = _wait_step(
+                resolve_eid=eid,
+                read_timeout=min(remaining, 0.05) if drain_active else remaining)
+            if kind == "resolved":
+                return payload
+            if kind in ("eof", "terminal", "cancel"):
                 return None
-            if pending_terminal is not None:    # terminal child this iteration = turn over (no EOF) → surface it
-                _ts["terminal_during_approval"] = pending_terminal
-                return None
-            if frame is not None:
-                # Shape-first: ONLY a RESPONSE whose id matches resolves the elicitation.
-                if frame.get("id") == eid and classify(frame) == "response":
-                    return frame
-                # A mid-approval cancel for our turn (interrupts enabled, cc_id known) → flag + decline.
-                if (drain_active and _cc_id is not None
-                        and frame.get("method") == "notifications/cancelled"
-                        and (frame.get("params") or {}).get("requestId") == _cc_id
-                        and _interrupts_enabled()):
-                    _ts["cancel_during_approval"] = True
-                    return None
-                # #269: otherwise an id-bearing CC request (ping/tools/list/tools/call) MUST be
-                # answered or CC blocks on it (the turn-pump path enforces the same contract via
-                # _route_cc_frame). It answers requests and no-ops notifications / responses /
-                # foreign-or-disabled cancels; its interrupt/teardown return is irrelevant here
-                # (our-turn cancel + EOF are handled above).
-                _route_cc_frame(frame, cc_id=_cc_id, reply_fn=_approval_reply)
-            # transient (None) / skipped frame → retry within the deadline
         if _wait_state is not None:
             _wait_state["timed_out"] = True
         return None  # deadline expired without a matching reply
 
-    if method == "item/commandExecution/requestApproval":
-        label_pairs = build_command_approval_labels(params, acc=acc)
-        labels = [lbl for lbl, _ in label_pairs]
-        label_map = dict(label_pairs)
+    def _pump_event():
+        """#340: the dialog-wait pump — one _wait_step with no elicitation to resolve. Returns
+        'eof' | 'terminal' | 'cancel' | None; ~50ms pacing comes from the CC read timeout."""
+        return _wait_step()[0]
+
+    def _elicit(message: str, labels: list, allow_ok: bool):
+        """#340: route one label-enum approval through the selected UI. Dialog mode returns a
+        SYNTHETIC response frame (same {'result': {action, content}} shape CC produces), so the
+        arms' decision mapping (label tables / fail-closed defaults / drift warnings) is
+        UI-agnostic. `allow_ok` (from the arm's label→decision MAP) says whether a BARE accept
+        really resolves to plain accept — the dialog offers its Allow button only then. Dialog
+        unavailable (no GUI / no osascript) → stderr warn + CC-elicitation fallback: an approval
+        must not die headless.
+
+        ONE deadline governs the WHOLE approval — the dialog stages AND a late CC fallback. A
+        fallback that started a fresh full-length wait after a long dialog could block for ~2× the
+        configured timeout and blow the bridge/client deadline (codex round-3 P2); with the budget
+        already spent, no elicitation is opened at all — the approval times out (safe decline). In
+        CC mode the deadline is set here and consumed immediately, so the wait is the full timeout
+        exactly as before. None-sentinel discipline: an EXPLICIT timeout=0 means "already expired"
+        (decline at once, ask nobody) — `timeout or 300` silently turned it into a 5-minute wait
+        (round-4 P2, reproduced: the zero-timeout tests took the full 300 s)."""
+        deadline = time.time() + (300 if timeout is None else timeout)
+        if _approval_ui() == "dialog":
+            if _wait_state is not None:
+                _wait_state["ui"] = "dialog"
+            resp = _dialog_label_elicit(message, labels, deadline, allow_ok,
+                                        pump_fn=_pump_event, wait_state=_wait_state)
+            if resp is not _DIALOG_UNAVAILABLE:
+                return resp
+            if _wait_state is not None:
+                _wait_state["ui"] = "cc"      # fell back — audit the UI that actually answered
+            # best-effort: a broken stderr must NOT abort the fallback (codex P2, reproduced —
+            # BrokenPipeError before the elicitation was sent → codex's approval hung forever)
+            _warn_stderr("bulldozer-codex: approval dialog unavailable (no GUI?) — "
+                         "falling back to CC elicitation")
+        remaining = deadline - time.time()
+        if remaining <= 0:                   # budget spent in the dialog → don't ask CC (r3 P2)
+            if _wait_state is not None:
+                _wait_state["timed_out"] = True
+            return None                      # → the arm's safe decline
         cc_write_fn({
             "jsonrpc": "2.0",
             "id": eid,
             "method": "elicitation/create",
             "params": {
-                "message": _build_command_approval_message(params, narrative),
+                "message": message,
                 "requestedSchema": {
                     "type": "object",
                     "properties": {"label": {"type": "string", "enum": labels}},
                 },
             },
         })
-        resp = read_correlated(eid, timeout)
+        return read_correlated(eid, remaining)
+
+    if method == "item/commandExecution/requestApproval":
+        label_pairs = build_command_approval_labels(params, acc=acc)
+        labels = [lbl for lbl, _ in label_pairs]
+        label_map = dict(label_pairs)
+        # a bare accept is only meaningful if the default label really maps to plain `accept`
+        # (dedupe can rename the real accept when a decision string collides with a display label)
+        allow_ok = label_map.get(LBL_ALLOW_ONCE) == "accept"
+        resp = _elicit(_build_command_approval_message(params, narrative), labels, allow_ok)
         if resp is None:
             return "decline"
         result = resp.get("result", {})
@@ -2842,10 +3200,21 @@ def _bridge_approval_dispatch(method: str, params: dict, cc_write_fn, cc_read_fn
             content = result.get("content") or {}
             # Clicking CC's Accept WITHOUT picking a dropdown label = plain accept
             # (the dropdown is optional, for advanced amendment choices).
-            chosen = content.get("label", LBL_ALLOW_ONCE)
-            if chosen not in label_map:
-                _drift_warn(acc, "OUT_OF_ENUM_LABEL", str(chosen))
-            return label_map.get(chosen, "accept")
+            if "label" in content:
+                chosen = content["label"]
+                if chosen not in label_map:
+                    # An unrecognized label is ambiguous → fail CLOSED (the posture the permissions
+                    # arm already takes, #272). Returning "accept" here sent codex a decision it
+                    # never OFFERED (invalid reply / bypassed the amendment). Round-2 P1.
+                    _drift_warn(acc, "OUT_OF_ENUM_LABEL", str(chosen))
+                    return "decline"
+                return label_map[chosen]
+            # BARE accept (CC's plain Accept, no dropdown pick) — valid only if the default label
+            # really means plain `accept` in THIS offer (round-2 P1 / round-4 P3).
+            if not allow_ok:
+                _drift_warn(acc, "OUT_OF_ENUM_LABEL", "bare-accept, plain accept not offered")
+                return "decline"
+            return "accept"
         if action == "cancel":
             return "cancel"  # abort the turn — distinct from "decline" (skip this command)
         return "decline"
@@ -2859,20 +3228,9 @@ def _bridge_approval_dispatch(method: str, params: dict, cc_write_fn, cc_read_fn
         ]
         labels = [lbl for lbl, _ in fc_pairs]
         fc_map = dict(fc_pairs)
-        cc_write_fn({
-            "jsonrpc": "2.0",
-            "id": eid,
-            "method": "elicitation/create",
-            "params": {
-                "message": _build_simple_approval_message(
-                    "filechange", params.get("reason"), narrative),
-                "requestedSchema": {
-                    "type": "object",
-                    "properties": {"label": {"type": "string", "enum": labels}},
-                },
-            },
-        })
-        resp = read_correlated(eid, timeout)
+        resp = _elicit(_build_simple_approval_message(
+            "filechange", params.get("reason"), narrative), labels,
+            fc_map.get(LBL_ALLOW_ONCE) == "accept")
         if resp is None:
             return "decline"
         result = resp.get("result", {})
@@ -2903,21 +3261,10 @@ def _bridge_approval_dispatch(method: str, params: dict, cc_write_fn, cc_read_fn
         ]
         labels = [lbl for lbl, _ in perm_pairs]
         perm_map = dict(perm_pairs)
-        cc_write_fn({
-            "jsonrpc": "2.0",
-            "id": eid,
-            "method": "elicitation/create",
-            "params": {
-                "message": _build_simple_approval_message(
-                    "permissions", params.get("reason"), narrative,
-                    details=_summarize_permissions(requested)),
-                "requestedSchema": {
-                    "type": "object",
-                    "properties": {"label": {"type": "string", "enum": labels}},
-                },
-            },
-        })
-        resp = read_correlated(eid, timeout)
+        resp = _elicit(_build_simple_approval_message(
+            "permissions", params.get("reason"), narrative,
+            details=_summarize_permissions(requested)), labels,
+            LBL_GRANT_TURN in perm_map)
         if resp is None:
             return PERM_DECLINE
         result = resp.get("result", {})
@@ -2982,19 +3329,8 @@ def _bridge_approval_dispatch(method: str, params: dict, cc_write_fn, cc_read_fn
         ]
         labels = [lbl for lbl, _ in legacy_pairs]
         label_to_review = dict(legacy_pairs)
-        cc_write_fn({
-            "jsonrpc": "2.0",
-            "id": eid,
-            "method": "elicitation/create",
-            "params": {
-                "message": f"Codex {method}\nCWD: {params.get('cwd') or '(unknown)'}",
-                "requestedSchema": {
-                    "type": "object",
-                    "properties": {"label": {"type": "string", "enum": labels}},
-                },
-            },
-        })
-        resp = read_correlated(eid, timeout)
+        resp = _elicit(f"Codex {method}\nCWD: {params.get('cwd') or '(unknown)'}", labels,
+                       label_to_review.get(LBL_ALLOW_ONCE) == "approved")
         if resp is None:
             return {"decision": "denied"}
         result = resp.get("result", {})
@@ -3826,9 +4162,23 @@ def _approval_knobs() -> dict:
         narrative_max_source = "env"                 # a clamped-but-valid env still counts as env-driven
     except (TypeError, ValueError):
         narrative_max_source = "default"             # absent / malformed → _approval_narrative_max fell back
+    # #340: approval UI (cc | dialog) + how it was selected.
+    ui_env = (os.environ.get("BULLDOZER_APPROVAL_UI") or "").strip().lower()
+    dialog_sentinel = os.environ.get("BULLDOZER_APPROVAL_DIALOG_FILE") or os.path.expanduser(
+        _APPROVAL_DIALOG_SENTINEL_DEFAULT)
+    approval_ui = _approval_ui()
+    if ui_env in ("dialog", "cc", "tui"):
+        approval_ui_source = "env"
+    elif approval_ui == "dialog":
+        approval_ui_source = "sentinel-file"
+    else:
+        approval_ui_source = "default"
     return {
         "unattended": active,
         "unattended_source": source,
+        "approval_ui": approval_ui,
+        "approval_ui_source": approval_ui_source,
+        "approval_ui_sentinel_path": dialog_sentinel,
         "park_cap_s": _park_cap_s(),
         "park_cap_source": park_cap_source,
         "fast_path_scope": effective_scope,

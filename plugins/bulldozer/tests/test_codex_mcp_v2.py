@@ -76,6 +76,22 @@ def _disarm_unattended(monkeypatch):
     monkeypatch.setenv("BULLDOZER_APPROVAL_UNATTENDED_FILE", "/nonexistent/bulldozer-unattended-xyz")
 
 
+@pytest.fixture(autouse=True)
+def _disarm_dialog_ui(monkeypatch):
+    """#340 hermeticity: approval UI → CC elicitation for every test unless the test opts in.
+    A stray real sentinel (~/.claude/bulldozer-approval-dialog) would otherwise flip the whole
+    bridge suite into REAL osascript dialogs (popping windows / hanging headless). env
+    BULLDOZER_APPROVAL_UI=cc wins over the sentinel by design, so that alone is hermetic; the
+    _FILE redirect is belt-and-braces. A dialog-mode test sets BULLDOZER_APPROVAL_UI=dialog in
+    its body (runs after fixtures → wins). Beeper is neutered suite-wide — no test ever wants
+    a real Basso loop (raising=False: attr absent until #340 ships)."""
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "cc")
+    monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_FILE",
+                       "/nonexistent/bulldozer-approval-dialog-xyz")
+    import codex_server as cs
+    monkeypatch.setattr(cs, "_start_beeper", lambda: None, raising=False)
+
+
 def test_real_codex_log_is_never_touched_by_tests(tmp_path_factory):
     """Hygiene guard: the autouse redirect must point BULLDOZER_CODEX_LOG OFF the real
     monitoring log for EVERY test (offline + slow), so the suite never pollutes it
@@ -1992,7 +2008,11 @@ class FakeCC:
     """
 
     def __init__(self):
-        self._next_answer = ("accept", {"label": "accept"})  # default: accept
+        # bare Accept (no dropdown pick) — what CC sends when the user just clicks Accept.
+        # NOT {"label": "accept"}: the enum carries DISPLAY labels ("Allow once"), never the
+        # decision string, so that old default was an impossible payload whose leniency
+        # (label_map.get(chosen, "accept")) masked the round-2 P1 defect.
+        self._next_answer = ("accept", None)  # default: bare accept
         self._requests: list = []
         self._pending: list = []
 
@@ -2417,7 +2437,7 @@ def test_every_server_request_gets_schema_valid_response():
 
     for method, is_valid in SERVER_REQUEST_RESPONSE_SHAPE.items():
         cc = FakeCC()
-        cc.set_answer("accept", {"label": "accept"})
+        cc.set_answer("accept", {})       # bare accept (no dropdown pick)
         msg = {"id": f"req-{method}", "method": method,
                "params": METHOD_PARAMS.get(method, {})}
         resp = handle_server_request(msg, cc.write, cc.read)
@@ -3675,7 +3695,7 @@ def test_elicitation_reply_id_correlation_answers_unrelated_request():
         if call_count[0] == 1:
             return {"jsonrpc": "2.0", "id": _eid() + 1000, "method": "ping"}
         return {"jsonrpc": "2.0", "id": _eid(), "result": {"action": "accept",
-                                                           "content": {"label": "accept"}}}
+                                                           "content": {}}}
 
     msg = {
         "id": "req-corr",
@@ -3745,7 +3765,7 @@ def test_read_correlated_retries_on_transient_none_frame():
         if calls[0] == 1:
             return None  # transient (blank/malformed) — must be retried, not declined
         return {"jsonrpc": "2.0", "id": eid,
-                "result": {"action": "accept", "content": {"label": "accept"}}}
+                "result": {"action": "accept", "content": {}}}
 
     msg = {
         "id": "req-tn", "method": "item/commandExecution/requestApproval",
@@ -3778,7 +3798,7 @@ def test_read_correlated_skips_id_colliding_request_frame():
             # A REQUEST (has 'method') with the SAME id as our elicitation/create.
             return {"jsonrpc": "2.0", "id": eid, "method": "tools/list"}
         return {"jsonrpc": "2.0", "id": eid,
-                "result": {"action": "accept", "content": {"label": "accept"}}}
+                "result": {"action": "accept", "content": {}}}
 
     msg = {
         "id": "req-collide", "method": "item/commandExecution/requestApproval",
@@ -6087,7 +6107,12 @@ def test_empty_dict_availabledecision_entry_no_stopiteration():
 
 def test_out_of_enum_label_breadcrumb_via_handle_server_request():
     # R1-F4: exercises the acc-threading chain handle_server_request(acc=) -> bridge_approval(acc=).
-    # CC answers with a label NOT in the map -> OUT_OF_ENUM_LABEL breadcrumb + safe "accept" default.
+    # CC answers with a label NOT in the map -> OUT_OF_ENUM_LABEL breadcrumb + fail-CLOSED decline.
+    # CONTRACT CHANGE (#340, codex round-2 P1): the command arm used to fall back to "accept" on an
+    # unrecognized label. Only decisions that came from the offered label map may be sent to codex —
+    # otherwise an amendment-only availableDecisions could receive a plain `accept` it never offered
+    # (invalid reply / amendment bypassed). This is the posture the permissions arm already took
+    # (#272: ambiguous label → PERM_DECLINE). Declining an ambiguous click is safe and retryable.
     import codex_server as cs
     acc = []
     cc = FakeCC()
@@ -6095,7 +6120,7 @@ def test_out_of_enum_label_breadcrumb_via_handle_server_request():
     msg = {"id": "req-x", "method": "item/commandExecution/requestApproval",
            "params": {"availableDecisions": ["accept", "decline"]}}
     resp = cs.handle_server_request(msg, cc.write, cc.read, acc=acc)
-    assert resp["result"]["decision"] == "accept"               # #18268 safe default preserved
+    assert resp["result"]["decision"] == "decline"              # fail-closed, not a silent accept
     assert any(r["code"] == "OUT_OF_ENUM_LABEL" for r in acc)   # breadcrumb reached the accumulator
 
 
@@ -7762,3 +7787,768 @@ class TestTurnObservability:
         log = self._log_text()
         assert "TURN_ERROR" not in log.replace("/ TURN_ERROR /", "")  # sanitized pipes
         assert log.count("\n") == 1  # exactly one line written
+
+
+# ---------------------------------------------------------------------------
+# #340 — BULLDOZER_APPROVAL_UI=dialog: native macOS approval dialog (guards engine)
+# ---------------------------------------------------------------------------
+# Contract under test:
+#   _approval_ui(): 'dialog' | 'cc' — env BULLDOZER_APPROVAL_UI wins (dialog OR explicit
+#     cc/tui), else the sentinel file (BULLDOZER_APPROVAL_DIALOG_FILE, default
+#     ~/.claude/bulldozer-approval-dialog) toggles dialog live; default 'cc'.
+#   In dialog mode the four label-enum arms of _bridge_approval_dispatch (commandExecution /
+#   fileChange / permissions / legacy exec+applyPatch) present an osascript dialog instead of
+#   writing elicitation/create to CC, and synthesize the SAME {'result': {action, content}}
+#   shape — the arms' decision mapping is UI-agnostic. requestUserInput and
+#   mcpServer/elicitation stay on the CC path. Dialog unavailable (no GUI) → stderr warn +
+#   CC-elicitation fallback. Timeout/Esc → decline (fail-safe, guards semantics).
+
+
+def _fake_stages(monkeypatch, results, record=None):
+    """Monkeypatch cs._osascript_stage with a scripted per-call (status, out) sequence.
+    record (list) captures each call's argv/script for assertions."""
+    import codex_server as cs
+    def fake(script, argv, cap_s, pump_fn=None, wait_state=None, **kw):
+        if record is not None:
+            record.append({"script": script, "argv": list(argv), "cap_s": cap_s,
+                           "pump_fn": pump_fn, "wait_state": wait_state})
+        assert results, "unexpected extra _osascript_stage call"
+        status, out = results.pop(0)
+        if status == "timeout" and wait_state is not None:
+            wait_state["timed_out"] = True
+        return status, out
+    monkeypatch.setattr(cs, "_osascript_stage", fake)
+    return results
+
+
+def _no_cc_read(timeout=10.0):
+    return None
+
+
+# --- toggle: _approval_ui() ---
+
+def test_approval_ui_default_is_cc(monkeypatch):
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_APPROVAL_UI", raising=False)
+    monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_FILE", "/nonexistent/nope-340")
+    assert cs._approval_ui() == "cc"
+
+
+def test_approval_ui_env_dialog(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    assert cs._approval_ui() == "dialog"
+
+
+def test_approval_ui_sentinel_file(monkeypatch, tmp_path):
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_APPROVAL_UI", raising=False)
+    sentinel = tmp_path / "bulldozer-approval-dialog"
+    sentinel.write_text("")
+    monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_FILE", str(sentinel))
+    assert cs._approval_ui() == "dialog"
+
+
+def test_approval_ui_env_cc_wins_over_sentinel(monkeypatch, tmp_path):
+    """Explicit env cc/tui beats a present sentinel — the hermeticity guarantee the test
+    suite's own autouse fixture relies on."""
+    import codex_server as cs
+    sentinel = tmp_path / "bulldozer-approval-dialog"
+    sentinel.write_text("")
+    monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_FILE", str(sentinel))
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "cc")
+    assert cs._approval_ui() == "cc"
+
+
+# --- dialog-mode dispatch: command arm ---
+
+def test_dialog_allow_is_plain_accept(monkeypatch):
+    """Allow (bare, Enter-activated) = plain accept — same semantics as CC's bare Accept.
+    No elicitation/create is written to CC in dialog mode."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    _fake_stages(monkeypatch, [("ok", "Allow")])
+    writes = []
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        writes.append, _no_cc_read, timeout=2.0)
+    assert decision == "accept"
+    assert writes == []          # nothing went to CC
+
+
+def test_dialog_deny_declines(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    _fake_stages(monkeypatch, [("ok", "Deny")])
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        lambda m: None, _no_cc_read, timeout=2.0)
+    assert decision == "decline"
+
+
+def test_dialog_esc_declines(monkeypatch):
+    """Esc (-128) is an ANSWER (decline), not an outage — no CC fallback."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    _fake_stages(monkeypatch, [("esc", "")])
+    writes = []
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        writes.append, _no_cc_read, timeout=2.0)
+    assert decision == "decline"
+    assert writes == []
+
+
+# --- dialog-mode dispatch: stage 2 (Опции… → full label list) ---
+
+def test_dialog_options_picks_full_label(monkeypatch):
+    """Stage 2 exposes the FULL label set; a picked label maps through the arm's own
+    label table (fileChange: LBL_ALLOW_SESSION → acceptForSession)."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    rec = []
+    _fake_stages(monkeypatch, [("ok", "Опции…"), ("ok", cs.LBL_ALLOW_SESSION)], record=rec)
+    decision = cs._bridge_approval_dispatch(
+        "item/fileChange/requestApproval", {"reason": "patch"},
+        lambda m: None, _no_cc_read, timeout=2.0)
+    assert decision == "acceptForSession"
+    # stage-2 argv carries every fileChange label (after message+title)
+    stage2_argv = rec[1]["argv"]
+    for lbl in (cs.LBL_ALLOW_ONCE, cs.LBL_ALLOW_SESSION, cs.LBL_DONT_ALLOW, cs.LBL_CANCEL):
+        assert lbl in stage2_argv
+
+
+def test_dialog_options_cancelled_declines(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    _fake_stages(monkeypatch, [("ok", "Опции…"), ("ok", "CANCELLED")])
+    decision = cs._bridge_approval_dispatch(
+        "item/fileChange/requestApproval", {"reason": "patch"},
+        lambda m: None, _no_cc_read, timeout=2.0)
+    assert decision == "decline"
+
+
+def test_dialog_stage2_junk_label_fails_safe(monkeypatch):
+    """A stage-2 result not in the label set must NOT map to an accept — fail-safe decline
+    (mirrors the perm arm's fail-closed OUT_OF_ENUM posture)."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    _fake_stages(monkeypatch, [("ok", "Опции…"), ("ok", "Totally Bogus Label")])
+    decision = cs._bridge_approval_dispatch(
+        "item/fileChange/requestApproval", {"reason": "patch"},
+        lambda m: None, _no_cc_read, timeout=2.0)
+    assert decision == "decline"
+
+
+# --- dialog-mode dispatch: permissions + legacy arms ---
+
+def test_dialog_permissions_bare_allow_grants_turn(monkeypatch):
+    """Bare Allow on a permissions approval = grant EXACTLY the requested profile for the
+    turn (#272 echo semantics preserved through the dialog path)."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    _fake_stages(monkeypatch, [("ok", "Allow")])
+    requested = {"network": {"allowedHosts": ["example.com"]}}
+    decision = cs._bridge_approval_dispatch(
+        "item/permissions/requestApproval", {"permissions": requested, "reason": "net"},
+        lambda m: None, _no_cc_read, timeout=2.0)
+    assert decision == {"permissions": requested, "scope": "turn"}
+
+
+def test_dialog_legacy_exec_allow_approved(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    _fake_stages(monkeypatch, [("ok", "Allow")])
+    decision = cs._bridge_approval_dispatch(
+        "execCommandApproval", {"cwd": "/tmp"},
+        lambda m: None, _no_cc_read, timeout=2.0)
+    assert decision == {"decision": "approved"}
+
+
+# --- fallback + non-label arms stay on CC ---
+
+def test_dialog_unavailable_falls_back_to_cc(monkeypatch, capsys):
+    """No GUI / no osascript → stderr warn + normal CC elicitation (an approval must not
+    die headless)."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    _fake_stages(monkeypatch, [("unavailable", "")])
+    cc = FakeCC()
+    cc.set_answer("accept", None)
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        cc.write, cc.read, timeout=2.0)
+    assert decision == "accept"
+    assert len(cc._requests) == 1 and cc._requests[0]["method"] == "elicitation/create"
+    assert "dialog unavailable" in capsys.readouterr().err
+
+
+def test_dialog_requestuserinput_stays_on_cc(monkeypatch):
+    """requestUserInput is not a label-enum approval — dialog mode must not touch it."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    def _boom(*a, **k):
+        raise AssertionError("_osascript_stage must not be called for requestUserInput")
+    monkeypatch.setattr(cs, "_osascript_stage", _boom)
+    cc = FakeCC()
+    cc.set_answer("accept", None)
+    decision = cs._bridge_approval_dispatch(
+        "item/tool/requestUserInput", {}, cc.write, cc.read, timeout=2.0)
+    assert decision == {"answers": {}}
+    assert len(cc._requests) == 1
+
+
+def test_dialog_mcp_elicitation_stays_on_cc(monkeypatch):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    def _boom(*a, **k):
+        raise AssertionError("_osascript_stage must not be called for mcpServer elicitation")
+    monkeypatch.setattr(cs, "_osascript_stage", _boom)
+    cc = FakeCC()
+    cc.set_answer("accept", {"x": 1})
+    out = cs._bridge_approval_dispatch(
+        "mcpServer/elicitation/request", {"message": "hi"}, cc.write, cc.read, timeout=2.0)
+    assert out["action"] == "accept"
+    assert len(cc._requests) == 1
+
+
+# --- the pump: #252 child drain + EOF handling while the dialog is up ---
+
+def test_dialog_pump_threaded_and_drains_child(monkeypatch):
+    """The dispatch hands _osascript_stage a WORKING pump: one pump call drains a child
+    delta into ts (the #252 guarantee holds while a native dialog is up)."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([[{"method": "item/agentMessage/delta",
+                                  "params": {"delta": "Y" * 100}}]])
+    def fake(script, argv, cap_s, pump_fn=None, wait_state=None, **kw):
+        assert pump_fn is not None, "dialog stage must receive the approval-wait pump"
+        ev = pump_fn()
+        assert ev is None            # a drained delta is not a terminal event
+        return ("ok", "Allow")
+    monkeypatch.setattr(cs, "_osascript_stage", fake)
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        lambda m: None, _no_cc_read, timeout=2.0,
+        drain_ctx=_drain_ctx(reactor, ts))
+    assert decision == "accept"
+    assert "".join(ts["final_message_parts"]) == "Y" * 100
+
+
+def test_dialog_eof_via_pump_aborts_and_declines(monkeypatch):
+    """CC stdin EOF while the dialog is up → pump reports it, stage aborts, arm declines,
+    and the ts flag is set exactly as in the CC-elicitation path."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    ts = _mk_ts()
+    reactor = _ScriptedReactor([])
+    def fake(script, argv, cap_s, pump_fn=None, wait_state=None, **kw):
+        ev = pump_fn()
+        assert ev == "eof"
+        return ("aborted", "")
+    monkeypatch.setattr(cs, "_osascript_stage", fake)
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        lambda m: None, lambda timeout=10.0: cs._CC_EOF, timeout=2.0,
+        drain_ctx=_drain_ctx(reactor, ts))
+    assert decision == "decline"
+    assert ts.get("eof_during_approval") is True
+
+
+# --- audit + knobs ---
+
+def test_dialog_timeout_declines_and_audits(monkeypatch, tmp_path):
+    """Dialog timeout → decline + APPROVAL audit line carries timed_out=true AND ui=dialog."""
+    import codex_server as cs
+    logf = tmp_path / "codex.log"
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logf))
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    _fake_stages(monkeypatch, [("timeout", "")])
+    decision = cs.bridge_approval(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        lambda m: None, _no_cc_read, timeout=2.0)
+    assert decision == "decline"
+    line = logf.read_text()
+    assert "APPROVAL" in line and "timed_out=true" in line and "ui=dialog" in line
+
+
+def test_dialog_accept_audit_has_ui_dialog(monkeypatch, tmp_path):
+    import codex_server as cs
+    logf = tmp_path / "codex.log"
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logf))
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    _fake_stages(monkeypatch, [("ok", "Allow")])
+    decision = cs.bridge_approval(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        lambda m: None, _no_cc_read, timeout=2.0)
+    assert decision == "accept"
+    assert "ui=dialog" in logf.read_text()
+
+
+def test_cc_mode_audit_line_has_no_ui_field(monkeypatch, tmp_path):
+    """Default (cc) mode keeps the pre-#340 APPROVAL line format byte-compatible — no ui=."""
+    import codex_server as cs
+    logf = tmp_path / "codex.log"
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logf))
+    cc = FakeCC()
+    cc.set_answer("accept", None)
+    cs.bridge_approval("item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+                       cc.write, cc.read, timeout=2.0)
+    line = logf.read_text()
+    assert "APPROVAL" in line and "ui=" not in line
+
+
+def test_approval_knobs_report_ui(monkeypatch, tmp_path):
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    k = cs._approval_knobs()
+    assert k["approval_ui"] == "dialog" and k["approval_ui_source"] == "env"
+    monkeypatch.delenv("BULLDOZER_APPROVAL_UI", raising=False)
+    monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_FILE", "/nonexistent/nope-340")
+    k = cs._approval_knobs()
+    assert k["approval_ui"] == "cc" and k["approval_ui_source"] == "default"
+    sentinel = tmp_path / "bulldozer-approval-dialog"
+    sentinel.write_text("")
+    monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_FILE", str(sentinel))
+    k = cs._approval_knobs()
+    assert k["approval_ui"] == "dialog" and k["approval_ui_source"] == "sentinel-file"
+    assert k["approval_ui_sentinel_path"] == str(sentinel)
+
+
+def test_dialog_stage1_designates_cancel_button():
+    """Esc must dismiss the dialog. AppleScript fires the Escape key ONLY when a button is
+    designated `cancel button` — without it Esc is INERT (verified live 2026-07-13: the user
+    had to click Deny). Stage 1 designates Deny, so Esc AND a Deny click both raise -128 →
+    'esc' → decline (same safe outcome)."""
+    import codex_server as cs
+    assert 'cancel button "Deny"' in cs._DIALOG_STAGE1
+    # buttons + default button now come from argv (round-2 P1: Allow is dropped when plain
+    # accept is not offered), so the script must consume them, not hardcode them
+    assert "default button defBtn" in cs._DIALOG_STAGE1
+    assert "buttons btns" in cs._DIALOG_STAGE1
+
+
+def test_osascript_stage_maps_real_minus128_to_esc():
+    """End-to-end through a REAL osascript: the -128 ("User canceled") error that Esc / the
+    cancel button produce maps to 'esc' (an answer → decline), while any OTHER AppleScript
+    failure (e.g. -1719, no GUI / no accessibility) maps to 'unavailable' (→ CC fallback).
+    Skips where osascript is absent (Linux CI)."""
+    import codex_server as cs
+    if not shutil.which("osascript"):
+        pytest.skip("osascript not available")
+    assert cs._osascript_stage('on run argv\n    error number -128\nend run',
+                               ["m", "t", 5], cap_s=10) == ("esc", "")
+    assert cs._osascript_stage('on run argv\n    error number -1719\nend run',
+                               ["m", "t", 5], cap_s=10) == ("unavailable", "")
+
+
+# --- codex_review round 1 (#340): beeper lifetime + fallback on a dead stderr ---
+
+def test_beeper_dies_with_the_server(tmp_path):
+    """P2-1 (codex, REPRODUCED live): the Basso loop is a detached /bin/sh — if the server is
+    SIGKILLed while a dialog is up, `_dialog_label_elicit`'s finally never runs and the shell
+    beeps FOREVER. The beeper must therefore self-terminate when its parent dies (and be
+    bounded regardless). Drives a real subprocess: start the beeper in a child python, SIGKILL
+    that child, assert the beeper is gone shortly after."""
+    if not sys.platform.startswith("darwin"):
+        pytest.skip("beeper is macOS-only (afplay)")
+    code = (
+        "import sys,time;"
+        f"sys.path.insert(0, {MCP_DIR!r});"
+        "import codex_server as cs;"
+        "p = cs._start_beeper();"
+        "print(p.pid, flush=True);"
+        "time.sleep(60)"
+    )
+    child = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        beeper_pid = int(child.stdout.readline().strip())
+        time.sleep(0.3)
+        child.kill()
+        child.wait(timeout=5)
+        deadline = time.time() + 6          # parent-liveness check runs once per beep cycle
+        while time.time() < deadline:
+            if subprocess.run(["ps", "-p", str(beeper_pid)],
+                              capture_output=True).returncode != 0:
+                return                       # beeper reaped itself — PASS
+            time.sleep(0.25)
+        try:
+            os.kill(beeper_pid, 9)           # don't leave a beeping orphan behind
+        except OSError:
+            pass
+        pytest.fail(f"beeper {beeper_pid} outlived its SIGKILLed parent (orphaned Basso loop)")
+    finally:
+        if child.poll() is None:
+            child.kill()
+
+
+def test_dialog_fallback_survives_dead_stderr():
+    """P2-2 (codex, REPRODUCED live: BrokenPipeError, 0 CC writes): the no-GUI fallback warns on
+    stderr BEFORE sending the CC elicitation — a broken stderr (line-buffered → the newline
+    flushes → EPIPE) killed the fallback and left codex's approval unanswered. The warn must be
+    best-effort AND the process must still exit cleanly: a merely-CAUGHT EPIPE leaves the buffer
+    dirty and the interpreter's shutdown flush re-raises it (exit 120 — the PR #339 lesson).
+
+    Runs in a SUBPROCESS so the real EPIPE and the real interpreter shutdown are both exercised
+    (an in-process fake would test neither, and a broken pipe object left behind trips pytest's
+    unraisable-exception warning)."""
+    code = (
+        "import os,sys;"
+        f"sys.path.insert(0, {MCP_DIR!r});"
+        "import codex_server as cs;"
+        "os.environ['BULLDOZER_APPROVAL_UI']='dialog';"
+        "cs._start_beeper=lambda: None;"
+        "cs._osascript_stage=lambda *a, **k: ('unavailable','');"
+        "r,w=os.pipe(); os.close(r);"
+        "sys.stderr=os.fdopen(w,'w',buffering=1);"   # line-buffered, reader gone → EPIPE on warn
+        "writes=[];"
+        "d=cs._bridge_approval_dispatch('item/commandExecution/requestApproval',"
+        " {'command':'echo hi','cwd':'/tmp'}, writes.append,"
+        " lambda timeout=1.0: {'jsonrpc':'2.0','id':1,'result':{'action':'accept','content':{}}},"
+        " timeout=2.0);"
+        "print('RESULT', d, len(writes))"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, f"fallback must exit cleanly, got {proc.returncode}: {proc.stdout}"
+    assert "RESULT accept 1" in proc.stdout       # decision returned AND the elicitation went out
+
+
+# --- codex_review round 2 (#340): offered-decisions, timeout budget, stage-2 outage ---
+
+_AMENDMENT_ONLY = {
+    "threadId": "T1", "turnId": "TURN1", "itemId": "I1", "startedAtMs": 1,
+    "command": "npm publish", "cwd": "/tmp",
+    # codex offers NO plain `accept` — only an execpolicy amendment and a decline
+    "availableDecisions": [
+        {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": {"rule": "npm"}}},
+        "decline",
+    ],
+}
+
+
+def test_dialog_hides_allow_when_plain_accept_not_offered(monkeypatch):
+    """P1 (codex): with an amendment-only `availableDecisions`, a bare Allow would synthesize
+    the decision string `accept` — which codex NEVER OFFERED (invalid protocol reply / bypasses
+    the amendment). The prominent Allow button must not exist in that case: stage 1 shows
+    Deny/Опции… (default Опции…), and the decision can only come from the offered list."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    rec = []
+    _fake_stages(monkeypatch, [("ok", "Опции…"), ("ok", cs.LBL_EXECPOLICY)], record=rec)
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_AMENDMENT_ONLY),
+        lambda m: None, _no_cc_read, timeout=5.0)
+    assert decision == _AMENDMENT_ONLY["availableDecisions"][0]      # verbatim amendment dict
+    stage1_argv = [str(a) for a in rec[0]["argv"]]
+    assert "Allow" not in stage1_argv, "bare Allow must be absent when plain accept is not offered"
+    assert cs._BTN_OPTIONS in stage1_argv
+
+
+def test_dialog_keeps_allow_when_plain_accept_offered(monkeypatch):
+    """Control: the normal shape (plain accept offered) keeps the Enter-activated Allow."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    rec = []
+    _fake_stages(monkeypatch, [("ok", "Allow")], record=rec)
+    params = dict(_CMD_APPROVAL, availableDecisions=["accept", "decline"])
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", params,
+        lambda m: None, _no_cc_read, timeout=5.0)
+    assert decision == "accept"
+    assert "Allow" in [str(a) for a in rec[0]["argv"]]
+
+
+def test_cc_bare_accept_fails_closed_when_not_offered(monkeypatch):
+    """P1, CC side (pre-#340 latent): CC's bare Accept defaults to LBL_ALLOW_ONCE; if that label
+    is not in the offered map the arm used to return the UNOFFERED string `accept`. It must fail
+    CLOSED (decline) instead — the posture the permissions arm already takes (#272)."""
+    import codex_server as cs
+    cc = FakeCC()
+    cc.set_answer("accept", None)                      # bare Accept, no dropdown label
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_AMENDMENT_ONLY),
+        cc.write, cc.read, timeout=2.0)
+    assert decision == "decline", f"unoffered decision leaked: {decision!r}"
+
+
+def test_dialog_stage2_gets_only_the_remaining_budget(monkeypatch):
+    """P2 (codex): stage 2 re-received the FULL timeout, so Опции… could double the approval's
+    wall-clock (≈595 s on a 300 s budget) and blow the bridge/client deadline. One deadline must
+    span both stages."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    caps = []
+    def fake(script, argv, cap_s, pump_fn=None, wait_state=None, **kw):
+        caps.append(cap_s)
+        if len(caps) == 1:
+            time.sleep(0.4)                            # user deliberated in stage 1
+            return ("ok", cs._BTN_OPTIONS)
+        return ("ok", cs.LBL_ALLOW_ONCE)
+    monkeypatch.setattr(cs, "_osascript_stage", fake)
+    cs._bridge_approval_dispatch(
+        "item/fileChange/requestApproval", {"reason": "patch"},
+        lambda m: None, _no_cc_read, timeout=5.0)
+    assert caps[1] < caps[0], f"stage 2 must get the REMAINING budget, got {caps}"
+    assert caps[1] <= 5.0 - 0.3
+
+
+def test_dialog_stage2_unavailable_falls_back_to_cc(monkeypatch, capsys):
+    """P2 (codex): if the SECOND osascript launch fails (GUI session gone), the approval was
+    declined outright. It must fall back to the CC elicitation like a stage-1 outage does."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    _fake_stages(monkeypatch, [("ok", cs._BTN_OPTIONS), ("unavailable", "")])
+    cc = FakeCC()
+    cc.set_answer("accept", None)
+    decision = cs._bridge_approval_dispatch(
+        "item/fileChange/requestApproval", {"reason": "patch"},
+        cc.write, cc.read, timeout=5.0)
+    assert decision == "accept"
+    assert len(cc._requests) == 1 and cc._requests[0]["method"] == "elicitation/create"
+    assert "dialog unavailable" in capsys.readouterr().err
+
+
+# --- codex_review round 3 (#340): the deadline must bound EVERY path, incl. the CC fallback ---
+
+def test_dialog_fallback_inherits_remaining_budget(monkeypatch):
+    """P2 (codex r3): a dialog that dies LATE (user deliberated, then the GUI vanished) handed
+    read_correlated a FRESH full timeout → the bridge could block ~2× its budget. The CC
+    fallback must inherit only what is left."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    def slow_then_dead(script, argv, cap_s, pump_fn=None, wait_state=None, **kw):
+        time.sleep(0.5)                       # the human stared at the dialog…
+        return ("unavailable", "")            # …then the GUI session went away
+    monkeypatch.setattr(cs, "_osascript_stage", slow_then_dead)
+    seen, written = [], []
+    def cc_read(timeout=10.0):
+        seen.append(timeout)
+        # correlate on the REAL elicitation id: _next_bridge_id() is a MODULE counter, so a
+        # hardcoded id only matches when this test runs first (full-suite flake, caught live)
+        return {"jsonrpc": "2.0", "id": written[-1]["id"],
+                "result": {"action": "accept", "content": {}}}
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        written.append, cc_read, timeout=2.0)
+    assert decision == "accept"
+    assert seen and seen[0] <= 2.0 - 0.45, f"CC fallback got a fresh budget: {seen}"
+
+
+def test_dialog_exhausted_budget_declines_without_asking_cc(monkeypatch):
+    """P2 (codex r3): when the dialog burned the WHOLE budget and only then reported
+    unavailable, the fallback must not open a second full-length wait — the approval is out of
+    time → fail-safe decline, no CC elicitation at all."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    def burn_it_all(script, argv, cap_s, pump_fn=None, wait_state=None, **kw):
+        time.sleep(1.1)
+        return ("unavailable", "")
+    monkeypatch.setattr(cs, "_osascript_stage", burn_it_all)
+    writes = []
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        writes.append, _no_cc_read, timeout=1.0)
+    assert decision == "decline"
+    assert writes == [], "no CC elicitation may be opened once the deadline is spent"
+
+
+def test_dialog_stage2_not_started_after_deadline(monkeypatch, tmp_path):
+    """P2 (codex r3): _remaining() floored at 1.0 s, so a stage could START (and ACCEPT) after
+    the deadline had already passed. Stage 2 must not run with an exhausted budget → decline,
+    audited as timed_out."""
+    import codex_server as cs
+    logf = tmp_path / "codex.log"
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logf))
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    calls = []
+    def fake(script, argv, cap_s, pump_fn=None, wait_state=None, **kw):
+        calls.append(cap_s)
+        time.sleep(1.1)                        # stage 1 eats the entire 1 s budget…
+        return ("ok", cs._BTN_OPTIONS)         # …and only then asks for the option list
+    monkeypatch.setattr(cs, "_osascript_stage", fake)
+    decision = cs.bridge_approval(
+        "item/fileChange/requestApproval", {"reason": "patch"},
+        lambda m: None, _no_cc_read, timeout=1.0)
+    assert decision == "decline"
+    assert len(calls) == 1, "stage 2 must not start with no budget left"
+    assert "timed_out=true" in logf.read_text()
+
+
+# --- codex_review round 4 (#340): zero timeout, label-collision drift ---
+
+def test_zero_timeout_declines_immediately(monkeypatch):
+    """P2 (codex r4): `(timeout or 300)` turned an EXPLICIT timeout=0 ("don't wait") into the
+    five-minute default. Zero must mean an already-expired deadline: decline at once, with no
+    dialog and no CC elicitation opened."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    def _boom(*a, **k):
+        raise AssertionError("no dialog may be shown with a zero budget")
+    monkeypatch.setattr(cs, "_osascript_stage", _boom)
+    writes = []
+    t0 = time.time()
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        writes.append, _no_cc_read, timeout=0)
+    assert decision == "decline"
+    assert writes == []
+    assert time.time() - t0 < 1.0                 # immediate, not a 300 s wait
+
+
+def test_zero_timeout_cc_mode_declines_immediately(monkeypatch):
+    """Same for the default CC path — timeout=0 must not silently become 300 s."""
+    import codex_server as cs
+    cc = FakeCC()
+    cc.never_answer_elicitation()
+    t0 = time.time()
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", dict(_CMD_APPROVAL),
+        cc.write, cc.read, timeout=0)
+    assert decision == "decline"
+    assert time.time() - t0 < 1.0
+
+
+def test_dialog_allow_hidden_when_label_collision_shadows_accept(monkeypatch):
+    """P3 (codex r4): if codex ever offers a decision string that COLLIDES with one of our display
+    labels ('Allow once'), _dedupe_labels renames the real accept to 'Allow once (2)'. A membership
+    check on the label alone would still show the bare Allow button, whose click then resolves via
+    label_map['Allow once'] → the COLLIDING decision, not plain accept. Availability must be decided
+    from the label→decision MAP, not from the label's presence."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    rec = []
+    _fake_stages(monkeypatch, [("ok", cs._BTN_OPTIONS), ("ok", "Allow once (2)")], record=rec)
+    params = dict(_CMD_APPROVAL, availableDecisions=[cs.LBL_ALLOW_ONCE, "accept", "decline"])
+    decision = cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval", params,
+        lambda m: None, _no_cc_read, timeout=5.0)
+    stage1_argv = [str(a) for a in rec[0]["argv"]]
+    assert "Allow" not in stage1_argv, "bare Allow must be hidden when it would not mean accept"
+    assert decision == "accept"                   # the explicit pick still resolves correctly
+
+
+# --- codex_review round 5 (#340): EOF-priority race at the dialog's final poll ---
+
+def test_dialog_final_poll_rechecks_bridge_state(monkeypatch):
+    """P2 (codex r5): the poll loop pumps only WHILE the dialog process is alive. If CC's stdin
+    closes (or the codex child emits a terminal frame) in the instant the user clicks Allow, the
+    loop exits on poll() without pumping again — the accept would be mapped and written to the
+    child even though the bridge is already dead, violating the EOF-priority invariant (#218).
+    A final non-blocking state check must run before the dialog's output is honored.
+
+    Deterministic: the dialog process is a FAKE whose poll() reports 'alive' for a fixed number of
+    calls and then 'exited'; the pump reports 'eof' only once it has exited. So a during-loop pump
+    can never see the EOF (no timing race) — only a post-loop check can."""
+    import io
+    import codex_server as cs
+
+    class _FakeProc:
+        def __init__(self):
+            self.polls = 0
+            self.returncode = None
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO("Allow\n")
+            self.stderr = io.StringIO("")
+            self.killed = False
+
+        def poll(self):
+            self.polls += 1
+            if self.polls > 3:                 # alive for 3 iterations, then gone
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            self.killed = True
+
+        def kill(self):
+            self.killed = True
+
+    fake = _FakeProc()
+    monkeypatch.setattr(cs.subprocess, "Popen", lambda *a, **k: fake)
+
+    def pump():
+        # the EOF becomes observable STRICTLY after the dialog process is gone
+        return "eof" if fake.returncode is not None else None
+
+    status, out = cs._osascript_stage(
+        "on run argv\n    return \"Allow\"\nend run",
+        ["m", "t", 5, "Allow", "Deny", "Allow"], cap_s=10, pump_fn=pump)
+    assert status == "aborted", f"dialog result honored after EOF: {(status, out)}"
+
+
+# --- codex_review round 6 (#340): keep approval text out of the process table ---
+
+def test_dialog_body_not_exposed_in_argv(monkeypatch):
+    """P2 (codex r6): the approval message can carry a literal credential (codex asking to run
+    `curl -H "Authorization: Bearer sk-…"`). Passing it as osascript ARGV publishes it in the
+    system process table — readable by ANY user on the box for the dialog's whole lifetime. That
+    is a disclosure the CC-elicitation path does not have. The dynamic text must travel out of
+    band (child env, which macOS does not expose across uids); argv may carry only non-secret
+    chrome (button names, the give-up integer)."""
+    import codex_server as cs
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "dialog")
+    secret = "curl -H 'Authorization: Bearer sk-SUPER-SECRET-abc123'"
+    seen = {}
+    def fake(script, argv, cap_s, pump_fn=None, wait_state=None, env_payload=None):
+        seen["argv"] = [str(a) for a in argv]
+        seen["env"] = env_payload or {}
+        return ("ok", "Deny")
+    monkeypatch.setattr(cs, "_osascript_stage", fake)
+    cs._bridge_approval_dispatch(
+        "item/commandExecution/requestApproval",
+        dict(_CMD_APPROVAL, command=secret),
+        lambda m: None, _no_cc_read, timeout=5.0)
+    joined_argv = " | ".join(seen["argv"])
+    assert "sk-SUPER-SECRET" not in joined_argv, f"secret leaked into argv: {joined_argv}"
+    assert any("sk-SUPER-SECRET" in str(v) for v in seen["env"].values()), \
+        "the dialog must still receive the message (via env)"
+
+
+def test_osascript_stage_reads_body_from_env():
+    """The env channel actually works end-to-end through a REAL osascript: `system attribute`
+    returns what we injected, so the dialog can render text it never received on the command
+    line. Skips where osascript is absent."""
+    import codex_server as cs
+    if not shutil.which("osascript"):
+        pytest.skip("osascript not available")
+    status, out = cs._osascript_stage(
+        'on run argv\n    return system attribute "BULLDOZER_DIALOG_BODY"\nend run',
+        [5], cap_s=10, env_payload={"BULLDOZER_DIALOG_BODY": "hello-from-env"})
+    assert (status, out) == ("ok", "hello-from-env")
+
+
+# --- codex_review round 7 (#340): a dialog answer that lands past the deadline is LATE ---
+
+def test_dialog_answer_after_deadline_is_a_timeout(monkeypatch):
+    """P2 (codex r7): if the dialog process exits just after the last in-loop deadline check (or
+    the final pump crosses it), the loop ends on poll() and the answer used to be honored with
+    timed_out=false — accepting an approval past its budget. Especially reachable in stage 2,
+    which has NO native `giving up after`. The deadline must be re-checked before the output is
+    honored → fail-safe timeout/decline.
+
+    Deterministic: a fake process that is ALREADY exited at the first poll, with a budget that has
+    just expired — exactly the 'answered as the deadline passed' shape."""
+    import io
+    import codex_server as cs
+
+    class _ExitedProc:
+        returncode = 0
+        def __init__(self):
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO("Allow\n")
+            self.stderr = io.StringIO("")
+        def poll(self):
+            return 0            # already gone: the loop body never runs
+        def terminate(self):
+            pass
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(cs.subprocess, "Popen", lambda *a, **k: _ExitedProc())
+    ws = {}
+    status, out = cs._osascript_stage(
+        "on run argv\n    return \"Allow\"\nend run", [5, "Allow", "Deny", "Allow"],
+        cap_s=0.0, wait_state=ws)                    # budget expires the instant we start
+    assert status == "timeout", f"a late answer was honored: {(status, out)}"
+    assert ws.get("timed_out") is True

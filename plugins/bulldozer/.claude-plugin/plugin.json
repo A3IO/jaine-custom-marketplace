@@ -1,6 +1,6 @@
 {
   "name": "bulldozer",
-  "version": "2026.07.12.6",
+  "version": "2026.07.13",
   "description": "Adversarial review loop with external AI reviewer (Codex CLI) + visual browser verification via JAINE Browser CDP",
   "author": {
     "name": "JAINE",
