@@ -2251,6 +2251,11 @@ def _unattended_active() -> bool:
 # (arbitrary schemas can't be rendered as buttons).
 
 _APPROVAL_DIALOG_SENTINEL_DEFAULT = "~/.claude/bulldozer-approval-dialog"
+# Machine-global sentinel (Chris, 2026-07-13): vault-level, NOT $HOME-bound — one touch flips
+# dialog mode for EVERY user/config/session on the box (the user-level sentinel above only
+# covers its own $HOME). On machines without the /0 vault the path simply never exists —
+# bulldozer's home turf has it. Test override: BULLDOZER_APPROVAL_DIALOG_MACHINE_FILE.
+_APPROVAL_DIALOG_MACHINE_SENTINEL_DEFAULT = "/0/.jaine/bulldozer-approval-dialog"
 _DIALOG_TITLE = "🤖 Codex approval"
 _BTN_OPTIONS = "Опции…"
 _DIALOG_UNAVAILABLE = object()   # sentinel: dialog could not be SHOWN → fall back to CC
@@ -2298,10 +2303,12 @@ end run'''
 def _approval_ui() -> str:
     """'dialog' | 'cc' — which UI answers ATTENDED approvals (#340). env BULLDOZER_APPROVAL_UI
     wins both ways ('dialog' arms it, explicit 'cc'/'tui' disarms — the test-suite hermeticity
-    hook); otherwise the sentinel file (BULLDOZER_APPROVAL_DIALOG_FILE, default
-    ~/.claude/bulldozer-approval-dialog) toggles dialog mode LIVE (touch/rm — the server env is
-    fixed at spawn, the file is not; mirrors the #277 unattended sentinel). Resolved FRESH per
-    approval. Default 'cc' → the pre-#340 elicitation path, byte-identical."""
+    hook); otherwise EITHER sentinel file toggles dialog mode LIVE (touch/rm — the server env
+    is fixed at spawn, the files are not; mirrors the #277 unattended sentinel): the user-level
+    one (BULLDOZER_APPROVAL_DIALOG_FILE, default ~/.claude/bulldozer-approval-dialog) or the
+    machine-global vault one (BULLDOZER_APPROVAL_DIALOG_MACHINE_FILE, default
+    /0/.jaine/bulldozer-approval-dialog — one touch covers every user/config/session on the
+    box). Resolved FRESH per approval. Default 'cc' → the pre-#340 path, byte-identical."""
     env = (os.environ.get("BULLDOZER_APPROVAL_UI") or "").strip().lower()
     if env == "dialog":
         return "dialog"
@@ -2309,8 +2316,10 @@ def _approval_ui() -> str:
         return "cc"
     sentinel = os.environ.get("BULLDOZER_APPROVAL_DIALOG_FILE") or os.path.expanduser(
         _APPROVAL_DIALOG_SENTINEL_DEFAULT)
+    machine = (os.environ.get("BULLDOZER_APPROVAL_DIALOG_MACHINE_FILE")
+               or _APPROVAL_DIALOG_MACHINE_SENTINEL_DEFAULT)
     try:
-        if sentinel and os.path.exists(sentinel):
+        if (sentinel and os.path.exists(sentinel)) or (machine and os.path.exists(machine)):
             return "dialog"
     except Exception:
         pass
@@ -4193,11 +4202,17 @@ def _approval_knobs() -> dict:
     ui_env = (os.environ.get("BULLDOZER_APPROVAL_UI") or "").strip().lower()
     dialog_sentinel = os.environ.get("BULLDOZER_APPROVAL_DIALOG_FILE") or os.path.expanduser(
         _APPROVAL_DIALOG_SENTINEL_DEFAULT)
+    machine_sentinel = (os.environ.get("BULLDOZER_APPROVAL_DIALOG_MACHINE_FILE")
+                        or _APPROVAL_DIALOG_MACHINE_SENTINEL_DEFAULT)
     approval_ui = _approval_ui()
     if ui_env in ("dialog", "cc", "tui"):
         approval_ui_source = "env"
     elif approval_ui == "dialog":
-        approval_ui_source = "sentinel-file"
+        try:
+            user_armed = os.path.exists(dialog_sentinel)
+        except OSError:
+            user_armed = False
+        approval_ui_source = "sentinel-file" if user_armed else "machine-sentinel"
     else:
         approval_ui_source = "default"
     return {
@@ -4206,6 +4221,7 @@ def _approval_knobs() -> dict:
         "approval_ui": approval_ui,
         "approval_ui_source": approval_ui_source,
         "approval_ui_sentinel_path": dialog_sentinel,
+        "approval_ui_machine_sentinel_path": machine_sentinel,
         "park_cap_s": _park_cap_s(),
         "park_cap_source": park_cap_source,
         "fast_path_scope": effective_scope,

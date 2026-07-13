@@ -88,6 +88,8 @@ def _disarm_dialog_ui(monkeypatch):
     monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "cc")
     monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_FILE",
                        "/nonexistent/bulldozer-approval-dialog-xyz")
+    monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_MACHINE_FILE",
+                       "/nonexistent/bulldozer-approval-dialog-machine-xyz")
     import codex_server as cs
     monkeypatch.setattr(cs, "_start_beeper", lambda: None, raising=False)
 
@@ -7847,6 +7849,49 @@ def test_approval_ui_sentinel_file(monkeypatch, tmp_path):
     sentinel.write_text("")
     monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_FILE", str(sentinel))
     assert cs._approval_ui() == "dialog"
+
+
+def test_approval_ui_machine_sentinel(monkeypatch, tmp_path):
+    """Machine-global sentinel (default /0/.jaine/bulldozer-approval-dialog — vault-level, NOT
+    $HOME-bound): its presence arms dialog mode for every user/config/session on the box.
+    Testable via the BULLDOZER_APPROVAL_DIALOG_MACHINE_FILE override (never touch the real
+    vault path from tests)."""
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_APPROVAL_UI", raising=False)
+    machine = tmp_path / "machine-dialog"
+    machine.write_text("")
+    monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_MACHINE_FILE", str(machine))
+    assert cs._approval_ui() == "dialog"
+
+
+def test_approval_ui_machine_sentinel_default_path_is_vault():
+    import codex_server as cs
+    assert cs._APPROVAL_DIALOG_MACHINE_SENTINEL_DEFAULT == "/0/.jaine/bulldozer-approval-dialog"
+
+
+def test_approval_ui_env_cc_wins_over_machine_sentinel(monkeypatch, tmp_path):
+    """The per-server escape hatch works against the machine-global toggle too."""
+    import codex_server as cs
+    machine = tmp_path / "machine-dialog"
+    machine.write_text("")
+    monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_MACHINE_FILE", str(machine))
+    monkeypatch.setenv("BULLDOZER_APPROVAL_UI", "cc")
+    assert cs._approval_ui() == "cc"
+
+
+def test_approval_knobs_report_machine_sentinel(monkeypatch, tmp_path):
+    """codex_info(query='approval') distinguishes WHICH sentinel armed the dialog and always
+    reports both paths."""
+    import codex_server as cs
+    monkeypatch.delenv("BULLDOZER_APPROVAL_UI", raising=False)
+    monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_FILE", "/nonexistent/user-xyz")
+    machine = tmp_path / "machine-dialog"
+    machine.write_text("")
+    monkeypatch.setenv("BULLDOZER_APPROVAL_DIALOG_MACHINE_FILE", str(machine))
+    k = cs._approval_knobs()
+    assert k["approval_ui"] == "dialog"
+    assert k["approval_ui_source"] == "machine-sentinel"
+    assert k["approval_ui_machine_sentinel_path"] == str(machine)
 
 
 def test_approval_ui_env_cc_wins_over_sentinel(monkeypatch, tmp_path):
