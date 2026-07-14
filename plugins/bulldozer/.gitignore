@@ -7,3 +7,7 @@ __pycache__/
 # settings.json, rules/) stay visible to git.
 .claude/*.lock
 .venv-spike/
+
+# Playwright MCP working files (console logs / page snapshots) — transient,
+# recreated on any browser_* call with this cwd.
+.playwright-mcp/
