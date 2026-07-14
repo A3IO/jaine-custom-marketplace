@@ -20,6 +20,19 @@ sys.path.insert(0, MCP_DIR)
 import codex_facade  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _redirect_facade_log(tmp_path_factory, monkeypatch):
+    """Hygiene (mirrors the v2 suite's _redirect_codex_log): NO facade test writes
+    FACADE_* lines to the real ~/.claude/hooks/bulldozer-codex.log — fake-worker
+    SPAWN_FAIL/WORKER_DIED/PARK bursts were poisoning the production log's
+    aggregates (found live during the #19 bake-in, 2026-07-14). _facade_log_path()
+    reads the env at Facade construction, which happens inside test bodies — after
+    this fixture — so the redirect always wins; tests that assert log contents
+    override with their own setenv in the body."""
+    logdir = tmp_path_factory.mktemp("facadelog")
+    monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(logdir / "bulldozer-codex.log"))
+
+
 # ---------------------------------------------------------------------------
 # §3.2(3) — dispatch-args preparation: codex_review policy injection
 # ---------------------------------------------------------------------------

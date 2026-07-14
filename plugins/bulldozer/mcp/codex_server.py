@@ -3877,12 +3877,49 @@ def codex_review_v2(args: dict, manager: "AppServerManager | None" = None,
     return r
 
 
+def _foreign_thread(ts: dict, params: dict) -> bool:
+    """True when a frame belongs to a thread OUTSIDE this turn's accepted set (#349 r1:
+    ultra auto-delegation streams CHILD threads' items on the same connection — their
+    text must not enter the root assembly, and their turn/completed must not end OUR
+    pump). Accepted set = {root thread} ∪ {reviewThreadId} (captured at the start ACK).
+    Missing frame threadId or an unknowable set → NOT foreign (defensive accept)."""
+    fr = params.get("threadId")
+    if not fr:
+        return False
+    allowed = ts.get("accepted_thread_ids")
+    if not allowed:
+        tid = ts.get("thread_id")
+        if not tid:
+            return False
+        allowed = {tid}
+    return fr not in allowed
+
+
+def _assembled_message(ts: dict) -> str:
+    """Assemble the turn's message text per agentMessage ITEM (#349). effort=ultra
+    auto-delegation streams several items CONCURRENTLY — a flat join of deltas
+    interleaves them delta-by-delta into unreadable mush, so deltas are keyed by
+    itemId and joined per item (first-seen order, blank line between items). A
+    completed item's full .text is authoritative over that item's deltas. Falls back
+    to the legacy flat join when no per-item data was recorded (hand-built ts)."""
+    order = ts.get("msg_item_order") or []
+    if not order:
+        return "".join(ts["final_message_parts"])
+    blocks = []
+    for iid in order:
+        final = ts.get("msg_item_final", {}).get(iid)
+        text = final if final is not None else "".join(ts.get("msg_item_parts", {}).get(iid, []))
+        if text:
+            blocks.append(text)
+    return "\n\n".join(blocks)
+
+
 def _build_interrupted_result(ts: dict, interrupted_by: str, thread_warm: bool = True) -> dict:
     """Graceful, resumable result for an interrupted turn (#218 F7). Mode-shaped (so a
     review/implement/codex_review caller still gets its keys) with interrupt metadata and NO
     'error' key — the dispatcher marks isError iff 'error' in res, so an interrupt stays a
     graceful partial, not a failure."""
-    partial = "".join(ts["final_message_parts"])
+    partial = _assembled_message(ts)             # per-item assembly (#349)
     meta = _build_result_meta(ts["manager"], ts["usage_snapshot"], ts["turn_start_t"],
                               ts["mcp_mode"], ts["mcp_servers_enabled"],
                               ts["effort_val"], ts["model_val"], "interrupted", ts=ts)
@@ -3947,14 +3984,31 @@ def _handle_child_frame(frame: dict, ts: dict):
         return None
     method = frame.get("method", "")
     if method == "item/agentMessage/delta":
+        p = frame.get("params", {})
+        if _foreign_thread(ts, p):               # a delegated child thread's stream (#349 r1)
+            return None
         # `or ""`: a present-but-null delta returns None from .get(k, "") (#18)
-        ts["final_message_parts"].append(frame.get("params", {}).get("delta") or "")
+        d = p.get("delta") or ""
+        ts["final_message_parts"].append(d)      # raw stream order — the #224 narrative cursor
+        iid = p.get("itemId") or ""              # required per schema; "" = defensive bucket (#349)
+        parts = ts.setdefault("msg_item_parts", {})
+        if iid not in parts:
+            parts[iid] = []
+            ts.setdefault("msg_item_order", []).append(iid)
+        parts[iid].append(d)
         return None
-    if method == "item/completed" and ts["review_target"] is not None:
-        # Native review output is delivered as a COMPLETED agentMessage item (.text), not deltas.
+    if method == "item/completed":
+        # A completed agentMessage carries the item's FULL text — authoritative over that
+        # item's deltas for ALL turns (#349; native review delivers ONLY this, never deltas).
+        if _foreign_thread(ts, frame.get("params", {})):   # child thread's item (#349 r1)
+            return None
         _it = frame.get("params", {}).get("item", {}) or {}
         if _it.get("type") == "agentMessage":
-            ts["final_message_parts"].append(_it.get("text") or "")   # null-safe (#18)
+            iid = _it.get("id") or ""
+            if iid not in ts.setdefault("msg_item_parts", {}):
+                ts["msg_item_parts"][iid] = []
+                ts.setdefault("msg_item_order", []).append(iid)
+            ts.setdefault("msg_item_final", {})[iid] = _it.get("text") or ""   # null-safe (#18)
         return None
     if method == "thread/tokenUsage/updated":
         tu = frame.get("params", {}).get("tokenUsage")
@@ -3962,6 +4016,8 @@ def _handle_child_frame(frame: dict, ts: dict):
             ts["usage_snapshot"] = tu
         return None
     if method == "turn/completed":
+        if _foreign_thread(ts, frame.get("params", {})):   # a child turn ending must not end OURS (#349 r1)
+            return None
         t = frame.get("params", {}).get("turn", {}) or {}
         # An interrupted turn (no error) is GRACEFUL, not a failure — route it to the graceful
         # result, bypassing the generic terminal-failure arm below. Two sources, both deliberate:
@@ -3984,7 +4040,7 @@ def _handle_child_frame(frame: dict, ts: dict):
         if ts["retries"]:
             meta["retries"] = ts["retries"]
         _turn_ok_log(ts, meta)
-        return _shape_result(ts["mode"], ts["thread_id"], "".join(ts["final_message_parts"]), meta)
+        return _shape_result(ts["mode"], ts["thread_id"], _assembled_message(ts), meta)   # #349
     if method == "error":
         # willRetry:true = transient stream reconnect (codex retries) → NOT terminal, NOT drift.
         is_terminal, emsg = _classify_error_notification(frame.get("params", {}) or {})
@@ -4519,7 +4575,14 @@ def _drive_turn(ctx):
                             return _stamp_drift({"error": f"{start_method} error: {frame['error']}",
                                                  **_fail_meta(ts)}, acc)
                         turn_acked = True
-                        turn_id = ((frame.get("result") or {}).get("turn") or {}).get("id")
+                        _ack_res = frame.get("result") or {}
+                        turn_id = (_ack_res.get("turn") or {}).get("id")
+                        # #349 r1: native review streams its items on a SEPARATE review
+                        # thread — admit it (and only it) alongside the root thread.
+                        ts["accepted_thread_ids"] = {thread_id}
+                        _rtid = _ack_res.get("reviewThreadId")
+                        if _rtid:
+                            ts["accepted_thread_ids"].add(_rtid)
                     elif method == "error":
                         is_terminal, emsg = _classify_error_notification(frame.get("params", {}) or {})
                         if is_terminal:
@@ -4903,6 +4966,8 @@ def codex_run_v2(
     # read/mutate these so a child frame is handled identically wherever it is read.
     ts = {
         "final_message_parts": [], "usage_snapshot": {}, "retries": 0,
+        # #349: per-item assembly (ultra delegation streams concurrent agentMessage items)
+        "msg_item_parts": {}, "msg_item_order": [], "msg_item_final": {},
         "interrupting": False, "interrupted_by": "cancel", "acc": acc,
         "manager": manager, "turn_start_t": turn_start_t, "mcp_mode": mcp_mode,
         "mcp_servers_enabled": mcp_servers_enabled, "effort_val": effort_val,

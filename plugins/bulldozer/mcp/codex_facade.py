@@ -371,9 +371,13 @@ _PARK_CAP_MARGIN_S = 60.0        # the facade unpins only AFTER the engine did
 _PARK_PROBE_EVERY_S = 30.0       # liveness probe cadence for a parked worker
 _DESIGNATED = "designated"       # the funnel's home worker (approvals + info)
 _FACADE_PARALLEL_LINE = (
-    "\n\nFACADE: turns run in PARALLEL — just issue concurrent tools/call; "
-    "the facade multiplexes an internal worker pool (writable roots and "
-    "approval-capable turns are serialized for safety)."
+    "\n\nFACADE: turns run in PARALLEL on an internal worker pool (writable roots and "
+    "approval-capable turns are serialized for safety). To actually fan out: dispatch "
+    "one call per SUBAGENT (sonnet or stronger — weaker models fumble MCP tool calls), "
+    "and for codex_run pass approval_policy:'never' with a read-only sandbox — the "
+    "default on-request policy is approval-capable, so those turns SERIALIZE by design "
+    "(codex_review is always parallel-class). Multiple calls in ONE assistant message "
+    "are dispatched SERIALLY by the client, so they never overlap regardless."
 )
 
 

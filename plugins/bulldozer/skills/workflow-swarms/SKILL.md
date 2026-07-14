@@ -1,6 +1,6 @@
 ---
 name: workflow-swarms
-description: ALWAYS invoke when building or authoring a Workflow tool script, fanning out subagents, orchestrating agent swarms, spawning parallel/pipeline agents, running parallel codex jobs, or working under ultracode. Triggers on "build a workflow", "fan out agents", "оркеструй", "разбей на агентов", "parallel agents", "subagent swarm", "workflow", "ultracode", "параллельные codex". Covers per-role model routing (Haiku for grep/search/extraction, Sonnet for verify/judge/review, explicit Opus for synthesis), throttling to avoid 529 overload, token-budget scaling, concurrency caps, and codex fan-out via the lane pool (one subagent per mcp__codex-lane<N> — the shared plugin bridge serializes and rejects concurrent calls). Do NOT let agents inherit the session model — under a Fable session (Mythos tier, 2× Opus price) omitted model = fable everywhere. Route by role, set synthesis explicitly.
+description: ALWAYS invoke when building or authoring a Workflow tool script, fanning out subagents, orchestrating agent swarms, spawning parallel/pipeline agents, running parallel codex jobs, or working under ultracode. Triggers on "build a workflow", "fan out agents", "оркеструй", "разбей на агентов", "parallel agents", "subagent swarm", "workflow", "ultracode", "параллельные codex". Covers per-role model routing (Haiku for grep/search/extraction, Sonnet for verify/judge/review, explicit Opus for synthesis), throttling to avoid 529 overload, token-budget scaling, concurrency caps, and codex fan-out via the facade multiplexer (one codex call per sonnet+ subagent; calls from a single assistant message are dispatched serially by the client and never overlap). Do NOT let agents inherit the session model — under a Fable session (Mythos tier, 2× Opus price) omitted model = fable everywhere. Route by role, set synthesis explicitly.
 ---
 
 # Workflow Agent Swarms — Routing & Throttling Doctrine
@@ -175,39 +175,35 @@ grok+agy) gives RECALL (different models catch the swarm's correlated blind spot
 neither alone was complete. For recall-critical work consider running BOTH, but this is a ~3-run
 observation: validate per task, and mind the doubled cost (the swarm alone is already ~2.5-3M tokens).
 
-## Codex fan-out — route subagents through the lane pool
+## Codex fan-out — one subagent per call, through the facade
 
-Parallel CODEX jobs (reviews, consults, implement runs) do NOT parallelize through the
-bulldozer plugin MCP server: subagents share the session's single connection to it, and its
-serial dispatcher rejects a second concurrent call (`codex turn already in flight`). The
-canonical parallel path is the **lane pool** (live-proven 2026-07-13: two turns overlapping
-102 s, wall = max not sum):
+Parallel CODEX jobs (reviews, consults, implement runs) fan out through the bulldozer codex
+server WHEN it is the facade multiplexer (#344): one registration, an internal worker pool,
+concurrent turns genuinely overlap (live-proven 2026-07-14: wall = max not sum). Check the
+server's MCP instructions for a `FACADE:` line — that line = the pool is live. No `FACADE:`
+line = the legacy serial bridge (one turn at a time, a second concurrent call is rejected
+with `codex turn already in flight`) — then fan out via background CLI `codex exec` per
+subagent instead.
 
-- Assign **one subagent per lane**: subagent N calls `mcp__codex-lane<N>__codex_run` with
-  `mcp:'isolated'` — name the lane EXPLICITLY in each subagent's prompt so two never share one.
-- Lanes are named local registrations of the same bulldozer bridge (all features preserved:
-  isolation, approvals, audit); each self-describes with a `FAN-OUT LANE <N>` preamble in its
-  MCP instructions. No lane tools visible = the pool isn't registered in this project — then
-  codex fan-out serializes; fall back to background CLI `codex exec` per subagent, or extend
-  the pool: `claude mcp add codex-lane<K> --env BULLDOZER_LANE=<K> -- python3 <bulldozer>/mcp/codex_server.py`
-  (+ session restart; mid-session registrations are invisible to subagents).
-- More parallel jobs than lanes → queue per lane (several sequential calls inside one
-  subagent) rather than sharing a lane between two subagents.
-- **Parked approvals are lane-local:** an `awaiting_approval` from lane N must be resumed via
-  `mcp__codex-lane<N>__codex_approve` — the park token lives in that lane's process; any other
-  server answers `parked turn expired` and the original turn stays blocked. Keep the whole
-  run→approve loop inside the SAME subagent (it only sees its own lane anyway).
+- **One codex call per SUBAGENT, subagents `sonnet` or stronger** — weaker models fumble
+  MCP tool calls after ToolSearch (observed: haiku concluded the tool "isn't callable").
+- **Never fan out from the main session's own message:** multiple MCP calls in ONE
+  assistant message are dispatched SERIALLY by the client — they will not overlap no matter
+  what the server supports. Subagents dispatching concurrently are THE mechanism.
+- **What still serializes (by design, for safety):** approval-capable turns (effective
+  `approval_policy != "never"`) and turns whose writable roots overlap — they queue
+  (`FACADE_QUEUED` in the audit log) and run in order. Read-only `mcp:'isolated'`
+  `approval_policy:'never'` jobs are the freely-parallel class; `codex_review` is always in
+  it (the facade injects `approval_policy:"never"` into every review dispatch).
+- **Keep a run→approve loop inside ONE subagent:** an `awaiting_approval` park must be
+  resumed via the SAME server registration's `codex_approve` — do not split the loop across
+  agents that might see different registrations.
 - **Writable jobs need filesystem isolation too** — `mcp:'isolated'` restricts codex's MCP
-  servers, NOT the filesystem. Two `sandbox:"workspace-write"` lanes pointed at the SAME `cwd`
-  race the checkout (edits, tests, git state). For writable fan-out either OMIT `cwd` (each
-  turn gets its own isolated tmpdir) or give each lane its OWN worktree; parallel jobs into one
-  repo checkout must stay read-only (reviews/consults).
-- **Consumer-project caveat:** registering lanes in a project that gets the bulldozer plugin's
-  own MCP server SUPPRESSES that plugin registration (`excludeStalePluginClients`) — existing
-  `mcp__plugin_bulldozer_codex__*` tools disappear for new sessions there, replaced by the lane
-  names (same four tools, served from whatever path you registered). Fine in the bulldozer dev
-  repo (lanes serve SOURCE); in consumer projects either accept the rename or skip lanes and
-  fan out via background CLI `codex exec` instead.
+  servers, NOT the filesystem. Two `sandbox:"workspace-write"` turns pointed at the SAME
+  `cwd` race the checkout — and the facade will serialize them anyway (overlapping writable
+  roots). For genuinely parallel writable fan-out either OMIT `cwd` (each turn gets its own
+  isolated tmpdir) or give each job its OWN worktree; parallel jobs into one repo checkout
+  must stay read-only (reviews/consults).
 
 ## Feedback
 

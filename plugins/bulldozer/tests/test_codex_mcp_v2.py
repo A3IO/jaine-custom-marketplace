@@ -460,6 +460,130 @@ def test_handle_child_frame_completed_returns_result():
     assert out is not None and "error" not in out and out.get("result") == "done"
 
 
+# ── #349: effort=ultra auto-delegation — parallel agentMessage items must not interleave ──
+
+def _delta(iid, text):
+    return {"method": "item/agentMessage/delta",
+            "params": {"itemId": iid, "delta": text, "threadId": "t1", "turnId": "T"}}
+
+
+def test_parallel_item_deltas_do_not_interleave_in_result():
+    """#349: ultra delegation streams SEVERAL concurrent agentMessage items; their deltas
+    must assemble per-item (first-seen order), not interleave by arrival order."""
+    import codex_server as cs
+    ts = _mk_ts()
+    for f in [_delta("A", "Finding 1: dosage "), _delta("B", "Finding 2: inter"),
+              _delta("A", "checks missing."),    _delta("B", "actions not reviewed.")]:
+        assert cs._handle_child_frame(f, ts) is None
+    out = cs._handle_child_frame(
+        {"method": "turn/completed", "params": {"turn": {"status": "completed"}}}, ts)
+    assert out.get("result") == ("Finding 1: dosage checks missing."
+                                 "\n\n"
+                                 "Finding 2: interactions not reviewed.")
+
+
+def test_item_completed_text_overrides_that_items_deltas_in_plain_turns():
+    """#349: a completed agentMessage item's full .text is authoritative over its own
+    accumulated deltas — for ALL turns, not only review."""
+    import codex_server as cs
+    ts = _mk_ts()                                    # review_target=None (plain codex_run)
+    cs._handle_child_frame(_delta("A", "draft ju"), ts)
+    cs._handle_child_frame({"method": "item/completed", "params": {
+        "item": {"id": "A", "type": "agentMessage", "text": "FINAL TEXT"}}}, ts)
+    out = cs._handle_child_frame(
+        {"method": "turn/completed", "params": {"turn": {"status": "completed"}}}, ts)
+    assert out.get("result") == "FINAL TEXT"
+
+
+def test_single_item_turn_result_byte_identical():
+    """#349 pin: the common single-item turn assembles to the exact delta concatenation —
+    no separators, no reordering (byte-compat with the pre-#349 flat join)."""
+    import codex_server as cs
+    ts = _mk_ts()
+    for d in ("Hello", ", ", "world"):
+        cs._handle_child_frame(_delta("A", d), ts)
+    out = cs._handle_child_frame(
+        {"method": "turn/completed", "params": {"turn": {"status": "completed"}}}, ts)
+    assert out.get("result") == "Hello, world"
+
+
+def test_interrupted_partial_text_assembles_per_item():
+    """#349: an interrupt mid-delegation returns partial_text as per-item blocks, not
+    the interleaved arrival-order mush."""
+    import codex_server as cs
+    ts = _mk_ts()
+    for f in [_delta("A", "alpha-one "), _delta("B", "beta-one "),
+              _delta("A", "alpha-two"),  _delta("B", "beta-two")]:
+        cs._handle_child_frame(f, ts)
+    res = cs._build_interrupted_result(ts, interrupted_by="cancel")
+    assert res["partial_text"] == "alpha-one alpha-two\n\nbeta-one beta-two"
+
+
+def _delta_t(iid, text, tid):
+    return {"method": "item/agentMessage/delta",
+            "params": {"itemId": iid, "delta": text, "threadId": tid, "turnId": "T"}}
+
+
+def test_child_thread_deltas_excluded_from_result():
+    """#349 r1: ultra delegation streams CHILD threads' agentMessage deltas on the same
+    connection (their own threadId) — they must not leak into the root turn's result."""
+    import codex_server as cs
+    ts = _mk_ts()                                    # thread_id "t1"
+    cs._handle_child_frame(_delta_t("R", "ROOT-ANSWER", "t1"), ts)
+    cs._handle_child_frame(_delta_t("C", "CHILD NOISE", "child-1"), ts)
+    out = cs._handle_child_frame(
+        {"method": "turn/completed", "params": {"turn": {"status": "completed"}}}, ts)
+    assert out.get("result") == "ROOT-ANSWER"
+
+
+def test_child_item_completed_excluded_from_result():
+    """#349 r1: a child thread's completed agentMessage must not enter the assembly."""
+    import codex_server as cs
+    ts = _mk_ts()
+    cs._handle_child_frame(_delta_t("R", "ROOT-ANSWER", "t1"), ts)
+    cs._handle_child_frame({"method": "item/completed", "params": {
+        "item": {"id": "C", "type": "agentMessage", "text": "CHILD REPORT"},
+        "threadId": "child-1", "turnId": "T"}}, ts)
+    out = cs._handle_child_frame(
+        {"method": "turn/completed", "params": {"turn": {"status": "completed"}}}, ts)
+    assert out.get("result") == "ROOT-ANSWER"
+
+
+def test_review_thread_frames_accepted_via_accepted_set():
+    """#349 r1: native review streams on a SEPARATE review thread — the ACK-captured
+    accepted set must admit its frames."""
+    import codex_server as cs
+    ts = _mk_ts(accepted_thread_ids={"t1", "rt1"})
+    cs._handle_child_frame({"method": "item/completed", "params": {
+        "item": {"id": "RI", "type": "agentMessage", "text": "REVIEW TEXT"},
+        "threadId": "rt1", "turnId": "T"}}, ts)
+    out = cs._handle_child_frame(
+        {"method": "turn/completed", "params": {"threadId": "rt1",
+                                                "turn": {"status": "completed"}}}, ts)
+    assert out.get("result") == "REVIEW TEXT"
+
+
+def test_foreign_thread_turn_completed_does_not_terminate():
+    """#349 r1 defensive: a foreign thread's turn/completed must not end OUR pump."""
+    import codex_server as cs
+    ts = _mk_ts()
+    out = cs._handle_child_frame({"method": "turn/completed", "params": {
+        "threadId": "child-1", "turn": {"status": "completed"}}}, ts)
+    assert out is None
+
+
+def test_delta_without_itemid_still_assembles():
+    """#349 defensive pin: a delta missing itemId (schema says required) falls into one
+    bucket and still reaches the result."""
+    import codex_server as cs
+    ts = _mk_ts()
+    cs._handle_child_frame(
+        {"method": "item/agentMessage/delta", "params": {"delta": "hello"}}, ts)
+    out = cs._handle_child_frame(
+        {"method": "turn/completed", "params": {"turn": {"status": "completed"}}}, ts)
+    assert out.get("result") == "hello"
+
+
 def test_handle_child_frame_failed_status_returns_error():
     import codex_server as cs
     ts = _mk_ts()
@@ -3953,16 +4077,17 @@ class ExtendedFakeChild(FakeChild):
         if method == "review/start":
             tid = params.get("threadId", "T1")
             turn_id = "RTURN1"
+            rtid = "REVIEW-" + tid   # real codex reviews on a SEPARATE review thread (#349 r1)
             self._write_msg({"id": mid, "result": {
                 "turn": {"id": turn_id, "items": [], "status": "running"},
-                "reviewThreadId": tid}})
-            # Review output is a COMPLETED agentMessage item (not deltas).
+                "reviewThreadId": rtid}})
+            # Review output is a COMPLETED agentMessage item (not deltas) ON THE REVIEW THREAD.
             self._write_msg({"method": "item/completed", "params": {
                 "item": {"id": "RI1", "type": "agentMessage",
                          "text": "REVIEW: minus should be plus"},
-                "threadId": tid, "turnId": turn_id}})
+                "threadId": rtid, "turnId": turn_id}})
             self._write_msg({"method": "turn/completed", "params": {
-                "threadId": tid,
+                "threadId": rtid,
                 "turn": {"id": turn_id, "items": [], "itemsView": "loaded",
                          "status": "completed", "error": None,
                          "startedAt": 0, "completedAt": 0, "durationMs": 10}}})
