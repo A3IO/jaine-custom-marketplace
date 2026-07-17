@@ -58,6 +58,77 @@ Multi-channel: CDP WebSocket (primary) → AppleScript + DOM injection (fallback
 
 **Log:** `~/.claude/hooks/bulldozer-look.log`
 
+### /bulldozer:drive — Agent-Driven Product Testing
+
+Product testing on isolated Chrome-for-Testing lanes (ports 9340-9349; your daily :9333
+browser is structurally unreachable from a drive lane). A verify-core on top of the same
+cdp.py engine: navigate-that-waits, console error gate, stability-window assertions,
+trusted clicks, navigation-bound screenshots, opt-in cookie-seed auth. Autonomous
+(headless, default) and co-pilot (headful, human checkpoints) modes; honest STOP after
+3 fix-verify iterations.
+
+```
+/bulldozer:drive http://localhost:9401 прогнать сценарий логина
+```
+
+Requires the pinned Chrome for Testing (`skills/look/scripts/update-cft.sh` installs it).
+
+## MCP server (codex bridge)
+
+The plugin ships its own MCP server — four tools for driving OpenAI Codex from any
+session, with interactive approvals, cross-session resume, structured review output, and
+per-call MCP isolation. (Do NOT use the stock `codex mcp-server`: its Accept is
+mis-parsed as Denied — openai/codex#18268; this bridge fronts `codex app-server`, where
+approvals work.)
+
+| Tool | Use for |
+|------|---------|
+| `codex_review` | Adversarial review of a git diff — `target`: `uncommitted` \| `branch:<name>` \| `commit:<sha>` \| `custom:<instructions>`; returns prioritized free-text findings |
+| `codex_run` | Autonomous coding/research task in isolation — `mode: review` (schema-enforced `{verdict, findings}`) or `implement` (free text); resumable across sessions via `thread_id` |
+| `codex_info` | Connection-level reads (`models` / `auth` / `config` / `limits` / `usage` / `approval` knobs) — fast, no cold start |
+| `codex_approve` | Resume a turn parked at an unattended approval (`{park_token, decision_id}`) |
+
+Pass `mcp:'isolated'` unless codex genuinely needs cross-server tools. The first thread
+of a fresh server process pays codex's cold start (~28–80 s, variable); subsequent turns
+are warm (~1–2 s).
+
+### Parallelism (facade multiplexer)
+
+`mcp/codex_facade.py` fronts a lazy pool of workers (each an unchanged single-turn
+bridge), so concurrent turns genuinely overlap — wall-clock = max, not sum. **Which
+bridge a session is on:** the server's injected MCP instructions carry a `FACADE:` line
+when the worker pool is live; without it you are on the legacy serial bridge (a second
+concurrent call is rejected with `codex turn already in flight`).
+
+Fan-out recipe: one call per subagent (sonnet or stronger — weaker models fumble MCP
+tool calls), and for `codex_run` pass `approval_policy:'never'` with a read-only sandbox.
+Approval-capable turns and overlapping writable roots serialize BY DESIGN (`codex_review`
+is always parallel-class). Calls issued in ONE assistant message are dispatched serially
+by the client — subagents are the fan-out mechanism. Kill switch: `BULLDOZER_FACADE_OFF=1`
+reverts to the legacy single bridge.
+
+### Approvals
+
+- Default: interactive approval dialogs in the client (MCP elicitation).
+- Native macOS dialog instead of the client TUI: `touch ~/.claude/bulldozer-approval-dialog`
+  (per-user) or `/0/.jaine/bulldozer-approval-dialog` (machine-wide); env
+  `BULLDOZER_APPROVAL_UI=cc` forces the TUI back. Live toggle — the sentinel is checked
+  fresh per approval, no restart needed.
+- Unattended (model-in-the-loop): arm `~/.claude/bulldozer-unattended` — instead of a
+  human dialog, `codex_run` returns `{status:'awaiting_approval', park_token, approval}`;
+  the orchestrating model decides from the evidence and resumes via `codex_approve`.
+- Introspect all knobs: `codex_info(query="approval")`.
+
+### Troubleshooting
+
+- Tools absent in a session ⇒ the server did not connect: check `claude mcp list`,
+  approve the server if pending. The server requires **Python 3.11+** (`tomllib`).
+- Server CODE changes need a full client restart — stdio MCP servers are spawned at
+  launch and do not hot-reload (`/reload-plugins` re-registers config only).
+- Audit log: `~/.claude/hooks/bulldozer-codex.log` (env override `BULLDOZER_CODEX_LOG`) —
+  `TURN_OK`/`TURN_ERROR` per turn, `FACADE_*` scheduler events, `APPROVAL`/`PARK`/
+  `INTERRUPT` lines. See "Log Format" below for the shape caveats.
+
 ## Supported Artifact Types
 
 | Type | Example | What codex reviews |
