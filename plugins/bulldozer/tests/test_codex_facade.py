@@ -67,6 +67,60 @@ class TestPrepareDispatchArgs:
         out = codex_facade.prepare_dispatch_args("codex_run", args)
         assert "approval_policy" not in out
 
+    def test_codex_review_injects_read_only_sandbox(self):
+        """Flip-review P2: without the injection a smuggled
+        sandbox:"workspace-write" reaches thread/start (the engine honors
+        sandbox_val for the review thread), contradicting the readOnlyHint
+        annotation and the always-parallel scheduling of reviews."""
+        out = codex_facade.prepare_dispatch_args(
+            "codex_review", {"target": "uncommitted", "mcp": "all",
+                             "sandbox": "workspace-write"})
+        assert out["sandbox"] == "read-only"
+        # and on the plain path too
+        out2 = codex_facade.prepare_dispatch_args(
+            "codex_review", {"target": "uncommitted", "mcp": "isolated"})
+        assert out2["sandbox"] == "read-only"
+
+    def test_codex_run_sandbox_not_injected(self):
+        out = codex_facade.prepare_dispatch_args(
+            "codex_run", {"prompt": "p", "mcp": "isolated"})
+        assert "sandbox" not in out
+
+
+class TestPythonVersionGuard:
+    """Flip-review P2: `.mcp.json` launches a bare python3; on py<=3.9 the
+    Posture dataclass's PEP 604 annotations die with a cryptic TypeError at
+    import unless the facade guards first (mirrors the engine's #256 guard)."""
+
+    def test_old_interpreter_gets_actionable_message(self):
+        msg = codex_facade._python_version_error((3, 9, 0))
+        assert "3.11+" in msg and "got 3.9" in msg
+
+    def test_supported_interpreter_passes(self):
+        assert codex_facade._python_version_error((3, 11, 0)) is None
+        assert codex_facade._python_version_error((3, 14, 5)) is None
+
+    def test_guard_runs_before_any_pep604_annotation(self):
+        with open(codex_facade.__file__, encoding="utf-8") as f:
+            src = f.read()
+        guard_at = src.index("raise SystemExit(1)")
+        first_dataclass = src.index("@dataclasses.dataclass")
+        lib_import = src.index("import bulldozer_log")
+        assert guard_at < first_dataclass
+        assert guard_at < lib_import
+
+    def test_guard_runs_before_every_import_but_sys(self):
+        """Round-2: dataclasses entered the stdlib in 3.7 — an import above
+        the guard would ModuleNotFoundError on 3.6 before the guard fires.
+        Only `import sys` (needed by the guard itself) may precede it."""
+        with open(codex_facade.__file__, encoding="utf-8") as f:
+            src = f.read()
+        guard_at = src.index("raise SystemExit(1)")
+        for mod in ("dataclasses", "itertools", "json", "os", "queue",
+                    "shutil", "subprocess", "tempfile", "threading", "time"):
+            assert guard_at < src.index(f"import {mod}"), mod
+        assert src.index("import sys") < guard_at
+
 
 # ---------------------------------------------------------------------------
 # §3.2 — posture classification
@@ -602,6 +656,23 @@ class TestFacadePlumbing:
         assert {"codex_run", "codex_info", "codex_review",
                 "codex_approve"} <= names
         assert f.worker_count() == 0
+
+    def test_tools_list_read_only_hint_on_review_and_info_only(self, facade):
+        """codex_review/codex_info carry ToolAnnotations readOnlyHint (the
+        client parallelizes same-message dispatch of hinted tools — verified
+        CC 2.1.214, 2/2 vs serial 2/2 control); codex_run/codex_approve can
+        mutate and MUST NOT be hinted."""
+        f, cc = facade
+        f.handle_cc_frame({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tools = {t["name"]: t for t in cc.wait_for_id(1)["result"]["tools"]}
+        for name in ("codex_review", "codex_info"):
+            assert tools[name]["annotations"]["readOnlyHint"] is True
+        for name in ("codex_run", "codex_approve"):
+            assert "readOnlyHint" not in (tools[name].get("annotations") or {})
+        # the annotation is facade-side only: the engine's TOOLS stay unhinted
+        import codex_server
+        for t in codex_server.TOOLS:
+            assert "annotations" not in t
 
     def test_tool_call_roundtrip(self, facade):
         f, cc = facade

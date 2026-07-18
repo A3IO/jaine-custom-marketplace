@@ -178,23 +178,33 @@ observation: validate per task, and mind the doubled cost (the swarm alone is al
 ## Codex fan-out — one subagent per call, through the facade
 
 Parallel CODEX jobs (reviews, consults, implement runs) fan out through the bulldozer codex
-server WHEN it is the facade multiplexer (#344): one registration, an internal worker pool,
-concurrent turns genuinely overlap (live-proven 2026-07-14: wall = max not sum). Check the
-server's MCP instructions for a `FACADE:` line — that line = the pool is live. No `FACADE:`
-line = the legacy serial bridge (one turn at a time, a second concurrent call is rejected
-with `codex turn already in flight`) — then fan out via background CLI `codex exec` per
-subagent instead.
+server — the facade multiplexer (#344), **the plugin default since 2026-07-18**: one
+registration, an internal worker pool, concurrent turns genuinely overlap (live-proven
+2026-07-14: wall = max not sum). Check the server's MCP instructions for a `FACADE:` line —
+that line = the pool is live. No `FACADE:` line = the legacy serial bridge (an old plugin
+cache or the `BULLDOZER_FACADE_OFF=1` kill switch; one turn at a time, a second concurrent
+call is rejected with `codex turn already in flight`) — then fan out via background CLI
+`codex exec` per subagent instead.
 
 - **One codex call per SUBAGENT, subagents `sonnet` or stronger** — weaker models fumble
   MCP tool calls after ToolSearch (observed: haiku concluded the tool "isn't callable").
-- **Never fan out from the main session's own message:** multiple MCP calls in ONE
-  assistant message are dispatched SERIALLY by the client — they will not overlap no matter
-  what the server supports. Subagents dispatching concurrently are THE mechanism.
+- **Main-session fan-out works ONLY for `readOnlyHint`-annotated tools:**
+  `codex_review`/`codex_info` carry the hint (facade `tools/list`), and a client honoring
+  it (Claude Code ≥ 2.1.214 verified, 2/2 vs 2/2 serial control) dispatches several
+  review calls from ONE assistant message in PARALLEL — review fan-out needs no
+  subagents. Unhinted tools (`codex_run`/`codex_approve`) in one message are dispatched
+  SERIALLY by the client — they will not overlap no matter what the server supports;
+  subagents dispatching concurrently are THE mechanism for run fan-out. One more slow
+  lane: clients that auto-background long MCP calls (Claude Code ≥ 2.1.212, a call still
+  running at ~120 s becomes a background task) let the main session STACK long turns one
+  per message with a ~120 s stagger each; short calls still block their message, and
+  subagent calls are never auto-backgrounded.
 - **What still serializes (by design, for safety):** approval-capable turns (effective
   `approval_policy != "never"`) and turns whose writable roots overlap — they queue
   (`FACADE_QUEUED` in the audit log) and run in order. Read-only `mcp:'isolated'`
   `approval_policy:'never'` jobs are the freely-parallel class; `codex_review` is always in
-  it (the facade injects `approval_policy:"never"` into every review dispatch).
+  it (the facade injects `approval_policy:"never"` + `sandbox:"read-only"` into every
+  review dispatch).
 - **Keep a run→approve loop inside ONE subagent:** an `awaiting_approval` park must be
   resumed via the SAME server registration's `codex_approve` — do not split the loop across
   agents that might see different registrations.

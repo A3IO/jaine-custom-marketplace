@@ -13,17 +13,43 @@ if it neither conflicts nor fails to get a worker (`place_fn`), so capacity is
 the pool's real worker count — never a parallel accounting that can drift.
 """
 
-import dataclasses
-import itertools
-import json
-import os
-import queue
-import shutil
-import subprocess
 import sys
-import tempfile
-import threading
-import time
+
+
+def _python_version_error(version_info=None):
+    """Return a clear error string if the interpreter is too old, else None.
+
+    `.mcp.json` launches a bare `python3`. The workers (codex_server.py) need
+    3.11+ (tomllib), and this module itself evaluates PEP 604 annotations
+    (`str | None` on the Posture dataclass) at import — on py<=3.9 that dies
+    with a cryptic TypeError before the engine's own guard can ever run, so
+    the facade guards HERE, before every other import (dataclasses is 3.7+ —
+    on 3.6 an import placed above this guard would ModuleNotFoundError first)
+    and before any 3.10+ construct is evaluated."""
+    vi = sys.version_info if version_info is None else version_info
+    if tuple(vi[:2]) < (3, 11):
+        return (f"bulldozer-codex facade requires Python 3.11+ (spawns "
+                f"codex_server.py workers, which use tomllib); got "
+                f"{vi[0]}.{vi[1]}. Relaunch with a 3.11+ interpreter "
+                f"(e.g. via uv).")
+    return None
+
+
+_pyver_err = _python_version_error()
+if _pyver_err:
+    sys.stderr.write(_pyver_err + "\n")
+    raise SystemExit(1)
+
+import dataclasses  # noqa: E402
+import itertools  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import queue  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
@@ -69,14 +95,18 @@ class Posture:
 
 def prepare_dispatch_args(tool: str, args: dict) -> dict:
     """§3.1: forward tools/call args verbatim — with ONE deliberate exception:
-    a codex_review dispatch gets approval_policy="never" injected (r5/r6 P2).
-    The engine passes extra keys through (codex_review_v2: run_args =
-    dict(args)) and approvalPolicy is thread-level, so the injected value
-    governs the review turn — review fan-out is approval-free by construction.
-    """
+    a codex_review dispatch gets approval_policy="never" AND
+    sandbox="read-only" injected (r5/r6 P2; flip-review P2). The engine passes
+    extra keys through (codex_review_v2: run_args = dict(args)) and both are
+    thread-level, so the injected values govern the review turn — review
+    fan-out is approval-free and its sandbox is read-only by construction
+    (without the sandbox injection a smuggled sandbox:"workspace-write" would
+    reach thread/start, contradicting both the readOnlyHint annotation and
+    the scheduler's always-parallel classification of reviews)."""
     if tool == "codex_review":
         out = dict(args)
         out["approval_policy"] = "never"
+        out["sandbox"] = "read-only"
         return out
     return args
 
@@ -372,12 +402,16 @@ _PARK_PROBE_EVERY_S = 30.0       # liveness probe cadence for a parked worker
 _DESIGNATED = "designated"       # the funnel's home worker (approvals + info)
 _FACADE_PARALLEL_LINE = (
     "\n\nFACADE: turns run in PARALLEL on an internal worker pool (writable roots and "
-    "approval-capable turns are serialized for safety). To actually fan out: dispatch "
-    "one call per SUBAGENT (sonnet or stronger — weaker models fumble MCP tool calls), "
-    "and for codex_run pass approval_policy:'never' with a read-only sandbox — the "
-    "default on-request policy is approval-capable, so those turns SERIALIZE by design "
-    "(codex_review is always parallel-class). Multiple calls in ONE assistant message "
-    "are dispatched SERIALLY by the client, so they never overlap regardless."
+    "approval-capable turns are serialized for safety). codex_review/codex_info carry "
+    "readOnlyHint and are always parallel-class: a client honoring the hint dispatches "
+    "several codex_review calls from ONE assistant message in PARALLEL — no subagents "
+    "needed for review fan-out. codex_run/codex_approve are unhinted: same-message "
+    "calls dispatch SERIALLY, so fan out codex_run one call per SUBAGENT (sonnet or "
+    "stronger — weaker models fumble MCP tool calls) and pass approval_policy:'never' "
+    "with a read-only sandbox — the default on-request policy is approval-capable, so "
+    "those turns SERIALIZE by design. A client that auto-backgrounds a long-running "
+    "MCP call (~120s+) lets the MAIN session stack long turns one per message — a "
+    "staggered slow lane; subagent calls are never auto-backgrounded."
 )
 
 
@@ -406,6 +440,32 @@ def _engine():
     construction (§3.1)."""
     import codex_server
     return codex_server
+
+
+# codex_review and codex_info never mutate the caller-visible world (the facade
+# forces approval_policy:"never" + sandbox:"read-only" into every review
+# dispatch; info is a connection-level read), so their tools/list entries carry
+# the MCP ToolAnnotations readOnlyHint. Stamped HERE, not in the engine —
+# workers ship the engine UNCHANGED. Scope: the hint describes the tool's OWN
+# contract (per the MCP spec annotations are hints, not guarantees); outside it
+# sit (a) external write-capable MCP servers a caller explicitly enables via
+# mcp:"all"/subset, and (b) codex's bundled computer-use server, which no spawn
+# flag can disable (#204 documented limitation). DOCUMENTED WON'T-FIX: neither
+# is a hazard the hint CREATES — review concurrency is already structural (the
+# scheduler always parallel-classes reviews; the subagent fan-out recipe ran
+# them concurrently pre-hint), and prompt-injection is outside this plugin's
+# threat model (LOCAL single-user, #277).
+_READ_ONLY_TOOLS = frozenset({"codex_review", "codex_info"})
+
+
+def _annotated_tools():
+    tools = []
+    for t in _engine().TOOLS:
+        if isinstance(t, dict) and t.get("name") in _READ_ONLY_TOOLS:
+            t = dict(t)
+            t["annotations"] = dict(t.get("annotations") or {}, readOnlyHint=True)
+        tools.append(t)
+    return tools
 
 
 class Worker:
@@ -700,7 +760,7 @@ class Facade:
         elif method == "notifications/initialized":
             pass
         elif method == "tools/list":
-            self._cc_reply(mid, {"tools": _engine().TOOLS})
+            self._cc_reply(mid, {"tools": _annotated_tools()})
         elif method == "tools/call":
             self._handle_tool_call(frame)
         elif method == "notifications/cancelled":

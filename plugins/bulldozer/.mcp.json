@@ -1,7 +1,7 @@
 {
   "codex": {
     "command": "python3",
-    "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/codex_server.py"],
+    "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/codex_facade.py"],
     "env": {}
   }
 }

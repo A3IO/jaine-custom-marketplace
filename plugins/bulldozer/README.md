@@ -94,17 +94,25 @@ are warm (~1–2 s).
 
 ### Parallelism (facade multiplexer)
 
-`mcp/codex_facade.py` fronts a lazy pool of workers (each an unchanged single-turn
-bridge), so concurrent turns genuinely overlap — wall-clock = max, not sum. **Which
-bridge a session is on:** the server's injected MCP instructions carry a `FACADE:` line
-when the worker pool is live; without it you are on the legacy serial bridge (a second
-concurrent call is rejected with `codex turn already in flight`).
+`mcp/codex_facade.py` — **the default since 2026-07-18** (`.mcp.json` launches it) —
+fronts a lazy pool of workers (each an unchanged single-turn bridge), so concurrent
+turns genuinely overlap — wall-clock = max, not sum. **Which bridge a session is on:**
+the server's injected MCP instructions carry a `FACADE:` line when the worker pool is
+live; without it you are on the legacy serial bridge (an old plugin cache or the kill
+switch — a second concurrent call is rejected with `codex turn already in flight`).
 
-Fan-out recipe: one call per subagent (sonnet or stronger — weaker models fumble MCP
-tool calls), and for `codex_run` pass `approval_policy:'never'` with a read-only sandbox.
-Approval-capable turns and overlapping writable roots serialize BY DESIGN (`codex_review`
-is always parallel-class). Calls issued in ONE assistant message are dispatched serially
-by the client — subagents are the fan-out mechanism. Kill switch: `BULLDOZER_FACADE_OFF=1`
+Fan-out recipe: `codex_review`/`codex_info` carry the MCP `readOnlyHint` annotation, and
+a client honoring it (Claude Code ≥ 2.1.214 verified) dispatches several review calls
+from ONE assistant message in parallel — review fan-out needs no subagents. For
+`codex_run` (unhinted — it can mutate), same-message calls dispatch serially: fan out one
+call per subagent (sonnet or stronger — weaker models fumble MCP tool calls) and pass
+`approval_policy:'never'` with a read-only sandbox. Approval-capable turns and
+overlapping writable roots serialize BY DESIGN (`codex_review` is always
+parallel-class). A second, slower lane: clients that
+auto-background long MCP calls (Claude Code ≥ 2.1.212 backgrounds a call still running
+at ~120 s into a task) let the MAIN session stack long turns one per message — each
+holds the session ~120 s before backgrounding; a call finishing under ~120 s blocks its
+message; subagent calls are never auto-backgrounded. Kill switch: `BULLDOZER_FACADE_OFF=1`
 reverts to the legacy single bridge.
 
 ### Approvals
