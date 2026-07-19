@@ -399,6 +399,11 @@ _DEFAULT_MAX_WORKERS = 4
 _PARK_CAP_S_DEFAULT = 1800.0     # mirrors the engine's #277 default
 _PARK_CAP_MARGIN_S = 60.0        # the facade unpins only AFTER the engine did
 _PARK_PROBE_EVERY_S = 30.0       # liveness probe cadence for a parked worker
+_HEARTBEAT_EVERY_S = 15.0        # progress-heartbeat cadence per in-flight call
+# (CC >= 2.1.203 idle-aborts a stdio MCP tool call after 30 min with NO
+# response/progress frame — CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT, MILLISECONDS,
+# default 1800000 ms = 1800 s. 15 s guarantees >= 2 beats inside ANY idle
+# window of 30 s or longer.)
 _DESIGNATED = "designated"       # the funnel's home worker (approvals + info)
 _FACADE_PARALLEL_LINE = (
     "\n\nFACADE: turns run in PARALLEL on an internal worker pool (writable roots and "
@@ -879,6 +884,10 @@ class Facade:
                     self._sched.release(rid, self._place, self._reclassify)
                 synth = True
             elif rid in self._calls:
+                # CC removes its progress handler BEFORE sending the cancel —
+                # any further beat would hit an unknown token (review r1 P2;
+                # empirically a benign CC debug line, but never emit it).
+                self._calls[rid]["hb_dead"] = True
                 forward_to = self._calls[rid]["worker"]   # worker's #218 path
         if synth:
             # §3.1 P1: a QUEUED call must never execute later — answer CC with
@@ -1343,6 +1352,65 @@ class Facade:
         self._settle()
 
     # -- keep-one-warm reap (§3.1 worker lifecycle) ----------------------------
+    def heartbeat_inflight(self, now=None):
+        """Emit notifications/progress for every in-flight call (queued,
+        dispatched, or approve-resumed), using the call's OWN progressToken.
+
+        CC >= 2.1.203 idle-aborts a stdio MCP tool call after 30 min with NO
+        response/progress frame (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT, default
+        1800s) — live incident 2026-07-19: a 38.7-min xhigh codex_run was
+        aborted client-side at exactly 1800 s while the worker ran on to
+        TURN_OK, whose result was thrown away. Backgrounded calls and subagent
+        calls are NOT exempt (docs: per-call limits still apply). Empirically
+        verified: CC sends `_meta.progressToken` with every tools/call, and a
+        progress frame resets the idle timer (70 s silent tool + 30 s idle cap
+        died; the same tool emitting 10 s beats survived). A call whose
+        request carried no token gets no beats — nothing legal to send.
+
+        Frames are written OUTSIDE the facade lock (`_cc_send` has its own);
+        liveness is RE-CHECKED under the lock right before each send (review
+        r1 P2 — a call can complete between snapshot and write). The residual
+        check-to-write micro-race is accepted: an unknown-token progress is
+        empirically a benign CC debug line, never a call failure."""
+        now = time.monotonic() if now is None else now
+        beats = []
+        with self._lock:
+            for mid, entry in self._calls.items():
+                if entry.get("hb_dead"):
+                    continue   # cancelled — CC already dropped the handler
+                params = entry.get("frame", {}).get("params")
+                meta = params.get("_meta") if isinstance(params, dict) else None
+                token = meta.get("progressToken") if isinstance(meta, dict) \
+                    else None
+                if token is None:
+                    continue
+                if now - entry.get("hb_last", 0.0) >= _HEARTBEAT_EVERY_S:
+                    entry["hb_last"] = now
+                    entry["hb_n"] = entry.get("hb_n", 0) + 1
+                    beats.append((mid, token, entry["hb_n"]))
+        for mid, token, n in beats:
+            with self._lock:
+                e = self._calls.get(mid)
+                if e is None or e.get("hb_dead"):
+                    continue   # finished/cancelled between snapshot and send
+            self._cc_send({"jsonrpc": "2.0",
+                           "method": "notifications/progress",
+                           "params": {"progressToken": token, "progress": n}})
+
+    def housekeeping_tick(self):
+        """One housekeeping pass, EACH op independently guarded (review r1
+        P2): a raising neighbor (e.g. a malformed BULLDOZER_WORKER_IDLE_S
+        makes reap_idle raise every tick) must not starve the others —
+        heartbeat_inflight is the ONLY driver of the CC idle-timeout
+        keepalive, so starving it re-opens the 30-min abort this ships to
+        prevent."""
+        for op in (self.expire_parks, self.probe_parks, self.reap_idle,
+                   self.heartbeat_inflight):
+            try:
+                op()
+            except Exception:
+                pass   # housekeeping is best-effort; never kills the server
+
     def reap_idle(self, idle_s=None):
         """Reap idle workers, keeping the most-recently-used one warm. Busy,
         parked, designated and temp-cwd-owning workers are never victims.
@@ -1427,12 +1495,8 @@ def main():
     def _housekeeping():
         while True:
             time.sleep(5)
-            try:
-                facade.expire_parks()   # the mirrored park cap (§3.2 rule 1)
-                facade.probe_parks()    # the park-ended liveness signal
-                facade.reap_idle()
-            except Exception:
-                pass   # housekeeping is best-effort; never kills the server
+            facade.housekeeping_tick()   # park cap / liveness probe / reaping /
+            # CC stdio idle-timeout keepalive — each op individually guarded
 
     try:
         threading.Thread(target=_housekeeping, name="facade-housekeeping",

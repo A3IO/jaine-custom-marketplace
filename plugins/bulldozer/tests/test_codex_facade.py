@@ -674,6 +674,114 @@ class TestFacadePlumbing:
         for t in codex_server.TOOLS:
             assert "annotations" not in t
 
+    def test_heartbeat_progress_while_call_in_flight(self, facade):
+        """CC >= 2.1.203 idle-aborts a stdio MCP tool call after 30 min with no
+        response/progress frame (live: a 38.7-min xhigh turn was aborted at
+        exactly 1800 s and its TURN_OK thrown away). The facade must emit
+        notifications/progress with the request's own progressToken while the
+        call is in flight."""
+        f, cc = facade
+        frame = _call_frame(30, {"approval_policy": "never",
+                                 "_fake": {"sleep": 1.5, "result": {"ok": 1}}})
+        frame["params"]["_meta"] = {"progressToken": 7}
+        f.handle_cc_frame(frame)
+        f.heartbeat_inflight(now=1000.0)
+        f.heartbeat_inflight(
+            now=1000.0 + codex_facade._HEARTBEAT_EVERY_S + 1)
+        p1 = cc.wait_for_request("notifications/progress")
+        p2 = cc.wait_for_request("notifications/progress")
+        assert p1["params"]["progressToken"] == 7
+        assert p2["params"]["progressToken"] == 7
+        assert p2["params"]["progress"] > p1["params"]["progress"]
+        cc.wait_for_id(30, timeout=5)   # the held call still completes cleanly
+
+    def test_heartbeat_throttled_within_interval(self, facade):
+        f, cc = facade
+        frame = _call_frame(31, {"approval_policy": "never",
+                                 "_fake": {"sleep": 1.0, "result": {"ok": 1}}})
+        frame["params"]["_meta"] = {"progressToken": "t31"}
+        f.handle_cc_frame(frame)
+        f.heartbeat_inflight(now=2000.0)
+        f.heartbeat_inflight(now=2000.0 + 1.0)   # inside the interval
+        cc.wait_for_request("notifications/progress")
+        with pytest.raises(AssertionError):
+            cc.wait_for_request("notifications/progress", timeout=0.3)
+        cc.wait_for_id(31, timeout=5)
+
+    def test_no_heartbeat_without_token(self, facade):
+        f, cc = facade
+        f.handle_cc_frame(_call_frame(32, {"approval_policy": "never",
+                                           "_fake": {"sleep": 0.8,
+                                                     "result": {"ok": 1}}}))
+        f.heartbeat_inflight(now=3000.0)
+        with pytest.raises(AssertionError):
+            cc.wait_for_request("notifications/progress", timeout=0.3)
+        cc.wait_for_id(32, timeout=5)
+
+    def test_no_heartbeat_after_reply(self, facade):
+        f, cc = facade
+        frame = _call_frame(33, {"approval_policy": "never",
+                                 "_fake": {"result": {"ok": 1}}})
+        frame["params"]["_meta"] = {"progressToken": 9}
+        f.handle_cc_frame(frame)
+        cc.wait_for_id(33, timeout=5)
+        f.heartbeat_inflight(now=4000.0)
+        with pytest.raises(AssertionError):
+            cc.wait_for_request("notifications/progress", timeout=0.3)
+
+    def test_cancel_stops_heartbeat(self, facade):
+        """Review r1 P2: CC drops the progress handler BEFORE sending
+        notifications/cancelled — beats after cancel hit an unknown token
+        (empirically a benign CC debug line, but noise we must not emit)."""
+        f, cc = facade
+        frame = _call_frame(34, {"approval_policy": "never",
+                                 "_fake": {"sleep": 1.5, "result": {"ok": 1}}})
+        frame["params"]["_meta"] = {"progressToken": 11}
+        f.handle_cc_frame(frame)
+        # wait until dispatched (worker assigned) so cancel takes the
+        # forward-to-worker branch that KEEPS the _calls entry
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with f._lock:
+                e = f._calls.get(34)
+                if e is not None and e["worker"] is not None:
+                    break
+            time.sleep(0.02)
+        f.handle_cc_frame({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                           "params": {"requestId": 34}})
+        f.heartbeat_inflight(now=5000.0)
+        with pytest.raises(AssertionError):
+            cc.wait_for_request("notifications/progress", timeout=0.3)
+
+    def test_housekeeping_tick_isolates_heartbeat(self, facade, monkeypatch):
+        """Review r1 P2: a neighbor housekeeping op raising (e.g. malformed
+        BULLDOZER_WORKER_IDLE_S makes reap_idle raise every tick) must not
+        starve the heartbeat — the only driver of the idle keepalive."""
+        f, cc = facade
+
+        def boom(*a, **k):
+            raise RuntimeError("neighbor exploded")
+
+        monkeypatch.setattr(f, "reap_idle", boom)
+        monkeypatch.setattr(f, "expire_parks", boom)
+        frame = _call_frame(35, {"approval_policy": "never",
+                                 "_fake": {"sleep": 1.2, "result": {"ok": 1}}})
+        frame["params"]["_meta"] = {"progressToken": 12}
+        f.handle_cc_frame(frame)
+        f.housekeeping_tick()
+        p = cc.wait_for_request("notifications/progress")
+        assert p["params"]["progressToken"] == 12
+        cc.wait_for_id(35, timeout=5)
+
+    def test_housekeeping_calls_heartbeat(self):
+        """Drift guard: main()'s housekeeping thread must drive
+        housekeeping_tick, which must drive the heartbeat — an in-flight-only
+        mechanism nothing else calls."""
+        import inspect
+        assert "housekeeping_tick" in inspect.getsource(codex_facade.main)
+        assert "heartbeat_inflight" in inspect.getsource(
+            codex_facade.Facade.housekeeping_tick)
+
     def test_tool_call_roundtrip(self, facade):
         f, cc = facade
         f.handle_cc_frame(_call_frame(10, {"approval_policy": "never",

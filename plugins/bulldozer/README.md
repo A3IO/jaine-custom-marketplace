@@ -131,6 +131,12 @@ reverts to the legacy single bridge.
 
 - Tools absent in a session ⇒ the server did not connect: check `claude mcp list`,
   approve the server if pending. The server requires **Python 3.11+** (`tomllib`).
+- Long silent turns: Claude Code ≥ 2.1.203 aborts a stdio MCP call after 30 min
+  with no response/progress frame (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, ms, 0
+  disables; backgrounded calls are not exempt). The facade defeats this with a
+  15 s progress heartbeat per in-flight call — but the legacy bridge
+  (`BULLDOZER_FACADE_OFF=1`) has no heartbeat: there, turns silent longer than
+  the idle window are aborted client-side (the worker's result is lost).
 - Server CODE changes need a full client restart — stdio MCP servers are spawned at
   launch and do not hot-reload (`/reload-plugins` re-registers config only).
 - Audit log: `~/.claude/hooks/bulldozer-codex.log` (env override `BULLDOZER_CODEX_LOG`) —
