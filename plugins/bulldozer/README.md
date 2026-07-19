@@ -185,14 +185,30 @@ The canonical grammar (issue #322), produced by the shared writer `lib/bulldozer
 pairs. Timestamps are ISO-8601 with a colon offset. Values are sanitized (no newline, no
 ` | `), so every line stays greppable and `cut`-able.
 
-**Two producers are NOT on the shared writer yet** — a miner must handle their shapes or
-skip them explicitly (do not assume `event=` is present on every line):
+**Every ACTIVE producer emits the canonical grammar as of #334** — the codex
+`_drift_warn` writers, consult's `_log_completion`, and the consult SKILL.md inline
+flow (now a `lib/bulldozer_log.py` CLI-shim call) all route through the shared writer.
 
-| Producer | Shape it emits | Difference |
-|---|---|---|
-| `mcp/codex_server.py` (`_drift_warn`) | `{ts} | TURN_OK | model=… | effort=…` | event is **positional**, no `event=`, no `session=`, timestamp has no offset |
-| `consult_panel.py` (`_log_completion`) | `{ts} | session=… | round=1 | verdict=… | models=…` | no `event=` key (its `consult-invoke` lines DO use the helper) |
-| `consult/SKILL.md` (inline single-codex flow) | `{ts} | session=… | round=1 | verdict=… | model=…` | a bare `echo >>` from the skill itself — no `event=`, and **`model=` singular** where the panel writes `models=` plural |
+**Transition rules for MINERS** — history and not-yet-restarted MCP servers still
+contain legacy lines; the cutover is **per-producer**, not one date (check/look went
+canonical with #322, 2026-07-11; the facade's `FACADE_*` writer was born canonical
+with #344, plugin default 2026-07-18; the codex `TURN_*`/generic and consult
+completion writers stayed legacy until #334):
+
+- Detect **per line**: segment 2 starts with `event=` → canonical; otherwise it is a
+  positional legacy record. Never assume one shape per file — both coexist, and no
+  record was ever dual-written.
+- Event tokens are IDENTICAL in both shapes (`TURN_OK` positional ≡ `event=TURN_OK`) —
+  one grep finds both.
+- Legacy codex `WARNING` carried a bare unkeyed tail → maps to `msg=`.
+- Legacy codex GENERIC records (`VERSION_MISMATCH`, `TRANSLATE_FAILED`, `UNKNOWN_*`,
+  `OUT_OF_ENUM_LABEL`, `NOTIFICATION_FIXTURE_MISSING`, `INTERRUPT_DISABLED`) carried
+  their payload as an unkeyed third segment → maps to `detail=`.
+- Legacy codex lines have NO `session=` → assign a missing-session sentinel, never
+  invent an identity; their timestamps are NAIVE (no offset) → do not assign a
+  timezone.
+- Legacy consult completion lines have no `event=` (`session=` comes first). Inline vs
+  panel is discriminated by `model=` singular vs `models=` plural in BOTH shapes.
 
 ```
 2026-07-12T17:25:03+07:00 | event=round | session=3d3b6182 | round=4 | artifact=specs/design.md | verdict=NO-GO | findings=1 | fixed=3 | fp=0 | reviewer=codex/gpt-5.6-sol | depth=standard | duration_s=364 | project=/path
@@ -211,21 +227,36 @@ wiped on every update):
 | `bulldozer-drive.log` | drive lanes | lane lifecycle, cookie-seed audit, tripped circuit-breakers |
 | `require-workflow-skill.log` | the Workflow guardrail hook | routing decisions (`project=`, `session=`) |
 
-**Redaction is scoped to the look channel**, where it is implemented (`cdp.py`: URLs are
-reduced to origin+path with a `?<redacted>` marker; JS becomes `expr_len=`/`expr_sha=`).
-The other producers only strip newlines and ` | ` — so a codex `TURN_ERROR` message or a
-warning payload CAN still carry a full URL with its query string. Do not treat
-"no secrets in the logs" as a plugin-wide guarantee.
+**Redaction — honest scope (#334).** Three channels URL-redact, each with its own
+boundary; do NOT read this as "no secrets in the logs":
+
+- **look** (`cdp.py`): URLs reduced to origin+path with a `?<redacted>` marker; JS
+  becomes `expr_len=`/`expr_sha=` (unchanged D2 semantics).
+- **codex** (`_drift_warn`): every field value is URL-redacted before the durable
+  write — location URLs keep origin+path (`?<redacted>` marks a dropped
+  query/userinfo/fragment), payload schemes (`data:`, `javascript:`, `blob:`,
+  `view-source:`, `filesystem:`) hash-redact whole.
+- **facade**: redacts ONLY the payload fields `err`/`reason`/`detail`/`msg` — opaque
+  identifier fields (`call=`, `token=`, `tool=`, `worker=`) are intentionally
+  preserved verbatim (miners join on them), so a URL-shaped correlation id persists
+  as-is.
+
+Limits that stay true everywhere: **paths remain visible**; bare secrets outside
+URLs, emails, and MALFORMED URIs with literal whitespace (RFC 3986 mandates
+%-encoding) are NOT detected; on very long values the length cap may truncate the
+`?<redacted>` marker (the secret itself is removed BEFORE truncation); history is
+NOT rewritten.
 
 Mining code should key off `event=` where it exists, never off line position.
 
 View: `column -t -s'|' ~/.claude/hooks/bulldozer.log`
 Full grammar + rationale: `docs/superpowers/specs/2026-07-11-bulldozer-log-grammar-design.md`.
 
-> **Note (2026-07-12):** no log miner or HTML report exists in this repo yet. This section
-> is the contract to build one against — not a description of an existing consumer. Lines
-> written before 2026-07-11 predate the grammar (no `event=` key); `require-workflow-skill.log`
-> additionally has a YAML-era prefix. A miner must tolerate both, or start at the cutover.
+> **Note (2026-07-12, upd. #334):** no log miner or HTML report exists in this repo yet.
+> This section is the contract to build one against — not a description of an existing
+> consumer. Legacy shapes persist in history per the per-producer cutovers above;
+> `require-workflow-skill.log` additionally has a YAML-era prefix. A miner must tolerate
+> all of them, or start at its channel's cutover.
 
 ## How It Works
 

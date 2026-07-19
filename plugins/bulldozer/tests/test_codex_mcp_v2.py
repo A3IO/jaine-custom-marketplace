@@ -3067,7 +3067,7 @@ def test_bridge_approval_logs_accept_event(tmp_path, monkeypatch):
     bridge_approval("item/commandExecution/requestApproval", dict(_APPROVAL_PARAMS),
                     cc.write, cc.read)
     assert logf.exists(), "approval event was not logged"
-    lines = [l for l in logf.read_text().splitlines() if "| APPROVAL |" in l]
+    lines = [l for l in logf.read_text().splitlines() if "event=APPROVAL" in l]
     assert len(lines) == 1, lines
     f = _approval_log_fields(lines[0])
     assert f["method"] == "item/commandExecution/requestApproval"
@@ -3087,7 +3087,7 @@ def test_bridge_approval_logs_timeout_event(tmp_path, monkeypatch):
                                dict(_APPROVAL_PARAMS), cc.write, cc.read, timeout=0.05)
     assert decision == "decline"  # safe default on no-reply
     assert logf.exists(), "timed-out approval event was not logged"
-    lines = [l for l in logf.read_text().splitlines() if "| APPROVAL |" in l]
+    lines = [l for l in logf.read_text().splitlines() if "event=APPROVAL" in l]
     assert len(lines) == 1, lines
     f = _approval_log_fields(lines[0])
     assert f["timed_out"] == "true"
@@ -5370,7 +5370,7 @@ class TestTurnErrorAudit:
              "params": {"error": {"message": "Selected model is at capacity."}}}, ts)
         assert out is not None and "error" in out  # caller-facing result unchanged
         log = self._log_text()
-        assert "| TURN_ERROR |" in log
+        assert "event=TURN_ERROR" in log
         assert "model=gpt-5.6-luna" in log
         assert "effort=max" in log
         assert "retries=2" in log
@@ -5395,7 +5395,7 @@ class TestTurnErrorAudit:
              "params": {"turn": {"status": "failed", "error": "boom"}}}, ts)
         assert out is not None and "error" in out
         log = self._log_text()
-        assert "| TURN_ERROR |" in log and "model=gpt-5.5" in log and "boom" in log
+        assert "event=TURN_ERROR" in log and "model=gpt-5.5" in log and "boom" in log
 
     def test_turn_error_msg_is_sanitized_one_line(self, tmp_path, monkeypatch):
         import codex_server as cs
@@ -5416,7 +5416,7 @@ class TestTurnErrorAudit:
             {"method": "warning", "params": {"message": "model capacity degraded"}}, ts)
         assert out is None  # non-terminal: the turn continues
         log = self._log_text()
-        assert "| WARNING |" in log and "model capacity degraded" in log
+        assert "event=WARNING" in log and "model capacity degraded" in log
         assert not any(d.get("code") == "UNKNOWN_NOTIFICATION" for d in ts["acc"]), \
             "warning is an explicit signal, not protocol drift"
 
@@ -5426,7 +5426,7 @@ class TestTurnErrorAudit:
         ts = _mk_ts()
         out = cs._handle_child_frame({"method": "warning", "params": {"foo": 1}}, ts)
         assert out is None
-        assert "| WARNING |" in self._log_text()  # payload shape unknown -> still a line
+        assert "event=WARNING" in self._log_text()  # payload shape unknown -> still a line
 
     def test_turn_error_falls_back_to_effective_thread_meta(self, tmp_path, monkeypatch):
         # #321 review P2: model/effort omitted at top level (config-routed / resumed call)
@@ -5469,7 +5469,7 @@ class TestTurnErrorAudit:
         except StopIteration as e:
             assert isinstance(e.value, dict) and "error" in e.value
         log = self._log_text()
-        assert "| TURN_ERROR |" in log and "model at capacity" in log
+        assert "event=TURN_ERROR" in log and "model at capacity" in log
 
     def test_pre_ack_transient_and_warning_are_counted_and_logged(self, tmp_path, monkeypatch):
         # #321 review P2: a willRetry error BEFORE the start ACK must bump retries and a
@@ -5512,7 +5512,7 @@ class TestTurnErrorAudit:
             assert isinstance(e.value, dict) and "error" not in e.value
         assert ctx["ts"]["retries"] == 1, "pre-ACK willRetry must increment retries"
         log = self._log_text()
-        assert "| WARNING |" in log and "capacity degraded upstream" in log
+        assert "event=WARNING" in log and "capacity degraded upstream" in log
         assert "TURN_ERROR" not in log  # the turn completed — nothing terminal to audit
 
     def test_model_rerouted_updates_turn_error_attribution(self, tmp_path, monkeypatch):
@@ -5556,7 +5556,7 @@ class TestTurnErrorAudit:
         except StopIteration as e:
             assert isinstance(e.value, dict) and "error" in e.value
         log = self._log_text()
-        assert "| TURN_ERROR |" in log and "exited mid-turn" in log
+        assert "event=TURN_ERROR" in log and "exited mid-turn" in log
 
     def test_pre_ack_reroute_updates_attribution(self, tmp_path, monkeypatch):
         # #321 review r3: model/rerouted arriving BEFORE the start ACK (the common capacity-
@@ -5610,7 +5610,7 @@ class TestTurnErrorAudit:
         sm.turn_started(None)
         cs._teardown_park(backend, sm, "child-death")
         log = self._log_text()
-        assert "| TURN_ERROR |" in log and "child-death" in log and "model=gpt-5.6-sol" in log
+        assert "event=TURN_ERROR" in log and "child-death" in log and "model=gpt-5.6-sol" in log
 
     def test_teardown_park_child_terminal_not_double_logged(self, tmp_path, monkeypatch):
         # child-terminal teardown: an error frame was ALREADY audited by _handle_child_frame —
@@ -5651,7 +5651,7 @@ class TestTurnErrorAudit:
             assert isinstance(e.value, dict) and "error" in e.value
             assert "during park" in e.value["error"]
         log = self._log_text()
-        assert "| TURN_ERROR |" in log and "during park" in log
+        assert "event=TURN_ERROR" in log and "during park" in log
 
     def test_pump_exception_writes_turn_error_line(self, tmp_path, monkeypatch):
         # #321 review r2: the catch-all exception exit is terminal too.
@@ -5674,7 +5674,7 @@ class TestTurnErrorAudit:
         except StopIteration as e:
             assert isinstance(e.value, dict) and "error" in e.value
         log = self._log_text()
-        assert "| TURN_ERROR |" in log and "transport blew up" in log
+        assert "event=TURN_ERROR" in log and "transport blew up" in log
 
 
 # ---------------------------------------------------------------------------
@@ -7818,7 +7818,7 @@ class TestTurnObservability:
             {"method": "turn/completed", "params": {"turn": {"status": "completed"}}}, ts)
         assert out is not None and "error" not in out
         log = self._log_text()
-        assert "| TURN_OK |" in log
+        assert "event=TURN_OK" in log
         assert "model=gpt-5.6-sol" in log and "effort=high" in log
         assert "mcp=isolated" in log and "retries=1" in log
         assert "tokens=1234" in log
@@ -7833,7 +7833,7 @@ class TestTurnObservability:
             {"method": "turn/completed",
              "params": {"turn": {"status": "failed", "error": "boom"}}}, ts)
         log = self._log_text()
-        assert "TURN_OK" not in log and "| TURN_ERROR |" in log
+        assert "TURN_OK" not in log and "event=TURN_ERROR" in log
 
     def test_interrupted_turn_writes_interrupt_line(self, tmp_path, monkeypatch):
         import codex_server as cs
@@ -7842,7 +7842,7 @@ class TestTurnObservability:
         res = cs._build_interrupted_result(ts, interrupted_by="timeout", thread_warm=False)
         assert res["status"] == "interrupted"
         log = self._log_text()
-        assert "| INTERRUPT |" in log
+        assert "event=INTERRUPT" in log
         assert "interrupted_by=timeout" in log and "thread_warm=false" in log
         assert "model=gpt-5.6-terra" in log
         assert "TURN_ERROR" not in log  # an interrupt is graceful, not a failure
@@ -7856,7 +7856,7 @@ class TestTurnObservability:
             {"itemId": "i1", "command": "rm -rf /tmp/x"}, ts, None, "tok-secret-12345")
         assert payload["status"] == "awaiting_approval"
         log = self._log_text()
-        assert "| PARK |" in log
+        assert "event=PARK" in log
         assert "kind=" in log
         assert "tok-secret-12345" not in log  # token never logged verbatim
         # suffix slice: 'park-<hex>' tokens keep entropy (a prefix slice would log
@@ -7876,7 +7876,7 @@ class TestTurnObservability:
         out = cs.codex_info_v2({"query": "models"}, manager=FM())
         assert "error" in out
         log = self._log_text()
-        assert "| INFO_ERROR |" in log
+        assert "event=INFO_ERROR" in log
         assert "query=models" in log and "spawn exploded" in log
 
     def test_setup_timing_attached_to_result_meta(self):
@@ -8771,3 +8771,184 @@ def test_non_numeric_lane_env_falls_back_clean(monkeypatch):
     for bad in ("lane1", "1-2", "1\n2", "один"):
         monkeypatch.setenv("BULLDOZER_LANE", bad)
         assert cs._initialize_result({})["instructions"] == cs.SERVER_INSTRUCTIONS, bad
+
+
+# ---------------------------------------------------------------------------
+# #334: canonical audit-line grammar — every _drift_warn write goes through
+# lib/bulldozer_log.py ({ts+offset} | event=CODE | session=S | k=v… [| worker=N])
+# with URL redaction at the choke point (fields AND detail, type-unconditional).
+# ---------------------------------------------------------------------------
+
+class TestCanonicalAuditLines:
+    CANON_LINE_SRC = (
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}"
+        r" \| event=[A-Za-z0-9_-]+ \| session=[A-Za-z0-9_-]{1,8}"
+        r"( \| [A-Za-z0-9_-]+=[^|]*)*$")
+
+    def _last_line(self, tmp_path, monkeypatch, fire):
+        log = tmp_path / "codex.log"
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(log))
+        fire()
+        return log.read_text().splitlines()[-1]
+
+    def _assert_canon(self, line):
+        import re
+        assert re.match(self.CANON_LINE_SRC, line), line
+
+    def test_turn_ok_is_canonical(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        line = self._last_line(tmp_path, monkeypatch, lambda: cs._turn_ok_log(
+            {"model_val": "m1", "effort_val": "high", "mcp_mode": "isolated",
+             "retries": 0, "setup_ms": 5, "cold_spawn": False},
+            {"timing": {"duration_ms": 12}, "usage": {"total_tokens": 99}}))
+        self._assert_canon(line)
+        assert "event=TURN_OK" in line and "| model=m1 |" in line
+        assert line.split(" | ")[1] == "event=TURN_OK"   # position pinned
+
+    def test_turn_error_msg_is_url_redacted(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        line = self._last_line(tmp_path, monkeypatch, lambda: cs._turn_error_log(
+            {"model_val": "m1"}, "boom https://u:p@x.test/api?token=SECRET"))
+        assert "SECRET" not in line and "u:p" not in line
+        assert "?<redacted>" in line and "event=TURN_ERROR" in line
+        self._assert_canon(line)
+
+    def test_interrupt_is_canonical(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        line = self._last_line(tmp_path, monkeypatch, lambda: cs._interrupt_log(
+            {"model_val": "m1", "mcp_mode": "isolated"}, "esc", True))
+        self._assert_canon(line)
+        assert "event=INTERRUPT" in line and "interrupted_by=esc" in line
+        assert "thread_warm=true" in line
+
+    def test_approval_variants_are_canonical(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        log = tmp_path / "codex.log"
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(log))
+        cs._log_approval_event("m1", "accept", 12, False)
+        cs._log_approval_event("m2", "accept", 0, False, unattended=True, rule="fast_accept")
+        cs._log_approval_event("m3", "accept", 5, False, ui="dialog")
+        lines = log.read_text().splitlines()
+        assert len(lines) == 3
+        for ln in lines:
+            self._assert_canon(ln)
+            assert "event=APPROVAL" in ln
+        assert "unattended=true" in lines[1] and "rule=fast_accept" in lines[1]
+        assert "unattended" not in lines[0] and "ui=" not in lines[0]
+        assert "ui=dialog" in lines[2]
+
+    def test_warning_shapes_land_as_msg(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        log = tmp_path / "codex.log"
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(log))
+        cs._warning_log({"message": "top-level"})
+        cs._warning_log({"warning": {"message": "nested"}})
+        cs._warning_log({"foo": 1})
+        lines = log.read_text().splitlines()
+        assert len(lines) == 3
+        for ln in lines:
+            self._assert_canon(ln)
+            assert "event=WARNING" in ln and "msg=" in ln
+        assert "msg=top-level" in lines[0] and "msg=nested" in lines[1]
+
+    def test_info_error_is_canonical(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        line = self._last_line(tmp_path, monkeypatch,
+                               lambda: cs._info_error_log("models", "spawn failed"))
+        self._assert_canon(line)
+        assert "event=INFO_ERROR" in line and "query=models" in line
+
+    def test_park_via_real_producer_is_canonical(self, tmp_path, monkeypatch):
+        # R1-F5: fire the REAL producer — a parity _drift_warn call would keep
+        # passing if build_awaiting_payload still emitted the positional blob.
+        import codex_server as cs
+        log = tmp_path / "codex.log"
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(log))
+        cs.build_awaiting_payload(
+            "item/commandExecution/requestApproval", {}, {}, "", "tok-abcdefgh")
+        line = log.read_text().splitlines()[-1]
+        self._assert_canon(line)
+        assert "event=PARK" in line and "kind=" in line and "method=" in line
+        assert "token8=abcdefgh" in line          # LAST 8 chars only
+        assert "tok-abcdefgh" not in line         # never the full token
+
+    def test_generic_drift_keeps_original_detail_in_acc(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        acc = []
+        raw = "label https://x.test/?t=SECRET"
+        self._last_line(tmp_path, monkeypatch,
+                        lambda: cs._drift_warn(acc, "OUT_OF_ENUM_LABEL", raw))
+        assert acc == [{"code": "OUT_OF_ENUM_LABEL", "detail": raw}]  # UNredacted
+
+    def test_generic_drift_detail_is_url_redacted(self, tmp_path, monkeypatch):
+        # R1-F4: the DURABLE copy of a generic detail= must redact — TRANSLATE_FAILED /
+        # UNKNOWN_* details carry exception text that can embed authenticated URLs.
+        import codex_server as cs
+        line = self._last_line(tmp_path, monkeypatch, lambda: cs._drift_warn(
+            None, "TRANSLATE_FAILED", "openai: HTTPError: https://u:p@api.test/v1?key=SECRET"))
+        assert "SECRET" not in line and "u:p" not in line
+        assert "?<redacted>" in line and "detail=" in line
+
+    def test_worker_field_is_last(self, tmp_path, monkeypatch):
+        import codex_server as cs
+        monkeypatch.setenv("BULLDOZER_WORKER", "3")
+        line = self._last_line(tmp_path, monkeypatch,
+                               lambda: cs._drift_warn(None, "TURN_OK", model="m"))
+        assert line.endswith(" | worker=3")
+
+    def test_nonstring_wire_value_cannot_smuggle_url(self, tmp_path, monkeypatch):
+        # R7-F1: a wire-derived dict/list must not bypass redaction via a type
+        # gate — append_line stringifies AFTER the redaction decision.
+        import codex_server as cs
+        line = self._last_line(tmp_path, monkeypatch, lambda: cs._drift_warn(
+            None, "TURN_OK", tokens={"url": "https://u:p@x.test/api?token=SECRET"}))
+        assert "SECRET" not in line and "u:p" not in line
+
+    def test_helper_unavailable_warns_once_and_drops(self, tmp_path, monkeypatch, capsys):
+        # R5-F1: the hard warn-once-and-drop contract when the import failed —
+        # exactly ONE stderr warning, NO durable line, acc contract untouched,
+        # no exception.
+        import codex_server as cs
+        log = tmp_path / "codex.log"
+        monkeypatch.setenv("BULLDOZER_CODEX_LOG", str(log))
+        monkeypatch.setattr(cs, "_bl_append", None)
+        monkeypatch.setattr(cs, "_HELPER_WARNED", False)
+        acc = []
+        cs._drift_warn(acc, "OUT_OF_ENUM_LABEL", "d1")
+        cs._drift_warn(None, "TURN_ERROR", "d2")
+        assert not log.exists()                                   # dropped, no legacy fallback
+        assert acc == [{"code": "OUT_OF_ENUM_LABEL", "detail": "d1"}]  # acc still fed
+        assert capsys.readouterr().err.count("audit disabled") == 1   # once, not per call
+
+    def test_long_value_single_truncation_after_redaction(self, tmp_path, monkeypatch):
+        # R3-F1: ONE truncation point (the helper's), AFTER redaction. With the
+        # URL early and a long tail, the redacted head + marker fit the cap and
+        # MUST survive; the secret must be gone; no writer-side double-slice.
+        import codex_server as cs
+        long_msg = "boom https://u:p@x.test/api?token=SECRET " + ("x" * 600)
+        line = self._last_line(tmp_path, monkeypatch,
+                               lambda: cs._turn_error_log({"model_val": "m1"}, long_msg))
+        assert "SECRET" not in line and "u:p" not in line
+        assert "?<redacted>" in line          # marker inside the cap survives
+        assert "…" in line                    # helper (not the writer) truncated
+
+    def test_no_raw_preslice_at_drift_warn_call_sites(self):
+        # R3-F1 r4: no _drift_warn call may pre-slice its raw text — the ONE
+        # truncation point is the helper's _value cap, AFTER redaction.
+        # Balanced-paren extraction of each call's args (a fixed window would
+        # bleed into neighboring code and false-positive on legit [:N] slices).
+        import inspect
+        import re as _re
+        import codex_server as cs
+        src = inspect.getsource(cs)
+        for m in _re.finditer(r"_drift_warn\(", src):
+            depth, i = 1, m.end()
+            while depth and i < len(src):
+                if src[i] == "(":
+                    depth += 1
+                elif src[i] == ")":
+                    depth -= 1
+                i += 1
+            args = src[m.end():i]
+            assert not _re.search(r"\[:\d+\]", args), (
+                "raw [:N] pre-slice inside a _drift_warn call near offset %d" % m.start())

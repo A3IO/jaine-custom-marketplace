@@ -282,21 +282,23 @@ Two kinds of line land in `~/.claude/hooks/bulldozer-consult.log`, told apart by
 
 **2. Completion line** — one line per COMPLETED invocation, when the outcome is known. The panel path (`--panel` / per-model `--codex`/`--grok`/`--agy` / `--web`) writes it **deterministically** from `consult_panel.py::_log_completion`; the inline single-codex flow writes it from Step 6 below. Two shapes, both metadata-only:
 
-**Inline single-codex** — `model=` (one model), written by Step 6. Strict 8 fields, this order:
+**Inline single-codex** — `model=` (one model), written by Step 6 via the shared CLI shim (#334 — `event=`/`session=` prepended by the writer). Strict field order:
 
 ```
-<ISO8601-ts> | session=<S> | round=<N> | verdict=<V> | tokens=<T> | time=<X>s | model=<M> | project=<P>
-2026-05-25T03:15:00+03:00 | session=f7186873 | round=1 | verdict=GO | tokens=NA | time=4.3s | model=gpt-5.6-sol | project=/path/to/repo
+<ISO8601-ts> | event=consult-complete | session=<S> | round=<N> | verdict=<V> | tokens=<T> | time=<X>s | model=<M> | project=<P>
+2026-07-20T03:15:00+07:00 | event=consult-complete | session=f7186873 | round=1 | verdict=GO | tokens=NA | time=4.3s | model=gpt-5.6-sol | project=/path/to/repo
 ```
 
 (`tokens=` is honestly **NA today** — no extraction mechanism exists since the codex banner-parsing hack was dropped; matching the panel path. `verdict=` may also be `TIMEOUT`/`ERROR` from the Step 4 failure branches, #322 A6.)
 
-**Panel / per-model / `--web`** — `models=` (comma list) + `web=`, written by the script:
+**Panel / per-model / `--web`** — `models=` (comma list) + `web=`, written by the script via the shared writer (#334):
 
 ```
-<ISO8601-ts> | session=<S> | round=1 | verdict=<V> | tokens=NA | time=<X>s | models=<m,…> | web=<m,…> | survivors=<N/M> | failures=<Display:class,…> | legtimes=<Display:sec,…> | agy_model=<id> | codex_effort=<e> | project=<P>
-2026-07-11T12:10:00+07:00 | session=6b48be89 | round=1 | verdict=find-holes | tokens=NA | time=54.8s | models=codex,grok,agy | web= | survivors=2/3 | failures=Grok:timeout | legtimes=GPT:31.2,Grok:180.0,Gemini:44.9 | agy_model=Gemini_3.1_Pro_(High) | codex_effort=medium | project=/path/to/repo
+<ISO8601-ts> | event=consult-complete | session=<S> | round=1 | verdict=<V> | tokens=NA | time=<X>s | models=<m,…> | web=<m,…> | survivors=<N/M> | failures=<Display:class,…> | legtimes=<Display:sec,…> | agy_model=<id> | codex_effort=<e> | project=<P>
+2026-07-20T12:10:00+07:00 | event=consult-complete | session=6b48be89 | round=1 | verdict=find-holes | tokens=NA | time=54.8s | models=codex,grok,agy | web= | survivors=2/3 | failures=Grok:timeout | legtimes=GPT:31.2,Grok:180.0,Gemini:44.9 | agy_model=Gemini_3.1_Pro_(High) | codex_effort=medium | project=/path/to/repo
 ```
+
+**Miner note (#334 transition):** history and un-restarted sessions still contain the pre-#334 completion shape — same fields, NO `event=` key (`session=` first). Detect per-line: segment 2 `event=` → canonical, else legacy. Inline vs panel is discriminated by `model=` singular vs `models=` plural in BOTH shapes.
 
 | Field | Value — and the ONLY accepted "no data" form |
 |-------|---------|
@@ -352,6 +354,13 @@ These are not oversights — they are validated design choices:
 # 3. Wrap prompt
 WRAPPED_PROMPT=$(printf 'SKIP SKILLS. Do not inspect files or run tools. Text-only consultation.\n---\n%s\n---\nSKIP SKILLS. Give a decisive verdict. Under 200 words. End with one sentence stating the basis or limits of this advice, then exactly one final standalone line — one of:\nVERDICT: GO\nVERDICT: NO-GO\nVERDICT: MINOR-FIXES\n' "$USER_PROMPT")
 
+# 3b. Resolve the shared log writer ONCE (#334; #221: $CLAUDE_PLUGIN_ROOT is NOT
+#     in the Bash env — honor it when set, else newest installed cache)
+BLOG=""
+for d in ${CLAUDE_PLUGIN_ROOT:+"$CLAUDE_PLUGIN_ROOT"} $(ls -dt ~/.claude/plugins/cache/*/bulldozer/*/ 2>/dev/null); do
+  [ -f "$d/lib/bulldozer_log.py" ] && BLOG="$d/lib/bulldozer_log.py" && break
+done
+
 # 4. Isolated invocation
 TMPDIR_RUN="/tmp/bulldozer-consult-$$"
 mkdir -p "$TMPDIR_RUN"
@@ -376,11 +385,15 @@ ELAPSED=$(python3 -c "import time; print(f'{time.time() - $START:.1f}')")   # te
 # misclassified by the verdict parser — log it and stop.
 if [ "$EXIT" -ne 0 ]; then
     [ "$EXIT" -eq 124 ] && VERDICT=TIMEOUT || VERDICT=ERROR
-    # token-normalize BEFORE slicing — an adversarial env value must not split the
-    # pipe grammar (same rule as the panel path, #326 r4)
-    S=$(printf '%s' "${CLAUDE_CODE_SESSION_ID:-}" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_' | cut -c1-8)
-    S="${S:-NA}"
-    echo "$(date -Iseconds) | session=$S | round=$ROUND | verdict=$VERDICT | tokens=NA | time=${ELAPSED}s | model=$MODEL | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)" >> ~/.claude/hooks/bulldozer-consult.log
+    # #334: canonical line via the shared CLI shim (it derives session= from
+    # CLAUDE_CODE_SESSION_ID itself); resolver failure WARNS, never a silent drop
+    if [ -n "$BLOG" ]; then
+        python3 "$BLOG" "${BULLDOZER_CONSULT_LOG:-$HOME/.claude/hooks/bulldozer-consult.log}" consult-complete \
+          "round=$ROUND" "verdict=$VERDICT" "tokens=NA" "time=${ELAPSED}s" "model=$MODEL" \
+          "project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || true
+    else
+        echo "warning: bulldozer_log.py not found — consult completion line NOT logged" >&2
+    fi
     tail -20 "$TMPDIR_RUN/verdict.err"   # report the failure to the user; do NOT silently retry
     rm -rf "$TMPDIR_RUN"; exit "$EXIT"
 fi
@@ -403,11 +416,16 @@ print(classify_verdict(open(sys.argv[1]).read()))
 PY
 )
 
-# 6. Log metadata, cleanup
-S=$(printf '%s' "${CLAUDE_CODE_SESSION_ID:-}" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_' | cut -c1-8)
-S="${S:-NA}"   # session id (token-normalized), never the project name (#107 schema)
+# 6. Log metadata, cleanup (#334: canonical line via the shared CLI shim — it
+#    derives session= from CLAUDE_CODE_SESSION_ID itself; resolver failure WARNS)
 T="${TOKENS:-NA}"; [ "$T" = "0" ] && T="NA"        # 0 is the no-data stub the schema forbids, not a count (#107)
-echo "$(date -Iseconds) | session=$S | round=$ROUND | verdict=$VERDICT | tokens=$T | time=${ELAPSED}s | model=$MODEL | project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)" >> ~/.claude/hooks/bulldozer-consult.log
+if [ -n "$BLOG" ]; then
+    python3 "$BLOG" "${BULLDOZER_CONSULT_LOG:-$HOME/.claude/hooks/bulldozer-consult.log}" consult-complete \
+      "round=$ROUND" "verdict=$VERDICT" "tokens=$T" "time=${ELAPSED}s" "model=$MODEL" \
+      "project=$(git rev-parse --show-toplevel 2>/dev/null || pwd)" || true
+else
+    echo "warning: bulldozer_log.py not found — consult completion line NOT logged" >&2
+fi
 rm -rf "$TMPDIR_RUN"
 ```
 

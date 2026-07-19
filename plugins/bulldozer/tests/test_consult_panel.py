@@ -1166,6 +1166,29 @@ def test_logging_never_raises_when_log_unwritable(tmp_path, monkeypatch):
     assert out and ok, "logging failure must not break the panel"
 
 
+def test_completion_line_is_canonical(tmp_path):
+    # #334: the completion line carries event=consult-complete right after the
+    # offset timestamp, then session= — the shared-writer grammar.
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert re.match(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}"
+        r" \| event=consult-complete \| session=[A-Za-z0-9_-]{1,8} \| round=1 \|", line), line
+
+
+def test_completion_helper_unavailable_warns_once_and_drops(monkeypatch, capsys):
+    # #334 R5-F1-parity for the panel: import failed → warn once at write
+    # attempt, drop the line, never raise, panel outcome unchanged.
+    monkeypatch.setattr(panel, "_bl_append", None, raising=False)
+    monkeypatch.setattr(panel, "_LOG_WARNED", False)
+    out, ok = panel.run_panel("Q", runner=_make_fake_runner([]))
+    assert out and ok
+    assert not panel.CONSULT_LOG.exists(), "no line may be written without the helper"
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    err = capsys.readouterr().err
+    assert err.count("could not write consult log") == 1  # once per process, not per run
+
+
 def test_consult_hook_is_lean_marker():
     """The UserPromptSubmit consult invoke-line is a lean start-marker — no always-empty
     verdict=/tokens=/model= fields (the substantive completion line is written by
@@ -2173,12 +2196,19 @@ def test_main_repo_validation_error_still_logs_error_line(tmp_path):
     assert "verdict=ERROR" in line, line
 
 
-def test_log_write_failure_warns_on_stderr(monkeypatch, capsys):
-    monkeypatch.setattr(panel, "_LOG_WARNED", False, raising=False)  # once-per-process flag
+def test_log_write_failure_warns_on_stderr_exactly_once(monkeypatch, capsys):
+    # codex_review r2 P3: write-failure warning ownership = the HELPER
+    # (bulldozer_log._warn_once). The panel must NOT add a second warning for
+    # the same failure — one failure, ONE stderr line.
+    import bulldozer_log
+    monkeypatch.setattr(bulldozer_log, "_WARNED", False)
+    monkeypatch.setattr(panel, "_LOG_WARNED", False, raising=False)
     monkeypatch.setattr(panel, "CONSULT_LOG",
                         panel.Path("/nonexistent-root/x/consult.log"), raising=False)
     panel.run_panel("Q", runner=_make_fake_runner([]))  # must not raise
-    assert "could not write consult log" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "could not write consult.log" in err       # the helper's message
+    assert err.count("could not write") == 1, err     # and ONLY the helper's
 
 
 def test_session_field_normalized(monkeypatch):
@@ -2207,12 +2237,16 @@ def test_log_write_failure_with_broken_stderr_never_raises(monkeypatch):
 
 
 def test_log_write_warning_fires_once_per_process(monkeypatch, capsys):
+    # #334: write-failure warning ownership moved to the HELPER (its _warn_once)
+    # — still exactly once per process across repeated failing runs.
+    import bulldozer_log
+    monkeypatch.setattr(bulldozer_log, "_WARNED", False)
     monkeypatch.setattr(panel, "CONSULT_LOG",
                         panel.Path("/nonexistent-root/x/consult.log"), raising=False)
     monkeypatch.setattr(panel, "_LOG_WARNED", False, raising=False)
     panel.run_panel("Q", runner=_make_fake_runner([]))
     panel.run_panel("Q", runner=_make_fake_runner([]))
-    assert capsys.readouterr().err.count("could not write consult log") == 1
+    assert capsys.readouterr().err.count("could not write") == 1
 
 
 def test_pre_run_error_record_keeps_full_schema(tmp_path):

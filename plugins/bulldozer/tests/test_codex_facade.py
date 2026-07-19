@@ -1205,7 +1205,10 @@ class TestEngineWorkerField:
         codex_server._drift_warn(None, "TEST_MARK", "detail=x")
         line = log.read_text().strip()
         assert "worker=" not in line
-        assert line.endswith("| TEST_MARK | detail=x")   # byte-identical legacy
+        # #334: canonical grammar — the detail value lands under a detail= key;
+        # unset BULLDOZER_WORKER still means NO worker field on the line.
+        assert "event=TEST_MARK" in line
+        assert line.endswith("| detail=detail=x")
 
 
 # ---------------------------------------------------------------------------
@@ -2491,3 +2494,55 @@ class TestReviewR9:
             assert spawns["n"] <= 10      # linear-ish, not quadratic (was ~15+)
         finally:
             f.shutdown(timeout=3)
+
+
+# ---------------------------------------------------------------------------
+# #334: facade payload-field URL redaction — key-gated (_REDACT_KEYS), but
+# TYPE-unconditional under those keys; correlation ids stay verbatim.
+# ---------------------------------------------------------------------------
+
+class TestFacadeLogRedaction:
+    def _facade_with_log(self, tmp_path):
+        cc = CCSide()
+        log = tmp_path / "facade.log"
+        f = codex_facade.Facade(cc_write=cc.write,
+                                worker_argv=[sys.executable, FAKE_WORKER],
+                                max_workers=2, log_path=str(log))
+        return f, log
+
+    @pytest.mark.parametrize("key", ["err", "reason", "detail", "msg"])
+    def test_payload_keys_are_url_redacted(self, tmp_path, key):
+        # R4-F1: EVERY payload key redacts — dropping any single key from
+        # _REDACT_KEYS must fail exactly that key's case.
+        f, log = self._facade_with_log(tmp_path)
+        try:
+            f._log("FACADE_ERROR", **{key: "X https://u:p@x.test/?t=SECRET"})
+            f.flush_log()
+        finally:
+            f.shutdown(timeout=3)
+        text = log.read_text()
+        assert "SECRET" not in text and "u:p" not in text
+        assert "?<redacted>" in text
+
+    def test_correlation_id_preserved_verbatim(self, tmp_path):
+        # R1-F2: call=/token=/tool=/worker= are opaque ids a miner joins on —
+        # even a URL-shaped call id must stay byte-identical.
+        f, log = self._facade_with_log(tmp_path)
+        try:
+            f._log("FACADE_DONE", call="https://weird.test/id?x=1", tool="codex_run")
+            f.flush_log()
+        finally:
+            f.shutdown(timeout=3)
+        assert "call=https://weird.test/id?x=1" in log.read_text()
+
+    def test_nonstring_payload_under_redacted_key(self, tmp_path):
+        # R7-F1: type-unconditional under payload keys — a dict cannot smuggle
+        # a URL past an isinstance(str) gate (append_line stringifies later).
+        f, log = self._facade_with_log(tmp_path)
+        try:
+            f._log("FACADE_ERROR", err={"u": "https://u:p@x.test/?t=SECRET"})
+            f.flush_log()
+        finally:
+            f.shutdown(timeout=3)
+        text = log.read_text()
+        assert "SECRET" not in text and "u:p" not in text

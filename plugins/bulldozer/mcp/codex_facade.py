@@ -434,6 +434,12 @@ def _park_cap_s(env_value=None) -> float:
     return max(1.0, min(v, 86400.0))
 
 
+# #334: payload-bearing audit fields — the ONLY keys the log writer URL-redacts.
+# call=/token=/tool=/worker= are opaque correlation ids a miner joins on;
+# rewriting one would break call-chain joins (R1-F2).
+_REDACT_KEYS = frozenset({"err", "reason", "detail", "msg"})
+
+
 def _facade_log_path():
     return (os.environ.get("BULLDOZER_CODEX_LOG")
             or os.path.expanduser("~/.claude/hooks/bulldozer-codex.log"))
@@ -645,7 +651,11 @@ class Facade:
         """Audit lines are QUEUED, never written inline (review r7 P2):
         bulldozer_log does blocking file I/O under a shared lock, and _log is
         called while the facade lock is held — a wedged log file would otherwise
-        block every worker reader and freeze the whole multiplexer."""
+        block every worker reader and freeze the whole multiplexer.
+
+        #334: values under _REDACT_KEYS are URL-redacted in the writer thread —
+        any FUTURE call site adding a free-text field must use one of those key
+        names, or its URLs persist verbatim."""
         if self._log_thread is None:
             return
         try:
@@ -666,6 +676,13 @@ class Facade:
                     self._report_drops()
                     kv.set()          # a flush barrier: the queue is drained AND
                     continue          # every line before it is already on disk
+                # #334: key-gated, TYPE-unconditional redaction (R1-F2 + R7-F1) —
+                # payload fields redact whatever their type (the redactor
+                # str()-coerces; append_line would stringify AFTER the decision),
+                # while call=/token=/tool=/worker= correlation ids stay verbatim.
+                kv = {k: (bulldozer_log.redact_urls_in_text(v)
+                          if k in _REDACT_KEYS else v)
+                      for k, v in kv.items()}
                 bulldozer_log.append_line(self._log_path, event, **kv)
                 self._report_drops()
             except Exception:

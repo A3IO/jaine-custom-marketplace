@@ -827,28 +827,38 @@ class TestReadmeLogFormat:
         assert "lib/bulldozer_log.py" in section
         assert "2026-07-11-bulldozer-log-grammar-design.md" in section
 
-    def test_non_canonical_producers_are_named(self):
-        """codex #186 r1 (P2): two writers are NOT on the shared helper — verified against
-        the live logs: codex emits `ts | TURN_OK | k=v` (positional event, no session=, no
-        offset) and consult_panel's completion line has no event=. A miner told 'every line
-        uses the grammar' would silently DISCARD current records, not just old history."""
+    def test_all_producers_canonical_and_transition_documented(self):
+        """#334 INVERTED the #186 contract: every ACTIVE producer now emits the canonical
+        grammar, and the README must carry the miner TRANSITION rules instead of the old
+        divergence table — history and un-restarted servers still hold legacy lines."""
         section = self._readme().split("## Log Format", 1)[1].split("\n## ", 1)[0]
-        assert "NOT on the shared writer" in section, \
-            "README still implies every line goes through lib/bulldozer_log.py"
-        assert "codex_server.py" in section, "README hides the codex log's positional-event shape"
-        assert "consult_panel.py" in section, "README hides consult's un-migrated completion line"
-        # codex #186 r2 (P2): a THIRD producer — consult/SKILL.md echoes completion lines
-        # itself, with `model=` SINGULAR where the panel writes `models=` plural. A miner
-        # supporting only the panel shape would drop every inline single-codex consult.
-        assert "consult/SKILL.md" in section, "README hides the inline consult writer"
-        assert "singular" in section, "README must warn about model= vs models="
+        assert "NOT on the shared writer" not in section, \
+            "README still carries the pre-#334 divergence table"
+        assert "canonical grammar as of #334" in section
+        # per-line detection + per-producer cutover, not one date
+        assert "per line" in section and "per-producer" in section
+        # legacy mapping rules a miner needs:
+        assert "maps to `msg=`" in section, "legacy WARNING bare-tail rule missing"
+        assert "maps to `detail=`" in section, "legacy generic positional rule missing"
+        assert "missing-session sentinel" in section, "no-invented-identity rule missing"
+        assert "do not assign a\n  timezone" in section or "do not assign a timezone" in section, \
+            "naive-timestamp rule missing"
+        # inline vs panel discrimination survives both shapes
+        assert "singular" in section and "plural" in section
 
-    def test_redaction_claim_is_scoped_to_where_it_exists(self):
-        """codex #186 r1 (P2): URL/JS redaction lives in cdp.py ONLY. Claiming it plugin-wide
-        would tell a reader that bulldozer-codex.log is safe to share — it is not."""
+    def test_redaction_scope_is_honest_per_channel(self):
+        """#334: redaction now covers look + codex + facade, each with an explicit
+        boundary. The README must not overclaim — the facade payload-key qualifier and
+        the 'paths remain visible' limit are load-bearing for anyone sharing a log."""
         section = self._readme().split("## Log Format", 1)[1].split("\n## ", 1)[0]
-        assert re.search(r"scoped to the look channel", section), \
-            "README must scope the redaction guarantee to the channel that implements it"
+        assert re.search(r"ONLY the payload fields `err`/`reason`/`detail`/`msg`", section), \
+            "facade redaction must be scoped to its payload keys"
+        assert "preserved verbatim" in section, \
+            "README must state identifier fields are intentionally NOT redacted"
+        assert "paths remain visible" in section
+        assert "NOT detected" in section          # bare tokens / malformed URIs
+        assert "NOT rewritten" in section         # history untouched
+        assert "no secrets in the logs" in section  # the anti-overclaim sentence stays
 
 
 class TestLookDocResidue187And172:

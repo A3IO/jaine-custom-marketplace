@@ -10,11 +10,13 @@ with a single stderr warning per process. stdlib-only, py3.9+.
 CLI shim (for .sh writers): python3 lib/bulldozer_log.py <log_path> <event> [k=v ...]
 Always exits 0 — logging never fails the calling hook/wrapper.
 """
+import hashlib
 import os
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     import fcntl  # POSIX-only; on other platforms rotation falls back to unserialized
@@ -47,6 +49,80 @@ def _value(v):
     if len(s) > _VALUE_MAX:
         s = s[: _VALUE_MAX - 1] + "…"
     return s
+
+
+# ── opt-in URL redaction (#334) ─────────────────────────────────────────────
+# Full-parity port of the look channel's cdp.py redaction: location schemes
+# keep origin+path; everything else is PAYLOAD → hash-redact.
+_LOCATION_SCHEMES = frozenset((
+    "", "http", "https", "file", "ws", "wss", "about", "chrome",
+    "chrome-extension", "devtools",
+))
+# Embedded-URL matcher: generic scheme:// forms + the payload/wrapper schemes
+# that carry secrets WITHOUT '//' or WRAP an inner URL (data:, javascript:,
+# blob:, view-source:, filesystem:). The wrapper schemes MUST be whole-token
+# alternatives: without them the generic arm matches the INNER https:// of
+# `blob:https://x/SECRET` and preserves the payload as 'path'. IGNORECASE —
+# schemes are case-insensitive per RFC 3986 (`DATA:` must not bypass).
+# Deliberately NOT any `word:` — that would mangle sha256:…, error:…, k=v
+# prose. DESIGN BOUNDARY (user-ratified, #334): tokens are matched to the next
+# whitespace/`|`; RFC 3986 forbids literal whitespace in URIs (%-encoding is
+# mandatory), so every VALID URI is captured whole — MALFORMED URIs with
+# embedded literal spaces and non-URL secrets (bare tokens, emails) are out of
+# scope, documented in README.
+# The lookbehind anchors every match to a TOKEN START (codex_review r1 P2 +
+# r2 P2): without it `metadata:SECRET` / `foo_data:SECRET` trip the data: arm
+# mid-token and an ordinary diagnostic value gets rewritten into a redaction
+# hash. `_` is a word char in identifiers, so it belongs in the guard; real
+# separators (space, `(`, `=`, quotes) stay outside it and keep matching.
+_URL_RE = re.compile(
+    r"(?<![A-Za-z0-9_+.-])"
+    r"(?:[A-Za-z][A-Za-z0-9+.-]*://|data:|javascript:|blob:|view-source:|filesystem:)[^\s|]+",
+    re.IGNORECASE)
+
+
+def _sha12(text):
+    return hashlib.sha256(
+        str(text).encode("utf-8", "surrogatepass")).hexdigest()[:12]
+
+
+def redact_url(url):
+    """Port of cdp.py:_redact_url (#334): scheme://host:port/path survives
+    (minable); userinfo, query and fragment are dropped — one `?<redacted>`
+    marker records that something was there. NON-location schemes (data:,
+    javascript:, unknown app schemes) carry payload in the 'path' → replaced
+    with `scheme:<redacted:len=N,sha=H>`. Opt-in producer policy; deliberately
+    NOT called from _value()."""
+    s = str(url)
+    try:
+        parts = urlsplit(s)
+    except ValueError:
+        return "unparseable:len={}".format(len(s))
+    if parts.scheme.lower() not in _LOCATION_SCHEMES:
+        return "{}:<redacted:len={},sha={}>".format(parts.scheme, len(s), _sha12(s))
+    netloc = parts.netloc.rpartition("@")[2]  # strip user:pass@
+    base = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    # Marker condition includes a STRIPPED netloc (codex_review r1 P2 —
+    # deliberate delta vs cdp.py): removed userinfo must be audit-visible,
+    # or the output is indistinguishable from an originally clean URL.
+    if parts.query or parts.fragment or netloc != parts.netloc:
+        # marker appended AFTER the cap so truncation can't eat it
+        return base[:109] + "?<redacted>"
+    return base[:120]
+
+
+def redact_urls_in_text(text):
+    """Replace every embedded URL (scheme:// forms + data:/javascript:/blob:/
+    view-source:/filesystem:) with redact_url() of it. `|` is excluded from the
+    match so field delimiters survive. Limitations (documented, not detected):
+    other scheme:opaque forms (mailto:) and bare tokens pass through. On ANY
+    failure returns a placeholder, NEVER the raw text — a redaction failure
+    must not leak the payload (#334)."""
+    s = str(text)
+    try:
+        return _URL_RE.sub(lambda m: redact_url(m.group(0)), s)
+    except Exception:
+        return "<redaction-failed:len={}>".format(len(s))
 
 
 def _session_token(session):

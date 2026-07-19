@@ -32,6 +32,17 @@ from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
+# #334: the completion line routes through the shared canonical writer. The
+# documented invocation is `python3 "$PANEL" …` from a CONSUMER project, so
+# sys.path[0] is scripts/ — resolve the plugin's lib/ explicitly; .resolve()
+# keeps cached/symlinked installs working. Guarded: helper missing → warn once
+# AT WRITE TIME (never at import — `--help` produces no telemetry) and drop.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
+try:
+    from bulldozer_log import append_line as _bl_append
+except Exception:
+    _bl_append = None
+
 # ── §3.7 single-consult verdict classifier ──
 
 # Anchored to the LINE (^...$, MULTILINE) so inline prose never matches, but
@@ -1077,34 +1088,38 @@ def _log_completion(
     call), failures=Display:reason_class, legtimes=Display:sec, and the resolved model ids
     (agy_model= from _AGY_MODEL; codex_effort= — the silent build_codex_cmd default)."""
     try:
+        # #334: canonical grammar via the shared writer — event=consult-complete,
+        # session= derived by the helper (same normalize-then-slice rule), ts with
+        # offset, sanitized values, locked rotation. Field order preserved.
+        if _bl_append is None:
+            raise RuntimeError("bulldozer_log helper unavailable")
         elapsed = time.perf_counter() - t0
-        raw_sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
-        # token-normalize BEFORE slicing — an adversarial env value must not split
-        # the pipe grammar (same rule as lib/bulldozer_log.py)
-        session = re.sub(r"[^A-Za-z0-9_-]", "_", raw_sid)[:8] or "NA"
         web = ",".join(m for m in selected if m in web_set)
-        line = (
-            f"{datetime.now().astimezone().isoformat(timespec='seconds')}"
-            f" | session={session} | round=1"
-            f" | verdict={_verdict_label(ok, verdict_mode, survivors)}"
-            f" | tokens=NA | time={elapsed:.1f}s | models={','.join(selected)}"
-            f" | web={web}"
-        )
+        fields = {
+            "round": 1,
+            "verdict": _verdict_label(ok, verdict_mode, survivors),
+            "tokens": "NA",
+            "time": f"{elapsed:.1f}s",
+            "models": ",".join(selected),
+            "web": web,
+        }
         if legs is not None:
             fails = [l for l in legs if l.output is None]
-            line += (
-                f" | survivors={len(legs) - len(fails)}/{len(legs)}"
-                f" | failures={','.join(f'{l.display}:{_reason_class(l.reason)}' for l in fails)}"
-                f" | legtimes={','.join(f'{l.display}:{l.elapsed_s}' for l in legs if l.elapsed_s is not None)}"
-            )
+            fields["survivors"] = f"{len(legs) - len(fails)}/{len(legs)}"
+            fields["failures"] = ",".join(
+                f"{l.display}:{_reason_class(l.reason)}" for l in fails)
+            fields["legtimes"] = ",".join(
+                f"{l.display}:{l.elapsed_s}" for l in legs if l.elapsed_s is not None)
         if "agy" in selected:
-            line += f" | agy_model={re.sub(r'[^A-Za-z0-9._()-]', '_', _AGY_MODEL)}"
+            fields["agy_model"] = re.sub(r"[^A-Za-z0-9._()-]", "_", _AGY_MODEL)
         if "codex" in selected:
-            line += " | codex_effort=medium"  # build_codex_cmd's default — not threaded through
-        line += f" | project={_project_root()}"
-        CONSULT_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with CONSULT_LOG.open("a") as f:
-            f.write(line + "\n")
+            fields["codex_effort"] = "medium"  # build_codex_cmd's default — not threaded through
+        fields["project"] = _project_root()
+        # Write-failure warning ownership = the HELPER (_warn_once inside
+        # append_line, codex_review r2 P3) — do NOT raise on False here, or one
+        # failure prints two warnings. _LOG_WARNED below covers import-absence
+        # and unexpected exceptions only.
+        _bl_append(CONSULT_LOG, "consult-complete", **fields)
     except Exception as e:
         # observability, never a blocker — but surface it once instead of forever-silently.
         # The warning itself is best-effort too: a closed stderr (detached process) must

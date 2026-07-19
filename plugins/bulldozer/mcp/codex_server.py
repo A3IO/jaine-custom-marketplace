@@ -67,6 +67,19 @@ if _pyver_err:
 import tomllib
 import urllib.request
 
+# #334: every audit line routes through the shared canonical writer (same
+# sys.path pattern as codex_facade.py). Guarded: a missing/broken helper
+# disables the audit channel (warn once at write time, drop lines) — NEVER a
+# raw legacy fallback (a second writer is exactly the drift #334 closed).
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+try:
+    from bulldozer_log import (append_line as _bl_append,
+                               redact_urls_in_text as _bl_redact)
+except Exception:
+    _bl_append = None
+    _bl_redact = None
+
 _CODEX_FALLBACK = "/opt/homebrew/bin/codex"
 
 
@@ -308,41 +321,51 @@ def log(*a):
     print("[bulldozer-codex]", *a, file=sys.stderr, flush=True)
 
 
-def _now_iso() -> str:
-    try:
-        return datetime.datetime.now().isoformat(timespec="seconds")
-    except Exception:
-        return "?"
+_HELPER_WARNED = False  # once-per-process "audit disabled" warning (#334)
 
 
-def _drift_warn(acc, code: str, detail: str) -> None:
-    """Record an upstream-drift breadcrumb. NEVER raises.
+def _drift_warn(acc, code: str, detail=None, **fields) -> None:
+    """Record an upstream-drift breadcrumb / audit line. NEVER raises.
 
     acc: per-call list (appended for user-facing _drift) or None (log-only,
-    e.g. VERSION_MISMATCH). Always best-effort writes one line to the stable log.
+    e.g. VERSION_MISMATCH). acc keeps the ORIGINAL detail — only the durable
+    copy is URL-redacted.
+
+    #334: the durable line routes through lib/bulldozer_log.append_line —
+    canonical grammar ({ts+offset} | event=CODE | session=S | k=v…), sanitized
+    values, 5MB locked rotation. Generic codes pass detail= ; named writers
+    pass structured **fields. Redaction is UNCONDITIONAL per value (R7-F1:
+    the redactor str()-coerces internally, so a wire-derived dict/list cannot
+    bypass it — append_line would stringify AFTER the redaction decision
+    otherwise; output-equivalent for clean values). Helper unavailable →
+    warn once, drop the line (no legacy fallback — a second writer is the
+    drift #334 closed).
     """
+    global _HELPER_WARNED
     if acc is not None:
         acc.append({"code": code, "detail": detail})
     try:
+        if _bl_append is None:
+            if not _HELPER_WARNED:
+                _HELPER_WARNED = True
+                log("audit disabled: bulldozer_log helper unavailable")
+            return
         path = os.environ.get("BULLDOZER_CODEX_LOG") or os.path.expanduser(
             "~/.claude/hooks/bulldozer-codex.log")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        kv = {}
+        if detail is not None:
+            kv["detail"] = _bl_redact(detail)
+        for k, v in fields.items():
+            kv[k] = _bl_redact(v)
         # #344 facade: the ONE engine touch — a facade worker sets
         # BULLDOZER_WORKER=N, stamping every audit line (TURN_OK/TURN_ERROR/
-        # APPROVAL/… all route through here) with its worker id. Unset → the
-        # line stays byte-identical to the single-bridge format.
+        # APPROVAL/… all route through here) with its worker id; stays LAST.
         worker = os.environ.get("BULLDOZER_WORKER")
-        suffix = f" | worker={worker}" if worker else ""
-        with open(path, "a") as f:
-            f.write(f"{_now_iso()} | {code} | {detail}{suffix}\n")
+        if worker:
+            kv["worker"] = worker
+        _bl_append(path, code, **kv)
     except Exception:
         pass
-
-
-def _log_san(v) -> str:
-    """One-line log sanitizer (shared by the audit writers): a value must never
-    break the `ts | KIND | k=v | ...` line grammar of the stable log."""
-    return str(v).replace("\n", " ").replace("\r", " ").replace("|", "/")
 
 
 def _turn_error_log(ts: dict, emsg) -> None:
@@ -361,12 +384,14 @@ def _turn_error_log(ts: dict, emsg) -> None:
         tm = getattr(ts.get("manager"), "_last_thread_meta", {}) or {}
         # rerouted_model (model/rerouted, e.g. capacity fallback) outranks the REQUESTED
         # model — a failure after a reroute belongs to the model that actually ran (#321 r2).
-        _drift_warn(None, "TURN_ERROR", (
-            f"model={_log_san(ts.get('rerouted_model') or ts.get('model_val') or tm.get('model') or 'default')} | "
-            f"effort={_log_san(ts.get('effort_val') or tm.get('effort') or 'default')} | "
-            f"mcp={_log_san(ts.get('mcp_mode') or '?')} | "
-            f"retries={ts.get('retries') or 0} | "
-            f"msg={_log_san(emsg or 'unknown error')[:500]}"))
+        # TRUNCATION ORDER (#334 R3-F1): values pass UNtruncated — the helper's
+        # _value cap is the ONE truncation point, applied AFTER redaction.
+        _drift_warn(None, "TURN_ERROR",
+                    model=ts.get('rerouted_model') or ts.get('model_val') or tm.get('model') or 'default',
+                    effort=ts.get('effort_val') or tm.get('effort') or 'default',
+                    mcp=ts.get('mcp_mode') or '?',
+                    retries=ts.get('retries') or 0,
+                    msg=str(emsg or 'unknown error'))
     except Exception:
         pass
 
@@ -380,20 +405,20 @@ def _turn_ok_log(ts: dict, meta: dict) -> None:
         tm = getattr(ts.get("manager"), "_last_thread_meta", {}) or {}
         timing = (meta or {}).get("timing") or {}
         tokens = ((meta or {}).get("usage") or {}).get("total_tokens")
-        parts = [
-            f"model={_log_san(ts.get('rerouted_model') or ts.get('model_val') or tm.get('model') or 'default')}",
-            f"effort={_log_san(ts.get('effort_val') or tm.get('effort') or 'default')}",
-            f"mcp={_log_san(ts.get('mcp_mode') or '?')}",
-            f"retries={ts.get('retries') or 0}",
-            f"duration_ms={timing.get('duration_ms')}",
-            # tokens is wire-derived (tokenUsage notification) — sanitize like every
-            # other external field or a malformed value forges log lines (#325 r2)
-            f"tokens={_log_san(tokens) if tokens is not None else 'NA'}",
-        ]
+        # tokens is wire-derived (tokenUsage notification) — _drift_warn redacts
+        # every value type-unconditionally (#334 R7-F1), the helper sanitizes.
+        kw = dict(
+            model=ts.get('rerouted_model') or ts.get('model_val') or tm.get('model') or 'default',
+            effort=ts.get('effort_val') or tm.get('effort') or 'default',
+            mcp=ts.get('mcp_mode') or '?',
+            retries=ts.get('retries') or 0,
+            duration_ms=timing.get('duration_ms'),
+            tokens=tokens if tokens is not None else 'NA',
+        )
         if ts.get("setup_ms") is not None:
-            parts.append(f"setup_ms={ts['setup_ms']}")
-            parts.append(f"cold_spawn={'true' if ts.get('cold_spawn') else 'false'}")
-        _drift_warn(None, "TURN_OK", " | ".join(parts))
+            kw["setup_ms"] = ts["setup_ms"]
+            kw["cold_spawn"] = 'true' if ts.get('cold_spawn') else 'false'
+        _drift_warn(None, "TURN_OK", **kw)
     except Exception:
         pass
 
@@ -403,11 +428,11 @@ def _interrupt_log(ts: dict, interrupted_by: str, thread_warm: bool) -> None:
     graceful partial, not a failure — it gets its own kind, never TURN_ERROR."""
     try:
         tm = getattr(ts.get("manager"), "_last_thread_meta", {}) or {}
-        _drift_warn(None, "INTERRUPT", (
-            f"interrupted_by={_log_san(interrupted_by)} | "
-            f"thread_warm={'true' if thread_warm else 'false'} | "
-            f"model={_log_san(ts.get('rerouted_model') or ts.get('model_val') or tm.get('model') or 'default')} | "
-            f"mcp={_log_san(ts.get('mcp_mode') or '?')}"))
+        _drift_warn(None, "INTERRUPT",
+                    interrupted_by=interrupted_by,
+                    thread_warm='true' if thread_warm else 'false',
+                    model=ts.get('rerouted_model') or ts.get('model_val') or tm.get('model') or 'default',
+                    mcp=ts.get('mcp_mode') or '?')
     except Exception:
         pass
 
@@ -429,8 +454,8 @@ def _info_error_log(query, msg) -> None:
     """#322 PR2 (F3): best-effort INFO_ERROR audit line — a codex_info outage
     (spawn/read failure) was previously visible only to the caller."""
     try:
-        _drift_warn(None, "INFO_ERROR", (
-            f"query={_log_san(query)} | msg={_log_san(msg or 'unknown error')[:500]}"))
+        _drift_warn(None, "INFO_ERROR", query=query,
+                    msg=str(msg or 'unknown error'))
     except Exception:
         pass
 
@@ -448,8 +473,8 @@ def _warning_log(params: dict) -> None:
             w = p.get("warning")
             msg = w.get("message") if isinstance(w, dict) else None
         if not isinstance(msg, str) or not msg:
-            msg = json.dumps(p)[:300]  # unknown shape — keep SOMETHING greppable
-        _drift_warn(None, "WARNING", _log_san(msg)[:500])
+            msg = json.dumps(p)  # unknown shape — keep SOMETHING greppable
+        _drift_warn(None, "WARNING", msg=str(msg))
     except Exception:
         pass
 
@@ -1920,7 +1945,7 @@ def _translate_openai(texts, lang):
     try:
         out = _translate_cached(lang, _translate_endpoint(), _translate_model(), tuple(texts))
     except Exception as e:
-        _drift_warn(None, "TRANSLATE_FAILED", f"openai: {type(e).__name__}: {str(e)[:100]}")
+        _drift_warn(None, "TRANSLATE_FAILED", f"openai: {type(e).__name__}: {e}")
         return None
     return list(out) if out and len(out) == len(texts) else None
 
@@ -1979,7 +2004,7 @@ def _translate_texts(texts, lang):
         try:
             res = fn(masked, lang)
         except Exception as e:
-            _drift_warn(None, "TRANSLATE_FAILED", f"{name}: {type(e).__name__}: {str(e)[:100]}")
+            _drift_warn(None, "TRANSLATE_FAILED", f"{name}: {type(e).__name__}: {e}")
             res = None
         if (isinstance(res, list) and len(res) == len(masked)
                 and all(isinstance(x, str) for x in res)
@@ -2187,20 +2212,20 @@ def _log_approval_event(method, decision, wait_ms, timed_out, unattended=False, 
     #340: when the native dialog answered, appends `| ui=dialog` (additive; cc-mode lines
     stay byte-compatible with the pre-#340 format).
     """
-    def _san(v):
-        # Keep the line greppable for the #251 miner: a CC-controlled value (e.g. the
-        # mcpServer/elicitation 'action' passthrough) must not inject a newline (spurious
-        # line) or the ' | ' field delimiter (split corruption).
-        return str(v).replace("\n", " ").replace("\r", " ").replace("|", "/")
     try:
-        extra = f" | unattended=true | rule={_san(rule)}" if unattended else ""
+        # single shared writer (#322 PR2 → #334 canonical): sanitation lives in
+        # the helper, redaction in _drift_warn; conditional fields keep the
+        # pre-#334 semantics (absent unless unattended / non-cc UI).
+        kw = dict(method=method,
+                  decision=_approval_decision_label(decision),
+                  wait_ms=wait_ms,
+                  timed_out='true' if timed_out else 'false')
+        if unattended:
+            kw["unattended"] = 'true'
+            kw["rule"] = rule
         if ui and ui != "cc":
-            extra += f" | ui={_san(ui)}"
-        # single shared writer (#322 PR2): same line format, one open/append path
-        _drift_warn(None, "APPROVAL", (
-            f"method={_san(method)} | "
-            f"decision={_san(_approval_decision_label(decision))} | "
-            f"wait_ms={wait_ms} | timed_out={'true' if timed_out else 'false'}{extra}"))
+            kw["ui"] = ui
+        _drift_warn(None, "APPROVAL", **kw)
     except Exception:
         pass
 
@@ -2942,9 +2967,8 @@ def build_awaiting_payload(method: str, params, ts, narrative, park_token):
         # token8 = the LAST 8 chars: production tokens are 'park-<hex>', so a prefix
         # slice would keep the constant 'park-' + 3 hex digits (4096 ids, ~50%
         # collision at ~75 parks) — the suffix carries full entropy (#325 r3).
-        _drift_warn(None, "PARK", (
-            f"kind={_log_san(kind)} | method={_log_san(method)} | "
-            f"token8={_log_san(str(park_token)[-8:])}"))
+        _drift_warn(None, "PARK", kind=kind, method=method,
+                    token8=str(park_token)[-8:])
     except Exception:
         pass
     approval = {"kind": kind, "decisions": decisions}

@@ -385,3 +385,148 @@ def test_cdp_log_sanitizes_multiline_js(tmp_path):
     lines = read_lines(log)
     assert len(lines) == 1
     assert "expr=typeof DATA  + x / y" in lines[0]
+
+
+# ── opt-in URL redaction helpers (#334) ──
+
+
+class TestRedactUrl:
+    def test_query_dropped_with_marker(self):
+        assert bulldozer_log.redact_url(
+            "https://x.test/api?token=SECRET") == "https://x.test/api?<redacted>"
+
+    def test_userinfo_stripped(self):
+        out = bulldozer_log.redact_url("https://user:pass@x.test/a")
+        assert "user:pass" not in out and out.startswith("https://x.test/a")
+
+    def test_userinfo_only_url_carries_marker(self):
+        # codex_review r1 P2: stripped userinfo must be AUDIT-VISIBLE — without
+        # the marker the output is indistinguishable from an originally clean URL.
+        assert bulldozer_log.redact_url(
+            "https://user:pass@x.test/a") == "https://x.test/a?<redacted>"
+
+    def test_fragment_dropped(self):
+        assert bulldozer_log.redact_url("https://x.test/a#frag") == "https://x.test/a?<redacted>"
+
+    def test_plain_url_survives(self):
+        assert bulldozer_log.redact_url("https://x.test/path/deep") == "https://x.test/path/deep"
+
+    def test_marker_survives_long_url(self):
+        out = bulldozer_log.redact_url("https://x.test/" + "p" * 300 + "?t=s")
+        assert out.endswith("?<redacted>") and len(out) <= 120
+
+
+class TestRedactUrlPayloadSchemes:
+    """R1-F1: cdp parity — non-location schemes carry PAYLOAD in the path;
+    they must hash-redact, never survive as 'path'."""
+
+    def test_data_uri_is_hash_redacted(self):
+        out = bulldozer_log.redact_url("data:text/html;base64,U0VDUkVU")
+        assert "U0VDUkVU" not in out and out.startswith("data:<redacted:len=")
+
+    def test_javascript_uri_is_hash_redacted(self):
+        out = bulldozer_log.redact_url("javascript:fetch('/steal?t=SECRET')")
+        assert "SECRET" not in out and out.startswith("javascript:<redacted:")
+
+    def test_unknown_scheme_with_slashes_is_hash_redacted(self):
+        out = bulldozer_log.redact_url("myapp://host/p?t=SECRET")
+        assert "SECRET" not in out and out.startswith("myapp:<redacted:")
+
+    def test_location_schemes_keep_origin_path(self):
+        for u in ("https://x.test/a", "file:///tmp/x", "wss://x.test/s"):
+            assert bulldozer_log.redact_url(u) == u
+
+
+class TestRedactUrlsInText:
+    def test_url_in_prose(self):
+        out = bulldozer_log.redact_urls_in_text(
+            "failed https://u:p@x.test/api?t=SECRET#f then died")
+        assert "SECRET" not in out and "u:p" not in out
+        assert "then died" in out and "?<redacted>" in out
+
+    def test_multiple_urls(self):
+        out = bulldozer_log.redact_urls_in_text(
+            "a https://a.test/x?q=1 b http://b.test/y?q=2 c")
+        assert out.count("?<redacted>") == 2 and "q=1" not in out and "q=2" not in out
+
+    def test_pipe_delimiter_not_consumed(self):
+        out = bulldozer_log.redact_urls_in_text("u=https://x.test/p?q=1 | k=2")
+        assert out.endswith("| k=2") and "q=1" not in out
+
+    def test_text_without_urls_unchanged(self):
+        assert bulldozer_log.redact_urls_in_text("plain error text") == "plain error text"
+
+    def test_non_string_coerced(self):
+        assert bulldozer_log.redact_urls_in_text(None) == "None"
+
+    def test_data_uri_in_prose_redacted(self):
+        out = bulldozer_log.redact_urls_in_text(
+            "codex sent data:text/plain;base64,U0VDUkVU to renderer")
+        assert "U0VDUkVU" not in out and "to renderer" in out
+
+    def test_javascript_uri_in_prose_redacted(self):
+        out = bulldozer_log.redact_urls_in_text(
+            "blocked javascript:alert(document.cookie) inline")
+        assert "document.cookie" not in out and "inline" in out
+
+    def test_bare_word_colon_not_matched(self):
+        # false-positive guard: sha256:, error:, time= values must survive intact
+        s = "sha256:abcdef error: boom time=1.5s"
+        assert bulldozer_log.redact_urls_in_text(s) == s
+
+    def test_embedded_scheme_inside_word_not_matched(self):
+        # codex_review r1 P2: 'metadata:SECRET' must NOT trip the data: arm
+        # mid-token — payload schemes anchor to a token START.
+        s = "metadata:SECRET olddata:v1 xjavascript:noop stays"
+        assert bulldozer_log.redact_urls_in_text(s) == s
+
+    def test_underscore_identifier_not_matched(self):
+        # codex_review r2 P2: '_' is a word char in identifiers — foo_data: must
+        # not trip the data: arm either.
+        s = "foo_data:SECRET x_javascript:noop stays"
+        assert bulldozer_log.redact_urls_in_text(s) == s
+
+    def test_match_after_real_separators_still_works(self):
+        # the boundary guard must allow matches after (, =, quotes — real prose
+        out = bulldozer_log.redact_urls_in_text(
+            "url=(data:1,SECRET) q='https://u:p@x.test/?t=S'")
+        assert "SECRET" not in out and "u:p" not in out and "t=S'" not in out
+
+    def test_payload_scheme_at_token_start_still_redacts(self):
+        # the boundary guard must not weaken real matches (start, after space)
+        out = bulldozer_log.redact_urls_in_text("data:text/plain;base64,U0VDUkVU x data:1,S y")
+        assert "U0VDUkVU" not in out and out.count("<redacted:") == 2
+
+    def test_blob_wrapper_scheme_whole_token_redacted(self):
+        # R1-F1 r2: the WHOLE blob: token must redact — the generic arm must not
+        # grab the inner https:// and keep SECRET_BLOB_ID as 'path'
+        out = bulldozer_log.redact_urls_in_text(
+            "leak blob:https://x.test/SECRET_BLOB_ID here")
+        assert "SECRET_BLOB_ID" not in out and "here" in out
+
+    def test_view_source_wrapper_scheme_redacted(self):
+        out = bulldozer_log.redact_urls_in_text(
+            "via view-source:https://x.test/p?t=SECRET end")
+        assert "SECRET" not in out and "end" in out
+
+    def test_scheme_matching_is_case_insensitive(self):
+        out = bulldozer_log.redact_urls_in_text("sent DATA:text/plain;base64,U0VDUkVU out")
+        assert "U0VDUkVU" not in out and "out" in out
+
+    def test_filesystem_wrapper_scheme_redacted(self):
+        out = bulldozer_log.redact_urls_in_text(
+            "got filesystem:https://x.test/persistent/SECRET end")
+        assert "SECRET" not in out and "end" in out
+
+    def test_percent_encoded_data_uri_captured_whole(self):
+        # RFC-valid data: URIs %-encode whitespace — captured to the token end
+        out = bulldozer_log.redact_urls_in_text("saw data:text/plain,a%20SECRET%20b tail")
+        assert "SECRET" not in out and "tail" in out
+
+    def test_failure_returns_placeholder_never_raw(self, monkeypatch):
+        class Boom:
+            def sub(self, *a, **k):
+                raise RuntimeError("boom")
+        monkeypatch.setattr(bulldozer_log, "_URL_RE", Boom())
+        out = bulldozer_log.redact_urls_in_text("secret https://x.test/?t=s")
+        assert "t=s" not in out and out.startswith("<redaction-failed")
