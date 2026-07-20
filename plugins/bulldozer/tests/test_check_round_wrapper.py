@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import PLUGIN_ROOT
+from conftest import PLUGIN_ROOT, test_env
 
 WRAPPER = PLUGIN_ROOT / "skills" / "check" / "scripts" / "bulldozer-round.sh"
 RENDER_TRAJECTORY = PLUGIN_ROOT / "skills" / "check" / "scripts" / "render-trajectory.py"
@@ -194,7 +194,7 @@ def _run_wrapper(tmp_path: Path, stub_dir: Path, *,
     prompt_file = tmp_path / "prompt.txt"
     prompt_file.write_text(prompt)
 
-    env = os.environ.copy()
+    env = test_env()
     env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
     env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
     env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -315,7 +315,7 @@ class TestCodexInvocation:
         """
         stdin_dump = tmp_path / "codex_stdin.txt"
         stub_dir = _install_codex_stub(tmp_path / "bin", exit_code=0)
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["CODEX_STUB_STDIN_FILE"] = str(stdin_dump)
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
@@ -849,7 +849,7 @@ class TestLogRoundComposition:
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_NOGO,
         )
         # Drop a stub directly via lower-level call to override env
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -1303,7 +1303,7 @@ class TestExitCodeContract:
         """Invoke wrapper without the standard 7-flag setup — for preflight tests
         that intentionally provide bad/missing args.
         """
-        env = os.environ.copy()
+        env = test_env()
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
         return subprocess.run(
@@ -1433,7 +1433,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_GO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -1485,7 +1485,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_GO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -1535,7 +1535,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_GO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -1640,7 +1640,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_GO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -1692,7 +1692,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_GO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -1744,7 +1744,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_GO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -1806,7 +1806,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_NOGO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -1897,7 +1897,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_NOGO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -1943,7 +1943,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_GO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2017,7 +2017,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_GO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2065,7 +2065,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_GO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2126,7 +2126,7 @@ class TestExitCodeContract:
         shutil.copy(
             PLUGIN_ROOT / "skills" / "check" / "data" / "depth-config.json",
             _bdata / "depth-config.json")
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2162,7 +2162,7 @@ class TestExitCodeContract:
         stub_dir = _install_codex_stub(
             tmp_path / "bin", exit_code=0, verdict_body=VALID_LEDGER_GO,
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2196,7 +2196,7 @@ class TestExitCodeContract:
         """
         prompt_file = tmp_path / "p.txt"; prompt_file.write_text("x")
         stub_dir = _install_codex_stub(tmp_path / "bin", exit_code=0)
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2469,7 +2469,7 @@ class TestManualExtractionBranch:
         rel_name = "rel_review"
         (tmp_path / rel_name).mkdir()
         prompt = tmp_path / "prompt.txt"; prompt.write_text("review")
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / rel_name)
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2527,7 +2527,7 @@ class TestManualExtractionBranch:
         review_dir = tmp_path / "review dir with spaces"
         review_dir.mkdir()
         prompt = tmp_path / "prompt.txt"; prompt.write_text("review")
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2570,7 +2570,7 @@ class TestManualExtractionBranch:
         review_dir = tmp_path / "rev $(touch PWNED) dir"
         review_dir.mkdir()
         prompt = tmp_path / "prompt.txt"; prompt.write_text("review")
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2625,7 +2625,7 @@ class TestManualExtractionBranch:
             verdict_body="LEDGER_PATCH:\n  findings: []\n  verdict: go\n",
         )
         prompt = tmp_path / "prompt.txt"; prompt.write_text("review")
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2697,7 +2697,7 @@ class TestManualExtractionBranch:
             verdict_body="LEDGER_PATCH:\n  findings: []\n  verdict: go\n",
         )
         prompt = tmp_path / "prompt.txt"; prompt.write_text("review")
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2758,7 +2758,7 @@ class TestManualExtractionBranch:
         review_dir = tmp_path / "review"
         review_dir.mkdir()
         prompt = tmp_path / "prompt.txt"; prompt.write_text("review")
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -2869,7 +2869,7 @@ class TestReviewerPreflight:
         args_dump = tmp_path / "codex_args.txt"
         stub_dir = _install_codex_stub(tmp_path / "bin", exit_code=0,
                                        verdict_body=VALID_LEDGER_GO)
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["CODEX_STUB_ARGS_FILE"] = str(args_dump)
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
@@ -2962,7 +2962,7 @@ class TestPromptViaStdin:
              depth: str = "standard"):
         stub_dir = _install_codex_stub(tmp_path / "bin", exit_code=0,
                                        verdict_body=VALID_LEDGER_GO)
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         if stdin_dump is not None:
             env["CODEX_STUB_STDIN_FILE"] = str(stdin_dump)
@@ -3049,7 +3049,7 @@ class TestPromptViaStdin:
         # > 64KB pipe buffer: on a pipe, `cat` would hit SIGPIPE once the
         # reader exits without draining.
         prompt_file.write_text("X" * 200_000)
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
         env["BULLDOZER_LOG"] = str(tmp_path / "bulldozer.log")
@@ -3307,7 +3307,7 @@ class TestWrapperVerdictFailsafe:
             tmp_path / "bin", exit_code=0,
             verdict_body="LEDGER_PATCH:\n  findings: []\n",
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")
@@ -3393,7 +3393,7 @@ class TestWrapperVerdictFailsafe:
             tmp_path / "bin", exit_code=0,
             verdict_body="Verdict body prose here.\n\nGO\n",
         )
-        env = os.environ.copy()
+        env = test_env()
         env["PATH"] = f"{stub_dir}{os.pathsep}{env['PATH']}"
         env["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
         env["BULLDOZER_REVIEW_DIR"] = str(tmp_path / "review")

@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from conftest import test_env
+
 PLUGIN_ROOT = Path(__file__).parent.parent
 INVOKE_HOOK = PLUGIN_ROOT / "hooks" / "log_skill_invoke.py"
 COOKIE_SEED = PLUGIN_ROOT / "skills" / "drive" / "scripts" / "cookie_seed.py"
@@ -12,10 +14,17 @@ LAUNCH = PLUGIN_ROOT / "skills" / "look" / "scripts" / "launch.sh"
 
 
 def test_drive_invoke_marker(tmp_path):
-    env = os.environ.copy()
-    env.pop("BULLDOZER_DRIVE_LOG", None)  # the hook gives it precedence — keep hermetic (#328 r6)
-    env.update({"BULLDOZER_INVOKE_LOG_DIR": str(tmp_path),
-                "CLAUDE_CODE_SESSION_ID": "cafebabe99"})
+    # The hook gives BULLDOZER_DRIVE_LOG precedence — keep hermetic (#328 r6).
+    # Dropping a protected knob requires the sanctioned foreign-HOME shape
+    # (#357 R10-F1): a scratch HOME sandboxes the producer fallback AND keeps
+    # the chokepoint from re-injecting the dropped knob; routing still goes
+    # through BULLDOZER_INVOKE_LOG_DIR, which is what this test asserts.
+    env = test_env(
+        drop=["BULLDOZER_DRIVE_LOG"],
+        unsafe_allow=["BULLDOZER_DRIVE_LOG"],
+        set_vars={"HOME": str(tmp_path / "scratch-home"),
+                  "BULLDOZER_INVOKE_LOG_DIR": str(tmp_path),
+                  "CLAUDE_CODE_SESSION_ID": "cafebabe99"})
     payload = json.dumps({"prompt": "/bulldozer:drive http://x test", "cwd": str(tmp_path)})
     r = subprocess.run([sys.executable, str(INVOKE_HOOK)], input=payload,
                        capture_output=True, text=True, timeout=10, env=env)
@@ -26,7 +35,7 @@ def test_drive_invoke_marker(tmp_path):
 
 def test_cookie_seed_failure_writes_audit_line(tmp_path):
     # unreachable source port → exit 1; the attempt must still leave a line
-    env = os.environ.copy()
+    env = test_env()
     env["BULLDOZER_DRIVE_LOG"] = str(tmp_path / "drive.log")
     env.pop("CDP_PORT", None)
     r = subprocess.run(
@@ -42,7 +51,7 @@ def test_cookie_seed_failure_writes_audit_line(tmp_path):
 
 
 def test_cookie_seed_validation_error_writes_audit_line(tmp_path):
-    env = os.environ.copy()
+    env = test_env()
     env["BULLDOZER_DRIVE_LOG"] = str(tmp_path / "drive.log")
     env.pop("CDP_PORT", None)
     r = subprocess.run(

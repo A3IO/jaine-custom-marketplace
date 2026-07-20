@@ -14,6 +14,8 @@ from pathlib import Path
 
 from test_check_round_wrapper import _seed_state_and_run
 
+from conftest import test_env
+
 PLUGIN_ROOT = Path(__file__).parent.parent
 CDP_SCRIPT = PLUGIN_ROOT / "skills" / "look" / "scripts" / "cdp.py"
 HOOK = PLUGIN_ROOT / "hooks" / "require-workflow-skill.py"
@@ -105,7 +107,7 @@ class TestRedactTarget:
         # behavioral: dead port 9399 → dispatcher fail line still carries
         # target=, but never the selector's secret
         log = tmp_path / "look.log"
-        env = os.environ.copy()
+        env = test_env()
         env.update({"BULLDOZER_LOOK_LOG": str(log), "CDP_PORT": "9399"})
         r = subprocess.run(
             [sys.executable, str(CDP_SCRIPT),
@@ -170,7 +172,7 @@ FANOUT_NO_ROUTING = (
 
 
 def run_hook(stdin_text, log_path, extra_env=None):
-    env = os.environ.copy()
+    env = test_env()
     env.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
     env.pop("BULLDOZER_ENFORCE_WORKFLOW_ROUTING", None)
     env["WORKFLOW_HOOK_LOG"] = str(log_path)
@@ -292,7 +294,7 @@ def run_verify(tmp_path, findings_obj, log_path):
         findings.write_text(findings_obj)
     else:
         findings.write_text(json.dumps(findings_obj))
-    env = os.environ.copy()
+    env = test_env()
     env["BULLDOZER_LOG"] = str(log_path)
     env["CLAUDE_CODE_SESSION_ID"] = "cafebabe99"
     r = subprocess.run(
@@ -341,7 +343,7 @@ class TestInvokeHookImportFailureWarns:
         hooks_dir.mkdir()
         shutil.copy(PLUGIN_ROOT / "hooks" / "log_skill_invoke.py",
                     hooks_dir / "log_skill_invoke.py")
-        env = os.environ.copy()
+        env = test_env()
         env["BULLDOZER_INVOKE_LOG_DIR"] = str(tmp_path)
         payload = json.dumps({"prompt": "/bulldozer:look http://x", "cwd": str(tmp_path)})
         r = subprocess.run(

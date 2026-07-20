@@ -209,6 +209,25 @@ completion writers stayed legacy until #334):
   timezone.
 - Legacy consult completion lines have no `event=` (`session=` comes first). Inline vs
   panel is discriminated by `model=` singular vs `models=` plural in BOTH shapes.
+- **`event=invoke` / `look-invoke` / `consult-invoke` lines are POISONED before the
+  #318 cutover:** the pre-fix inline-echo hooks fired on EVERY prompt and wrote an
+  invoke line into all three logs regardless of content (fix `50db186`; poisoned
+  lines run through 2026-07-12 because hooks hot-swap only on plugin update).
+  Discriminator: pre-cutover lines exist as identical-timestamp TRIPLES across the
+  three logs. For usage counts use `event=round` / `event=consult-complete`, never
+  the invoke family.
+- **Pre-isolation archive (#357 cutover, 2026-07-21):** the active `bulldozer.log`
+  starts clean at the cutover — its first line is `event=log-archived`. Pre-cutover
+  history lives UNMODIFIED in `bulldozer.log.pre-357-isolation.gz` (sibling
+  `.manifest.json` carries cutover ts, counts, sha256 of the raw bytes) — the
+  primary source for pre-cutover mining; never edit it, derive filtered views as
+  separate files. The archive is MIXED (~65% test-origin) in three classes:
+  `/pytest-of-` project paths; `event=reconciled` (0 production lines in the
+  archived corpus — a corpus fact, NOT event semantics: reconciled is a legitimate
+  production event); `event=wrapper-fail` (2 production lines of 75). Per-line
+  attribution is impossible (byte-identical shapes — the reason #357 exists);
+  filter by class on read. Earlier archive of the same kind:
+  `bulldozer.log.pre-318-cleanup.gz` (invoke-poisoning era).
 
 ```
 2026-07-12T17:25:03+07:00 | event=round | session=3d3b6182 | round=4 | artifact=specs/design.md | verdict=NO-GO | findings=1 | fixed=3 | fp=0 | reviewer=codex/gpt-5.6-sol | depth=standard | duration_s=364 | project=/path
@@ -221,7 +240,7 @@ wiped on every update):
 | Log | Written by | Carries |
 |---|---|---|
 | `bulldozer.log` | /check wrappers | `event=round`, `pivot`, `reconciled`, `audit`, `wrapper-fail` |
-| `bulldozer-codex.log` | the codex MCP bridge | `TURN_OK`, `TURN_ERROR`, `INTERRUPT`, `PARK`, `APPROVAL`, `INFO_ERROR`, `WARNING` |
+| `bulldozer-codex.log` | the codex MCP bridge + facade | `TURN_OK`, `TURN_ERROR`, `INTERRUPT`, `PARK`, `APPROVAL`, `INFO_ERROR`, `WARNING`, `FACADE_*` (scheduler events — the dominant volume in this log since the 2026-07-18 flip) |
 | `bulldozer-consult.log` | consult + panel legs | per-leg outcomes, resolved model ids |
 | `bulldozer-look.log` | `cdp.py` | per-command outcomes (`port=`, `target=`; URLs and JS are **redacted** — origin+path only, `expr_sha=` for JS) |
 | `bulldozer-drive.log` | drive lanes | lane lifecycle, cookie-seed audit, tripped circuit-breakers |

@@ -17,6 +17,7 @@ from urllib.request import urlopen
 sys.path.insert(0, os.path.dirname(__file__))
 import pytest  # noqa: E402
 from conftest import run_cdp, CDP_PORT, FIXTURES_DIR, LAUNCH_SCRIPT, LANE_ENV_VARS, _kill_pattern, _wait_port_release  # noqa: E402
+from conftest import test_env  # noqa: E402
 
 
 # ── Status & Tabs ──
@@ -532,7 +533,7 @@ def insecure_lane():
         pytest.fail("Unexpected CDP listener on insecure test port {0} — kill it "
                     "(pkill -f remote-debugging-port={0}) and re-run.".format(INSECURE_TEST_PORT))
     profile = tempfile.mkdtemp(prefix="jaine-insecure-{}-".format(INSECURE_TEST_PORT))
-    env = os.environ.copy()
+    env = test_env()
     for _v in LANE_ENV_VARS:
         env.pop(_v, None)
     env.update({

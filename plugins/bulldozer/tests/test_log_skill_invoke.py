@@ -30,7 +30,8 @@ LOG_NAMES = {
 
 def run_hook(prompt_payload, log_dir, cwd=None):
     """Invoke the hook script as CC would: JSON on stdin, log dir via env override."""
-    env = dict(os.environ, BULLDOZER_INVOKE_LOG_DIR=str(log_dir))
+    from conftest import test_env
+    env = test_env(set_vars={"BULLDOZER_INVOKE_LOG_DIR": str(log_dir)})
     stdin = (
         prompt_payload
         if isinstance(prompt_payload, str)

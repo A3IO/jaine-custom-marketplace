@@ -1035,6 +1035,16 @@ _CHILD_ENV_ALLOW_EXACT = frozenset({
                               # (codex-rs/codex-client custom_ca). Omitting it breaks TLS for
                               # corp users on a custom CA. (OPENAI_API_KEY is the only auth env
                               # codex reads; OPENAI_BASE_URL is config-only — kept as harmless.)
+    # #357 R11-F1: the stable-log override knobs are forwarded WHEN PRESENT —
+    # configuration paths, not secrets, so the fail-closed property is
+    # unchanged. Without this a codex descendant is env-scrubbed past the test
+    # suite's redirect and a stable-log producer it runs falls back to the real
+    # $HOME. In production the knobs are unset → no-op. (codex SHELL children
+    # still get shell_environment_policy inherit=core — the residual there is
+    # covered by codex's own sandbox: no test runs danger-full-access.)
+    "BULLDOZER_LOG", "BULLDOZER_CODEX_LOG", "BULLDOZER_LOOK_LOG",
+    "BULLDOZER_CONSULT_LOG", "BULLDOZER_DRIVE_LOG", "WORKFLOW_HOOK_LOG",
+    "BULLDOZER_INVOKE_LOG_DIR",
 })
 _CHILD_ENV_ALLOW_PREFIX = ("LC_",)
 

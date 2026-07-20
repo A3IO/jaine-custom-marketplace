@@ -1051,8 +1051,8 @@ class TestFacadeCrashAndTeardown:
     def test_shutdown_closes_stdin_first_graceful(self, tmp_path):
         marker = str(tmp_path / "eof")
         cc = CCSide()
-        env = dict(os.environ)
-        env["FAKE_WORKER_EOF_MARKER"] = marker
+        from conftest import test_env
+        env = test_env(set_vars={"FAKE_WORKER_EOF_MARKER": marker})
         f = codex_facade.Facade(cc_write=cc.write,
                                 worker_argv=[sys.executable, FAKE_WORKER],
                                 max_workers=2, env=env)
@@ -1106,8 +1106,8 @@ class TestFacadeMainLoop:
         then close stdin and let the server exit."""
         import subprocess
         import threading as _threading
-        env = dict(os.environ)
-        env.update(env_extra)
+        from conftest import test_env
+        env = test_env(set_vars=env_extra)
         proc = subprocess.Popen(
             [sys.executable, os.path.join(MCP_DIR, "codex_facade.py")],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)

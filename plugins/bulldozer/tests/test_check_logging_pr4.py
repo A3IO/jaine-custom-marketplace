@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import test_env
+
 PLUGIN_ROOT = Path(__file__).parent.parent
 LOG_ROUND = PLUGIN_ROOT / "skills" / "check" / "scripts" / "log-round.sh"
 WRAPPER = PLUGIN_ROOT / "skills" / "check" / "scripts" / "bulldozer-round.sh"
@@ -20,14 +22,13 @@ INVOKE_HOOK = PLUGIN_ROOT / "hooks" / "log_skill_invoke.py"
 
 
 def _env(tmp_path, review_dir, **extra):
-    env = os.environ.copy()
-    env.update({
+    # pinned env-builder (#357 CENTRAL_ALLOWLIST) — single test_env call
+    return test_env(set_vars={
         "BULLDOZER_REVIEW_DIR": str(review_dir),
         "BULLDOZER_LOG": str(tmp_path / "bulldozer.log"),
         "CLAUDE_CODE_SESSION_ID": "cafebabe99",
+        **extra,
     })
-    env.update(extra)
-    return env
 
 
 @pytest.fixture
@@ -113,7 +114,7 @@ class TestReconciledLine:
 
 class TestInvokeSession:
     def test_invoke_marker_carries_session(self, tmp_path):
-        env = os.environ.copy()
+        env = test_env()
         env.update({
             "BULLDOZER_INVOKE_LOG_DIR": str(tmp_path),
             "CLAUDE_CODE_SESSION_ID": "cafebabe99",

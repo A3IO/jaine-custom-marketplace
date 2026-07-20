@@ -8,8 +8,11 @@ running `pytest` without `-m slow` doesn't print PytestUnknownMarkWarning.
 Slow tests are not deselected by default — register a default filter via
 `-m "not slow"` if you want fast runs only.
 """
+import atexit
+import fcntl
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -17,11 +20,507 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
+
+# ── Test-log isolation, D1 (#357) ────────────────────────────────────────────
+# MODULE level, not a fixture: conftest imports BEFORE collection imports test
+# modules, so producers that freeze their log path at import time (spec F2 —
+# cdp.py, require-workflow-skill.py, consult_panel.py) capture the redirect,
+# and every subprocess inherits it via os.environ. Restore runs via atexit,
+# which also covers the xdist controller / zero-selected / collection-error
+# paths where no fixture ever executes (spec F8).
+# Spec: docs/superpowers/specs/2026-07-20-test-log-isolation-design.md
+
+_KNOB_TO_LOG_NAME = {
+    "BULLDOZER_LOG": "bulldozer.log",
+    "BULLDOZER_CODEX_LOG": "bulldozer-codex.log",
+    "BULLDOZER_LOOK_LOG": "bulldozer-look.log",
+    "BULLDOZER_CONSULT_LOG": "bulldozer-consult.log",
+    "BULLDOZER_DRIVE_LOG": "bulldozer-drive.log",
+    "WORKFLOW_HOOK_LOG": "require-workflow-skill.log",
+}
+# Full override surface is 7 knobs (spec F1): 6 files + one DIRECTORY.
+LOG_ISOLATION_KNOBS = tuple(_KNOB_TO_LOG_NAME) + ("BULLDOZER_INVOKE_LOG_DIR",)
+PRODUCTION_LOG_DIR = Path.home() / ".claude" / "hooks"
+PRODUCTION_LOG_NAMES = tuple(_KNOB_TO_LOG_NAME.values())
+
+_SAVED_LOG_ENV = {
+    k: os.environ.get(k)
+    for k in LOG_ISOLATION_KNOBS + ("CLAUDE_CODE_SESSION_ID",
+                                    "BULLDOZER_TEST_SENTINEL",
+                                    "BULLDOZER_TEST_SENTINEL_SPAWNER")
+}
+
+TEST_LOG_DIR = Path(tempfile.mkdtemp(prefix="bulldozer-test-logs-"))
+for _knob, _log_name in _KNOB_TO_LOG_NAME.items():
+    os.environ[_knob] = str(TEST_LOG_DIR / _log_name)
+_invoke_dir = TEST_LOG_DIR / "invoke"
+_invoke_dir.mkdir()
+os.environ["BULLDOZER_INVOKE_LOG_DIR"] = str(_invoke_dir)
+
+# Session sentinel, adopt-protocol (spec D1.3): adopt the inherited value ONLY
+# in a positively identified xdist worker AND only in exact wire form (writers
+# truncate session to 8 chars via _session_token — a longer value would never
+# appear on the wire). "Positively identified" needs THREE conjuncts:
+# PYTEST_XDIST_WORKER is inherited by every descendant of a worker, so a nested
+# pytest spawned FROM a worker (the shim runs in the guard tests) would
+# masquerade as one — the SPAWNER pid check disambiguates: execnet spawns
+# workers as DIRECT children of the controller, a nested run's parent is the
+# worker. Controller / non-xdist / nested / malformed → regenerate. Both vars
+# are re-pointed unconditionally so they can never diverge.
+_SENTINEL_WIRE_FORM = re.compile(r"^PT[0-9a-f]{6}$")
+_inherited_sentinel = os.environ.get("BULLDOZER_TEST_SENTINEL", "")
+if ("PYTEST_XDIST_WORKER" in os.environ
+        and _SENTINEL_WIRE_FORM.match(_inherited_sentinel)
+        and os.environ.get("BULLDOZER_TEST_SENTINEL_SPAWNER") == str(os.getppid())):
+    TEST_SENTINEL = _inherited_sentinel
+else:
+    TEST_SENTINEL = "PT" + secrets.token_hex(3)
+    os.environ["BULLDOZER_TEST_SENTINEL_SPAWNER"] = str(os.getpid())
+os.environ["BULLDOZER_TEST_SENTINEL"] = TEST_SENTINEL
+os.environ["CLAUDE_CODE_SESSION_ID"] = TEST_SENTINEL
+
+# Baselines for the D2 scan — recorded HERE, not at fixture setup, so a
+# collection-time leak falls inside both the timestamp window and the offset
+# fast-path window (spec D1.4). st_ino identifies a rotation (rename); size
+# alone cannot (a rotated file can regrow past the saved offset).
+SESSION_START = time.time()
+LOG_BASELINES = {}
+for _log_name in PRODUCTION_LOG_NAMES:
+    try:
+        _st = os.stat(PRODUCTION_LOG_DIR / _log_name)
+        LOG_BASELINES[_log_name] = (_st.st_ino, _st.st_size)
+    except FileNotFoundError:
+        LOG_BASELINES[_log_name] = None
+
+
+def _restore_log_isolation():
+    subprocess.Popen = _REAL_POPEN  # uninstall the D3a-rt chokepoint
+    for _k, _v in _SAVED_LOG_ENV.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+    shutil.rmtree(TEST_LOG_DIR, ignore_errors=True)
+
+
+atexit.register(_restore_log_isolation)
+
+
+def _line_ts_epoch(line):
+    """Epoch seconds of a stable-log line's leading ISO field, or None.
+
+    Parsed, never compared lexicographically (spec D2): canonical lines carry a
+    colon-offset ISO ts; a naive (legacy-form) ts is assumed local —
+    datetime.timestamp() does exactly that. Unparseable → None (a mid-line
+    read fragment or pre-canonical garbage; every current producer writes a
+    valid leading ts via the canonical helper)."""
+    ts = line.split(" | ", 1)[0].strip()
+    try:
+        return datetime.fromisoformat(ts).timestamp()
+    except ValueError:
+        return None
+
+
+def _read_generations(path, baseline):
+    """Text of `path`'s NEW content since `baseline` (spec D2 scan mechanics).
+
+    baseline None (file absent at session start) → full current + full `.1`
+    sibling (the ts window suppresses genuinely old lines). Inode changed →
+    rotation happened → full current + full `.1`; size alone cannot identify a
+    generation (a rotated file can regrow past the saved offset). Same inode,
+    size grew → tail from the saved offset (fast path). Read under a brief
+    SHARED flock on the writer's `<log>.lock` sibling so a concurrent
+    os.replace rotation cannot be raced mid-read.
+
+    Best-effort boundary (spec D2): TWO rotations of one log within a single
+    pytest run would overwrite `.1` and lose the middle generation — with
+    tests redirected to tmp, real-log growth comes only from foreign writers
+    (~hundreds of lines/day vs the 5 MB cap); not chased."""
+    lock_fh = None
+    try:
+        # Lock ONLY when the writer's lock file already exists — the scan must
+        # never CREATE files in the production dir (it is a reader). No lock
+        # file ⇒ no canonical writer has touched this log; scan unlocked.
+        lock_path = str(path) + ".lock"
+        try:
+            if os.path.exists(lock_path):
+                lock_fh = open(lock_path, "a")
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_SH)
+        except OSError:
+            lock_fh = None  # lock unavailable → still scan, unlocked
+        texts = []
+
+        def _full(p):
+            try:
+                with open(p, "r", errors="replace") as fh:
+                    texts.append(fh.read())
+            except OSError:
+                pass
+
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            st = None
+        rotated = Path(str(path) + ".1")
+        if baseline is None:
+            if st:
+                _full(path)
+            if rotated.exists():
+                _full(rotated)
+        else:
+            ino, size = baseline
+            if st is None:
+                if rotated.exists():
+                    _full(rotated)
+            elif st.st_ino != ino:
+                if rotated.exists():
+                    _full(rotated)
+                _full(path)
+            elif st.st_size > size:
+                try:
+                    with open(path, "r", errors="replace") as fh:
+                        fh.seek(size)
+                        texts.append(fh.read())
+                except OSError:
+                    pass
+            elif st.st_size < size:
+                _full(path)  # same-inode shrink: abnormal — rescan, ts window filters
+        return "".join(texts)
+    finally:
+        if lock_fh:
+            lock_fh.close()  # releases the flock
+
+
+def scan_for_leaks(log_dir, sentinel, since, baselines, markers):
+    """D2 guard core (#357): pure leak scanner over stable-log files.
+
+    Returns offending lines (prefixed with the file name), [] when clean. A
+    line is a leak iff its ts >= since - 1s AND any detector fires:
+      1. session=<sentinel>   — primary (every env-derived writer, spec F7);
+      2. session=cafebabe     — the reserved explicit-test-session id (F9/F10);
+      3. any caller marker substring (private tmp path, pytest-of-it,
+         artifact=test forms) — secondary content attribution.
+    All inputs explicit (target dir, baselines) — no env seam by design
+    (R1-F6: an env seam is an unauthenticated kill switch)."""
+    threshold = since - 1.0
+    sentinel_token = "session=" + sentinel
+    offenders = []
+    for name, baseline in baselines.items():
+        path = Path(log_dir) / name
+        for line in _read_generations(path, baseline).splitlines():
+            ts = _line_ts_epoch(line)
+            if ts is None or ts < threshold:
+                continue
+            if (sentinel_token in line
+                    or "session=cafebabe" in line
+                    or any(m in line for m in markers)):
+                offenders.append("{}: {}".format(name, line))
+    return offenders
+
+
+# Secondary content markers for the authoritative scan (D2 detectors 3-4).
+LEAK_MARKERS = [
+    "/pytest-of-",             # tmp_path factory paths (user-agnostic prefix)
+    "artifact=test |",         # the two historical polluted classes — exact-field
+    "artifact=test-artifact",  # forms so a real artifact=tests/foo.py never matches
+    str(TEST_LOG_DIR),         # this process's private redirect dir
+]
+
+# The three producers that freeze their log path at IMPORT time (spec F2).
+_IMPORT_FROZEN_PRODUCERS = (
+    ("skills/look/scripts/cdp.py", "LOG_FILE"),
+    ("hooks/require-workflow-skill.py", "LOG"),
+    ("skills/consult/scripts/consult_panel.py", "CONSULT_LOG"),
+)
+
+
+def _import_frozen_problems():
+    """Start-assert (b): the import-frozen producer constants captured the redirect.
+
+    sys.modules-first (R1-F2 r3): every ALREADY-LOADED instance of a producer is
+    checked — a fresh importlib load proves nothing about the instance tests
+    actually use. The fresh probe (never registered in sys.modules) runs only
+    when no instance is loaded, proving what a future import WOULD capture."""
+    import importlib.util
+    problems = []
+    tld = str(TEST_LOG_DIR)
+    for rel, attr in _IMPORT_FROZEN_PRODUCERS:
+        path = (Path(__file__).parent.parent / rel).resolve()
+        loaded = [m for m in list(sys.modules.values())
+                  if getattr(m, "__file__", None)
+                  and Path(m.__file__).resolve() == path]
+        probes = [("loaded", m) for m in loaded]
+        if not probes:
+            probe_name = "_bdz_frozen_probe_" + Path(rel).stem.replace("-", "_")
+            spec = importlib.util.spec_from_file_location(probe_name, str(path))
+            mod = importlib.util.module_from_spec(spec)
+            # Registered under the throwaway probe name DURING exec (py3.14
+            # dataclasses resolve annotations via sys.modules[cls.__module__])
+            # and removed right after — zero lasting sys.modules pollution.
+            sys.modules[probe_name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except Exception as e:  # noqa: BLE001 — report, don't crash the assert
+                problems.append("{}: fresh-import probe failed: {!r}".format(rel, e))
+                continue
+            finally:
+                sys.modules.pop(probe_name, None)
+            probes = [("fresh-import", mod)]
+        for source, mod in probes:
+            val = getattr(mod, attr, None)
+            if val is None or not str(val).startswith(tld):
+                problems.append(
+                    "{} ({}): {}={!r} escaped the redirect (expected under {})"
+                    .format(rel, source, attr, val, tld))
+    return problems
+
+
+def _start_assert_problems():
+    """Start-assert (a)+(b): redirect in effect, sentinel coherent, frozen
+    constants captured. Returns human-readable problems, [] when healthy."""
+    problems = []
+    tld = str(TEST_LOG_DIR)
+    for knob in LOG_ISOLATION_KNOBS:
+        val = os.environ.get(knob)
+        if not val or not val.startswith(tld):
+            problems.append(
+                "{}={!r} — not inside the private redirect dir {}".format(
+                    knob, val, tld))
+    for var in ("CLAUDE_CODE_SESSION_ID", "BULLDOZER_TEST_SENTINEL"):
+        if os.environ.get(var) != TEST_SENTINEL:
+            problems.append("{}={!r} != session sentinel {!r}".format(
+                var, os.environ.get(var), TEST_SENTINEL))
+    return problems + _import_frozen_problems()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """D2 authoritative leak scan (#357).
+
+    Runs in EVERY process that imported this conftest — xdist workers AND the
+    controller (which finishes last), zero-selected runs, collection errors —
+    exactly the cases where no fixture ever executes (spec F8). Offenders are
+    printed verbatim and the run is forced non-zero: a leak is an emergency,
+    not a routine assert."""
+    offenders = scan_for_leaks(PRODUCTION_LOG_DIR, TEST_SENTINEL, SESSION_START,
+                               LOG_BASELINES, LEAK_MARKERS)
+    if offenders:
+        sys.stderr.write(
+            "\n=== TEST-LOG LEAK GUARD (#357): {} test-origin line(s) leaked "
+            "into {} ===\n  {}\nA test wrote into the production stable logs — "
+            "fix the leak site (spec: docs/superpowers/specs/"
+            "2026-07-20-test-log-isolation-design.md).\n".format(
+                len(offenders), PRODUCTION_LOG_DIR, "\n  ".join(offenders)))
+        session.exitstatus = 1
+
+
+# ── Test-log isolation, D3 (#357) ────────────────────────────────────────────
+# The redirect cannot protect a child whose env is CONSTRUCTED without the
+# knobs (fallback → real $HOME). Three layers close the accidental-
+# misconstruction class (deliberate evasion is out of scope by declaration —
+# spec §4 D3 threat model): the test_env builder (ergonomics + protected-drop
+# checks), the runtime Popen chokepoint (repair, not rejection), and two
+# static scans in tests/test_log_isolation_guard.py. All consult the ONE
+# central allowlist below.
+
+PROTECTED_ENV_VARS = LOG_ISOLATION_KNOBS + ("CLAUDE_CODE_SESSION_ID",)
+
+# THE central allowlist (D3a/D3b). Every entry carries a justification; a
+# callsite file absent from the relevant section cannot self-authorize
+# (R1-F5 r4). Sections:
+#   unsafe_env           — (var|"*", callsite file, why) test_env may drop/empty
+#                          that protected var when called from that file
+#   env_forward_helpers  — (helper name, defining file, why) scan-1 permits the
+#                          helper's internal `env=<local>` forward; its build
+#                          MUST go through test_env
+#   session_literals     — (relative file, why) scan-2 permits non-cafebabe99
+#                          session literals in that file (hermetic tmp-only
+#                          unit tests of the logging path itself, spec F10)
+CENTRAL_ALLOWLIST = {
+    "unsafe_env": (
+        ("*", "test_log_isolation_guard.py",
+         "scratch-HOME leak repros (T2/T4/T7) + sentinel-protocol probes"),
+        ("BULLDOZER_DRIVE_LOG", "test_drive_logging_pr5.py",
+         "intentional DRIVE_LOG-absent fallback routing through "
+         "BULLDOZER_INVOKE_LOG_DIR under a scratch HOME (R10-F1)"),
+    ),
+    "env_forward_helpers": (
+        ("_env", "test_check_logging_pr4.py",
+         "pinned env-builder — single internal test_env(set_vars=…) call"),
+        ("_child_env_dump", "test_log_isolation_guard.py",
+         "chokepoint probe — forwards RAW env shapes BY DESIGN (the shapes "
+         "ARE the test subject; internal test_env would defeat the premise)"),
+    ),
+    "session_literals": (
+        ("tests/test_bulldozer_log.py",
+         "unit tests of _session_token/append_line themselves — adversarial "
+         "ids, explicit tmp log paths only"),
+        ("tests/test_consult_panel.py",
+         "one adversarial-session sanitization test, tmp-only"),
+        ("tests/test_log_isolation_guard.py",
+         "sentinel-protocol probes (stale PT-form values, divergence checks)"),
+    ),
+}
+
+
+def _unsafe_authorized(var, caller_file):
+    for allowed_var, allowed_file, _why in CENTRAL_ALLOWLIST["unsafe_env"]:
+        if allowed_file == caller_file and allowed_var in ("*", var):
+            return True
+    return False
+
+
+def test_env(drop=(), set_vars=None, unsafe_allow=(), scrub=False):
+    """D3a (#357): the ONLY sanctioned way to build a modified subprocess env.
+
+    Starts from os.environ.copy() (which carries the D1 redirect), applies
+    set_vars, drops `drop` — and raises if any operation would remove or empty
+    a PROTECTED var (directly, via loop variable, or set_vars={K: ""} — F11)
+    unless that var is named in unsafe_allow AND this callsite file is pinned
+    in CENTRAL_ALLOWLIST["unsafe_env"]. scrub=True starts from a minimal env
+    instead — which still carries the redirect knobs, so even a deliberately
+    minimal child that unexpectedly launches a stable-log writer lands in tmp.
+    set_vars value None unsets the var."""
+    import inspect
+    caller_file = Path(inspect.currentframe().f_back.f_code.co_filename).name
+    for var in unsafe_allow:
+        if not _unsafe_authorized(var, caller_file):
+            raise RuntimeError(
+                "test_env: unsafe_allow of {!r} from {!r} is not pinned in "
+                "CENTRAL_ALLOWLIST['unsafe_env'] (tests/conftest.py) — add an "
+                "entry with a justification".format(var, caller_file))
+    if scrub:
+        env = {k: os.environ[k]
+               for k in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")
+               if k in os.environ}
+        for k in PROTECTED_ENV_VARS:
+            if k in os.environ:
+                env[k] = os.environ[k]
+    else:
+        env = os.environ.copy()
+    for var in drop:
+        if var in PROTECTED_ENV_VARS and var not in unsafe_allow:
+            raise RuntimeError(
+                "test_env: dropping protected {!r} — the producer would fall "
+                "back to the real production log; name it in unsafe_allow and "
+                "pin this file in CENTRAL_ALLOWLIST if genuinely intended"
+                .format(var))
+        env.pop(var, None)
+    for var, val in (set_vars or {}).items():
+        if (var in PROTECTED_ENV_VARS and (val is None or val == "")
+                and var not in unsafe_allow):
+            raise RuntimeError(
+                "test_env: emptying protected {!r} — an empty string falls "
+                "through `os.environ.get(K) or default` exactly like a "
+                "removal (F11)".format(var))
+        if val is None:
+            env.pop(var, None)
+        else:
+            env[var] = str(val)
+    return env
+
+
+test_env.__test__ = False  # helper named per spec — never collect as a test
+
+
+# D3a-rt: runtime process-creation chokepoint, REPAIR-based (spec §4). Installed
+# at MODULE level (same import-ordering argument as D1) so collection-time
+# creations are covered; restored by the same atexit handler. Enforces the real
+# invariant — no child of the test process may resolve a stable log into the
+# real Path.home()/.claude/hooks — at the only place it can be guaranteed.
+_REDIRECT_VALUES = {k: os.environ[k] for k in LOG_ISOLATION_KNOBS}
+_REAL_HOME = Path.home().resolve()
+_REAL_POPEN = subprocess.Popen
+
+
+def _resolves_production(val):
+    """True when `val` names a path at or under the real production log dir."""
+    if not val:
+        return False
+    try:
+        resolved = Path(val).resolve()
+    except OSError:
+        return False
+    prod = PRODUCTION_LOG_DIR.resolve()
+    return resolved == prod or str(resolved).startswith(str(prod) + os.sep)
+
+
+def _repair_env_for_child(argv, env):
+    """Repair (never reject) a child env per D3a-rt; returns the env to use.
+
+    env=None → inherit, but ASSERT the parent os.environ knobs still resolve
+    non-production (R10-F2 — an unsanctioned in-process mutation must not ride
+    the inherit branch). Foreign HOME → the child's Path.home() fallback is
+    sandboxed: absent/empty knobs stay absent (the T2/T4 scratch-HOME repros
+    keep their RED premise), but an EXPLICIT production-resolving knob outranks
+    the fallback in every producer (`os.environ.get(K) or default`) and is
+    repaired anyway. Otherwise → inject the session redirect for each knob
+    that is absent, empty, or production-resolving, into a COPY (the caller's
+    dict is never mutated); a per-test tmp re-point is non-production and is
+    preserved. A literal `env -i` argv prefix raises — command-level clearing
+    cannot be repaired."""
+    head = list(argv[:2]) if isinstance(argv, (list, tuple)) else []
+    if (len(head) == 2 and os.path.basename(str(head[0])) == "env"
+            and str(head[1]) == "-i"):
+        raise RuntimeError(
+            "subprocess launches an `env -i` child — command-level env "
+            "clearing cannot be repaired; build the env with test_env() "
+            "instead (#357 D3a-rt)")
+    if env is None:
+        for k in LOG_ISOLATION_KNOBS:
+            val = os.environ.get(k)
+            if not val or _resolves_production(val):
+                raise RuntimeError(
+                    "env=None inherit with mutated parent os.environ: {}={!r} "
+                    "would reach the production stable logs (#357 R10-F2)"
+                    .format(k, val))
+        return None
+    # RELATIVE paths are unclassifiable from the parent (post-impl codex review
+    # P2): the child resolves them against ITS cwd — a relative HOME or knob
+    # with cwd at the real home lands IN the production dir while our resolve()
+    # (against pytest's cwd) reads it as non-production. So: a relative HOME is
+    # never a sanctioned foreign sandbox, and a relative knob value is always
+    # repaired.
+    home = env.get("HOME")
+    try:
+        foreign_home = (bool(home) and os.path.isabs(home)
+                        and Path(home).resolve() != _REAL_HOME)
+    except OSError:
+        foreign_home = True
+    repaired = None
+    for k in LOG_ISOLATION_KNOBS:
+        val = env.get(k)
+        relative = bool(val) and not os.path.isabs(val)
+        if not relative:
+            if foreign_home:
+                if not _resolves_production(val):
+                    continue
+            elif val and not _resolves_production(val):
+                continue
+        if repaired is None:
+            repaired = dict(env)
+        repaired[k] = _REDIRECT_VALUES[k]
+    return repaired if repaired is not None else env
+
+
+class _IsolationGuardedPopen(subprocess.Popen):
+    def __init__(self, args, *pargs, **kwargs):
+        if len(pargs) >= 10:  # env passed positionally (10th after args)
+            pargs = list(pargs)
+            pargs[9] = _repair_env_for_child(args, pargs[9])
+            pargs = tuple(pargs)
+        else:
+            kwargs["env"] = _repair_env_for_child(args, kwargs.get("env"))
+        super().__init__(args, *pargs, **kwargs)
+
+
+subprocess.Popen = _IsolationGuardedPopen
+# ── end test-log isolation D1+D2+D3 ──────────────────────────────────────────
 
 
 def pytest_configure(config):
@@ -34,6 +533,19 @@ def pytest_configure(config):
     )
 
 import pytest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _log_isolation_start_assert():
+    """D2 early start-assert (#357): fail loudly BEFORE any test runs when the
+    redirect is not in effect. The AUTHORITATIVE scan is pytest_sessionfinish —
+    fixtures never execute on the xdist controller (spec F8)."""
+    problems = _start_assert_problems()
+    if problems:
+        pytest.fail("test-log isolation start-assert (#357):\n  "
+                    + "\n  ".join(problems))
+    yield
+
 
 PLUGIN_ROOT = Path(__file__).parent.parent
 CDP_SCRIPT = str(PLUGIN_ROOT / "skills" / "look" / "scripts" / "cdp.py")
@@ -92,13 +604,12 @@ def _kill_pattern(profile):
 
 
 def run_cdp(args, env_override=None, timeout=15):
-    env = os.environ.copy()
-    env["CDP_PORT"] = str(CDP_PORT)
-    if env_override:
-        env.update(env_override)
+    set_vars = {"CDP_PORT": str(CDP_PORT)}
+    set_vars.update(env_override or {})
     return subprocess.run(
         [sys.executable, CDP_SCRIPT] + args,
-        capture_output=True, text=True, timeout=timeout, env=env,
+        capture_output=True, text=True, timeout=timeout,
+        env=test_env(set_vars=set_vars),
     )
 
 
@@ -123,15 +634,15 @@ def transient_cft_lane(port, start_timeout=20):
     if _cdp_is_online(port):
         raise RuntimeError(
             "port {} unexpectedly occupied — see the e2e port registry".format(port))
-    env = os.environ.copy()
-    for v in LANE_ENV_VARS:
-        env.pop(v, None)
     profile = tempfile.mkdtemp(prefix="jaine-lane-{}-".format(port))
-    env.update({"CDP_PORT": str(port), "LOOK_PROFILE_DIR": profile,
-                "LOOK_HEADLESS": "1", "LOOK_AUTOMATION": "1",
-                "CHROME_APP_NAME": CFT_APP_NAME})
     kill_match = _kill_pattern(profile)
-    subprocess.Popen(["bash", LAUNCH_SCRIPT, "about:blank"], env=env,
+    subprocess.Popen(["bash", LAUNCH_SCRIPT, "about:blank"],
+                     env=test_env(drop=LANE_ENV_VARS,
+                                  set_vars={"CDP_PORT": str(port),
+                                            "LOOK_PROFILE_DIR": profile,
+                                            "LOOK_HEADLESS": "1",
+                                            "LOOK_AUTOMATION": "1",
+                                            "CHROME_APP_NAME": CFT_APP_NAME}),
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         deadline = time.time() + start_timeout
@@ -195,22 +706,20 @@ def jaine_browser():
     # LOOK_DRY_RUN=1 would make launch.sh dry-run + never start (misleading 20s timeout);
     # LOOK_HEADLESS=1 would launch the 9333 daily browser headless; LOOK_INSECURE=1 fails
     # launch.sh loud. Mirrors test_launch.py's _run_launch via the shared LANE_ENV_VARS.
-    env = os.environ.copy()
-    for _v in LANE_ENV_VARS:
-        env.pop(_v, None)
-    env["CDP_PORT"] = str(CDP_PORT)
+    lane_vars = {"CDP_PORT": str(CDP_PORT)}
     temp_profile = None
     if CDP_PORT == 9333:
         kill_match = _kill_pattern(BROWSER_PROFILE)
     else:
         temp_profile = tempfile.mkdtemp(prefix="jaine-test-{}-".format(CDP_PORT))
-        env["LOOK_PROFILE_DIR"] = temp_profile
-        env["LOOK_HEADLESS"] = "1"
+        lane_vars["LOOK_PROFILE_DIR"] = temp_profile
+        lane_vars["LOOK_HEADLESS"] = "1"
         kill_match = _kill_pattern(temp_profile)
     # DEVNULL, not PIPE: launch.sh redirects Chrome itself into the lane's
     # chrome.log; an unread PIPE could fill (64KB) and block the child.
     subprocess.Popen(
-        ["bash", LAUNCH_SCRIPT, "about:blank"], env=env,
+        ["bash", LAUNCH_SCRIPT, "about:blank"],
+        env=test_env(drop=LANE_ENV_VARS, set_vars=lane_vars),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
@@ -256,20 +765,19 @@ def cft_browser():
             "a browser the fixture does not own (isolation). Kill it "
             "(pkill -f remote-debugging-port={0}) and re-run.".format(DRIVE_TEST_PORT)
         )
-    env = os.environ.copy()
-    for _v in LANE_ENV_VARS:
-        env.pop(_v, None)
     temp_profile = tempfile.mkdtemp(prefix="jaine-cft-{}-".format(DRIVE_TEST_PORT))
-    env["CDP_PORT"] = str(DRIVE_TEST_PORT)
-    env["LOOK_PROFILE_DIR"] = temp_profile
-    env["LOOK_HEADLESS"] = "1"
-    env["LOOK_AUTOMATION"] = "1"
-    env["CHROME_APP_NAME"] = CFT_APP_NAME  # lane contract (R1-F3) — explicit > implicit
     kill_match = _kill_pattern(temp_profile)
     # DEVNULL, not PIPE: launch.sh redirects Chrome itself into the lane's
     # chrome.log; an unread PIPE could fill (64KB) and block the child.
     subprocess.Popen(
-        ["bash", LAUNCH_SCRIPT, "about:blank"], env=env,
+        ["bash", LAUNCH_SCRIPT, "about:blank"],
+        env=test_env(drop=LANE_ENV_VARS,
+                     set_vars={"CDP_PORT": str(DRIVE_TEST_PORT),
+                               "LOOK_PROFILE_DIR": temp_profile,
+                               "LOOK_HEADLESS": "1",
+                               "LOOK_AUTOMATION": "1",
+                               # lane contract (R1-F3) — explicit > implicit
+                               "CHROME_APP_NAME": CFT_APP_NAME}),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     deadline = time.time() + 20

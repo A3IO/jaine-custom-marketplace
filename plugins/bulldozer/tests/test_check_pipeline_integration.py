@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from conftest import PLUGIN_ROOT
+from conftest import PLUGIN_ROOT, test_env
 
 PARSER = PLUGIN_ROOT / "skills" / "check" / "scripts" / "parse-ledger-patch.py"
 LOG_ROUND = PLUGIN_ROOT / "skills" / "check" / "scripts" / "log-round.sh"
@@ -53,7 +53,7 @@ def run_log_round(
     depth: str = "standard",
 ) -> subprocess.CompletedProcess[str]:
     """Run log-round.sh with sandboxed BULLDOZER_REVIEW_DIR + BULLDOZER_LOG."""
-    env = os.environ.copy()
+    env = test_env()
     env["BULLDOZER_REVIEW_DIR"] = str(review_dir)
     env["BULLDOZER_LOG"] = str(log_file)
     env["BULLDOZER_DEPTH"] = depth

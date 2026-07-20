@@ -23,10 +23,11 @@ LAUNCH_TEXT = Path(LAUNCH_SCRIPT).read_text()
 # _run_launch strips them and re-adds only what a case sets. Shared with conftest's
 # fixture so the strip-list never drifts (and includes LOOK_DRY_RUN — F5b).
 from conftest import LANE_ENV_VARS as _LANE_VARS  # noqa: E402
+from conftest import test_env  # noqa: E402
 
 
 def _run_launch(args=None, env_override=None, dry_run=True, timeout=10, bash="bash"):
-    env = os.environ.copy()
+    env = test_env()
     for k in _LANE_VARS:
         env.pop(k, None)
     if dry_run:
@@ -436,10 +437,10 @@ def test_test_server_uses_threading_http_server():
 def test_fixture_strips_lane_env_vars():
     """F1 (code-review): jaine_browser must strip lane vars so the fixture is hermetic —
     a shell LOOK_DRY_RUN=1 / LOOK_HEADLESS=1 / LOOK_INSECURE=1 must not bleed into
-    launch.sh (which would dry-run-and-never-start / headless-the-daily-browser / exit 1)."""
+    launch.sh (which would dry-run-and-never-start / headless-the-daily-browser / exit 1).
+    Post-#357 the strip is expressed as test_env(drop=LANE_ENV_VARS, …)."""
     conftest_text = (PLUGIN_ROOT / "tests" / "conftest.py").read_text()
-    assert "for _v in LANE_ENV_VARS:" in conftest_text
-    assert "env.pop(_v, None)" in conftest_text
+    assert conftest_text.count("drop=LANE_ENV_VARS") >= 3  # jaine_browser, cft_browser, transient_cft_lane
 
 
 def test_lane_env_vars_includes_dry_run():
@@ -891,7 +892,7 @@ def test_update_cft_dry_run_resolves_stable():
     """CFT_DRY_RUN=1 resolves the Stable version + mac-arm64 url and exits 0
     WITHOUT downloading. Needs network (googlechromelabs JSON) — skip offline."""
     r = subprocess.run(["bash", UPDATE_CFT], capture_output=True, text=True,
-                       timeout=30, env={**os.environ, "CFT_DRY_RUN": "1"})
+                       timeout=30, env=test_env(set_vars={"CFT_DRY_RUN": "1"}))
     if r.returncode != 0 and "could not resolve" in r.stderr:
         pytest.skip("offline — CfT version endpoint unreachable")
     assert r.returncode == 0, r.stderr

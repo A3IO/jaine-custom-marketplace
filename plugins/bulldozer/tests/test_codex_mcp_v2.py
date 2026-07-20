@@ -135,7 +135,7 @@ def test_reactor_reads_frames_from_both_fds_no_deadlock():
     from codex_server import JsonRpcStream, Reactor
 
     fake = os.path.join(FIXTURES_DIR, "fake_appserver.py")
-    env = os.environ.copy()
+    env = test_env()
     env["FAKE_SCRIPT"] = "basic"
 
     proc = subprocess.Popen(
@@ -1823,7 +1823,7 @@ def test_reactor_sees_server_request_frame():
     from codex_server import JsonRpcStream, Reactor, classify
 
     fake = os.path.join(FIXTURES_DIR, "fake_appserver.py")
-    env = os.environ.copy()
+    env = test_env()
     env["FAKE_SCRIPT"] = "with_approval"
 
     proc = subprocess.Popen(
@@ -1908,6 +1908,8 @@ def test_reactor_sees_server_request_frame():
 import json as _json
 import threading as _threading
 import io as _io
+
+from conftest import test_env
 
 
 class FakeChild:
@@ -5695,7 +5697,7 @@ class TestV2Dispatcher:
 
     def _start_server(self, env_override=None):
         """Start codex_server.py as a subprocess, return Popen."""
-        env = os.environ.copy()
+        env = test_env()
         if env_override:
             env.update(env_override)
         return subprocess.Popen(
@@ -6997,7 +6999,7 @@ def test_fake_appserver_approval_uses_real_available_decisions():
     """The fake's approval request must match real codex: string + amendment dict + cancel."""
     import json, subprocess, sys, os, time
     fake = os.path.join(FIXTURES_DIR, "fake_appserver.py")
-    env = os.environ.copy(); env["FAKE_SCRIPT"] = "with_approval"
+    env = test_env(set_vars={"FAKE_SCRIPT": "with_approval"})
     proc = subprocess.Popen([sys.executable, fake], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     try:

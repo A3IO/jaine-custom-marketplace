@@ -13,11 +13,13 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from conftest import test_env
+
 CDP_SCRIPT = str(Path(__file__).parent.parent / "skills" / "look" / "scripts" / "cdp.py")
 
 
 def run_cdp(args, log_path, extra_env=None, timeout=15):
-    env = os.environ.copy()
+    env = test_env()
     env.pop("CDP_PORT", None)
     env["BULLDOZER_LOOK_LOG"] = str(log_path)
     env["CLAUDE_CODE_SESSION_ID"] = "cafebabe99"

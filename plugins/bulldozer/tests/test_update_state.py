@@ -11,12 +11,14 @@ from pathlib import Path
 
 import pytest
 
+from conftest import test_env
+
 PLUGIN_ROOT = Path(__file__).parent.parent
 SCRIPT = PLUGIN_ROOT / "skills" / "check" / "scripts" / "update-state.py"
 
 
 def run_script(args, env_override=None, cwd=None, timeout=10):
-    env = os.environ.copy()
+    env = test_env()
     if env_override is not None:
         # Caller passes None for keys they want unset
         for k, v in env_override.items():

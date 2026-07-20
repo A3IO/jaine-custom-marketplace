@@ -13,12 +13,14 @@ from pathlib import Path
 
 import pytest
 
+from conftest import test_env
+
 PLUGIN_ROOT = Path(__file__).parent.parent
 LOG_ROUND = PLUGIN_ROOT / "skills" / "check" / "scripts" / "log-round.sh"
 
 
 def _run_log_round(bash_path: str, args: list[str], env_override=None, cwd=None):
-    env = os.environ.copy()
+    env = test_env()
     if env_override:
         for k, v in env_override.items():
             if v is None:

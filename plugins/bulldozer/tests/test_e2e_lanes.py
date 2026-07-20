@@ -14,7 +14,7 @@ import pytest
 # Reuse the canonical conftest probes (PR #178 review: a private copy of the
 # /json/version probe or the post-kill wait would silently drift from the shared
 # rationale — headless=new keeps serving CDP seconds after SIGTERM).
-from conftest import CFT_BIN, LANE_ENV_VARS, _cdp_is_online, _wait_port_release
+from conftest import CFT_BIN, LANE_ENV_VARS, _cdp_is_online, _wait_port_release, test_env
 
 LAUNCH_SCRIPT = os.path.join(os.path.dirname(__file__), "..", "skills", "look", "scripts", "launch.sh")
 
@@ -32,7 +32,7 @@ def _spawn_ephemeral():
     launch.sh redirects Chrome itself into the lane's chrome.log — its own stdout
     carries only the small contract + status lines, so PIPE cannot fill (64KB).
     """
-    env = os.environ.copy()
+    env = test_env()
     for v in LANE_ENV_VARS:
         env.pop(v, None)
     env["CDP_PORT"] = "0"

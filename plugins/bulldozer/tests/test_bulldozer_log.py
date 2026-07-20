@@ -18,6 +18,8 @@ sys.path.insert(0, str(LIB_DIR))
 import bulldozer_log  # noqa: E402
 from bulldozer_log import append_line  # noqa: E402
 
+from conftest import test_env
+
 TS_RE = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}"
 
 
@@ -275,7 +277,7 @@ def test_writes_utf8_under_c_locale(tmp_path):
     # launchd/detached processes often run with LC_ALL=C (ASCII default encoding) —
     # the truncation ellipsis must not raise UnicodeEncodeError (Copilot #323).
     log = tmp_path / "x.log"
-    env = os.environ.copy()
+    env = test_env()
     env.update({"LC_ALL": "C", "LANG": "C"})
     env.pop("CLAUDE_CODE_SESSION_ID", None)
     r = subprocess.run(
@@ -294,7 +296,7 @@ CDP_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "skills" / "look" / "
 
 
 def run_cdp_log(tmp_log, snippet, extra_env=None):
-    env = os.environ.copy()
+    env = test_env()
     env.pop("CDP_PORT", None)
     env["BULLDOZER_LOOK_LOG"] = str(tmp_log)
     env["CLAUDE_CODE_SESSION_ID"] = "cafebabe99"
@@ -339,7 +341,7 @@ def test_cdp_log_works_through_symlinked_skill_dir(tmp_path):
     log = tmp_path / "look.log"
     link = tmp_path / "look-linked"
     link.symlink_to(CDP_SCRIPTS_DIR.parent)  # symlink to skills/look/
-    env = os.environ.copy()
+    env = test_env()
     env.pop("CDP_PORT", None)
     env["BULLDOZER_LOOK_LOG"] = str(log)
     env["CLAUDE_CODE_SESSION_ID"] = "cafebabe99"
@@ -363,7 +365,7 @@ def test_cdp_survives_broken_helper_module(tmp_path):
     (root / "lib").mkdir()
     (scripts / "cdp.py").write_bytes((CDP_SCRIPTS_DIR / "cdp.py").read_bytes())
     (root / "lib" / "bulldozer_log.py").write_text("def broken(:\n")  # SyntaxError
-    env = os.environ.copy()
+    env = test_env()
     env.pop("CDP_PORT", None)
     env["BULLDOZER_LOOK_LOG"] = str(tmp_path / "x.log")
     code = "import sys; sys.path.insert(0, {!r}); import cdp; cdp.log('probe')".format(

@@ -37,12 +37,13 @@ pytestmark = [
 class FacadeProc:
     """Drives the facade over real stdio, exactly as CC would."""
 
-    def __init__(self, env=None):
-        e = dict(os.environ)
-        e.update(env or {})
+    def __init__(self, extra_env=None):
+        # extra_env (NOT env): overrides merged onto the redirect-carrying base
+        # via test_env — the helper stopped accepting a caller env (#357 D3b).
+        from conftest import test_env
         self.proc = subprocess.Popen(
             [sys.executable, FACADE], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, env=e)
+            stdout=subprocess.PIPE, env=test_env(set_vars=extra_env or {}))
         self.frames = queue.Queue()
         self._stash = []
         threading.Thread(target=self._reader, daemon=True).start()
@@ -157,7 +158,7 @@ def test_legacy_bridge_rejects_the_second_concurrent_turn():
     """The baseline the facade exists to fix: on the legacy single bridge the
     SECOND concurrent tools/call hits the busy guard. Same two frames, same
     connection — only the kill switch differs."""
-    f = FacadeProc(env={"BULLDOZER_FACADE_OFF": "1"})
+    f = FacadeProc(extra_env={"BULLDOZER_FACADE_OFF": "1"})
     try:
         f.initialize()
         f.send(_run_frame(1, "Reply with exactly: ALPHA. Nothing else."))
@@ -173,7 +174,7 @@ def test_legacy_bridge_rejects_the_second_concurrent_turn():
 
 def test_kill_switch_execs_the_legacy_engine():
     """BULLDOZER_FACADE_OFF=1 → the legacy single bridge, byte-identical path."""
-    f = FacadeProc(env={"BULLDOZER_FACADE_OFF": "1"})
+    f = FacadeProc(extra_env={"BULLDOZER_FACADE_OFF": "1"})
     try:
         r = f.initialize()
         assert "FACADE" not in (r["result"].get("instructions") or "")
@@ -188,7 +189,7 @@ def test_kill_switch_execs_the_legacy_engine():
 def test_engine_audit_lines_carry_the_worker_id(facade, tmp_path):
     """The ONE engine touch: BULLDOZER_WORKER=N → `worker=N` on every audit line."""
     log = tmp_path / "codex.log"
-    f = FacadeProc(env={"BULLDOZER_CODEX_LOG": str(log)})
+    f = FacadeProc(extra_env={"BULLDOZER_CODEX_LOG": str(log)})
     try:
         f.initialize()
         f.send(_run_frame(1, "Reply with exactly: GAMMA. Nothing else."))

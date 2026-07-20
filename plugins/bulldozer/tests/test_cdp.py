@@ -17,7 +17,7 @@ CDP_SCRIPT = str(Path(__file__).parent.parent / "skills" / "look" / "scripts" / 
 
 
 def run_cdp(args, env_override=None, timeout=10):
-    env = os.environ.copy()
+    env = test_env()
     env.pop("CDP_PORT", None)
     if env_override:
         env.update(env_override)
@@ -784,6 +784,7 @@ def test_screenshot_supports_full_page():
 # --- Documentation content verification (Feedback Protocol) ---
 
 from conftest import PLUGIN_ROOT  # noqa: E402
+from conftest import test_env  # noqa: E402
 
 MARKETPLACE_JSON = PLUGIN_ROOT.parent.parent / ".claude-plugin" / "marketplace.json"
 
@@ -1998,7 +1999,7 @@ def _import_cdp(env_override=None):
         "spec.loader.exec_module(m); "
         "print(m.CHROME_APP)"
     ).format(CDP_SCRIPT)
-    env = os.environ.copy()
+    env = test_env()
     env.pop("CHROME_APP_NAME", None)
     if env_override:
         env.update(env_override)
