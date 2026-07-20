@@ -147,13 +147,14 @@ def _read_generations(path, baseline):
         # Lock ONLY when the writer's lock file already exists — the scan must
         # never CREATE files in the production dir (it is a reader). No lock
         # file ⇒ no canonical writer has touched this log; scan unlocked.
+        # O_APPEND WITHOUT O_CREAT makes that atomic — no exists→open TOCTOU
+        # window that could recreate a just-deleted lock (Copilot, PR #358).
         lock_path = str(path) + ".lock"
         try:
-            if os.path.exists(lock_path):
-                lock_fh = open(lock_path, "a")
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_SH)
+            lock_fh = os.fdopen(os.open(lock_path, os.O_WRONLY | os.O_APPEND), "a")
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_SH)
         except OSError:
-            lock_fh = None  # lock unavailable → still scan, unlocked
+            lock_fh = None  # absent lock / lock unavailable → scan unlocked
         texts = []
 
         def _full(p):
