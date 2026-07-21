@@ -1191,3 +1191,410 @@ def test_isolated_lanes_unaffected_by_the_daily_gate():
     assert r.returncode == 0, "derived isolated lane broke: {}".format(r.stderr)
     r = _run_launch(env_override={"CDP_PORT": "9334", "LOOK_PROFILE_DIR": "/tmp/lane-x"})
     assert r.returncode == 0, "explicit isolated lane broke: {}".format(r.stderr)
+
+
+# ── #187 Proposal A: --auto-lane ──────────────────────────────────────────────
+# Spec: docs/superpowers/specs/2026-07-21-look-auto-lane-design.md (§8.1, §8.5)
+# Offline (dry-run + spawn-free real-launch) coverage. Live lifecycle: test_e2e.py.
+
+from conftest import TEST_SENTINEL as _SENTINEL  # noqa: E402
+
+EXPECTED_DEFAULT_CONFIG_LINES = [
+    "LOOK_DRY_RUN",
+    "port=9333",
+    "profile=/0/.jaine/.browser/profile",
+    "profile_overridden=0",
+    "headless=0",
+    "insecure=0",
+    "automation=0",
+    "ephemeral=0",
+    "cert_spki=",
+    "local_state_patch=1",
+    "osascript=1",
+    "window_position=100,100",
+    "chrome_bin=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "app_name=Google Chrome",
+    "log=/0/.jaine/.browser/chrome.log",
+    "kill_match=--user-data-dir=/0/\\.jaine/\\.browser/profile($|[[:space:]])",
+    "ARGV",
+]
+
+
+def _cksum_of(value):
+    """Mirror of the launch.sh key derivation: cksum CRC of the raw key string."""
+    out = subprocess.run(["cksum"], input=value.encode(), capture_output=True)
+    return int(out.stdout.split()[0])
+
+
+def _key8(value):
+    return format(_cksum_of(value), "08x")
+
+
+def _auto(args=None, env_override=None, tmpdir=None, dry_run=True, bash="bash"):
+    env = {"TMPDIR": tmpdir} if tmpdir else {}
+    env.update(env_override or {})
+    return _run_launch(args=["--auto-lane"] + (args or []), env_override=env,
+                       dry_run=dry_run, bash=bash)
+
+
+def test_default_dryrun_full_stdout_is_byte_identical(tmp_path):
+    """§8.1.1 (R1-F2): the no-flag dry-run stdout is pinned IN FULL — config block
+    AND argv — so ANY additive drift (e.g. an accidental auto_lane= key) fails."""
+    r = _run_launch(env_override={"TMPDIR": str(tmp_path)})
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.splitlines()
+    assert lines == EXPECTED_DEFAULT_CONFIG_LINES + EXPECTED_DEFAULT_ARGV, \
+        "no-flag dry-run stdout drifted:\n{}".format(r.stdout)
+
+
+def test_auto_lane_dryrun_shape(tmp_path):
+    """§8.1.2: flag on → auto_lane=1, port=0, derived key8 profile, headless
+    default 1, profile_overridden=1, reuse reported with a reason."""
+    r = _auto(tmpdir=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    cfg, argv = _parse_dryrun(r.stdout)
+    assert cfg["auto_lane"] == "1"
+    assert cfg["port"] == "0"
+    assert cfg["profile"] == str(tmp_path) + "/look-lane-" + _key8(_SENTINEL)
+    assert cfg["profile_overridden"] == "1"
+    assert cfg["headless"] == "1"
+    assert cfg["auto_lane_reuse"] == "0"
+    assert cfg["auto_lane_reuse_reason"] == "no-process"
+    assert "--remote-debugging-port=0" in argv
+    assert "--headless=new" in argv
+
+
+def test_auto_lane_deterministic_and_ppid_fallback(tmp_path):
+    """§8.1.3: sentinel → same profile twice + golden key8; empty session id via
+    the centrally allowlisted unsafe route → PPID fallback, well-formed, different."""
+    r1 = _auto(tmpdir=str(tmp_path))
+    r2 = _auto(tmpdir=str(tmp_path))
+    p1 = _parse_dryrun(r1.stdout)[0]["profile"]
+    assert p1 == _parse_dryrun(r2.stdout)[0]["profile"]
+    assert p1.endswith("look-lane-" + _key8(_SENTINEL))
+
+    env = test_env(set_vars={"CLAUDE_CODE_SESSION_ID": ""},
+                   unsafe_allow=("CLAUDE_CODE_SESSION_ID",))
+    for k in _LANE_VARS:
+        env.pop(k, None)
+    env["LOOK_DRY_RUN"] = "1"
+    env["TMPDIR"] = str(tmp_path)
+    r3 = subprocess.run(["bash", LAUNCH_SCRIPT, "--auto-lane"],
+                        capture_output=True, text=True, timeout=10, env=env)
+    assert r3.returncode == 0, r3.stderr
+    p3 = _parse_dryrun(r3.stdout)[0]["profile"]
+    assert re.search(r"/look-lane-[0-9a-f]{8}$", p3), p3
+    assert p3 != p1, "PPID fallback produced the sentinel-derived profile"
+
+
+def test_auto_lane_distinct_tmpdirs_distinct_profiles(tmp_path):
+    """§8 preamble (R6-F1): the per-test TMPDIR isolation mechanism itself."""
+    a = tmp_path / "a"; b = tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    pa = _parse_dryrun(_auto(tmpdir=str(a)).stdout)[0]["profile"]
+    pb = _parse_dryrun(_auto(tmpdir=str(b)).stdout)[0]["profile"]
+    assert pa != pb
+
+
+def test_auto_lane_headless_precedence(tmp_path):
+    """§8.1.4 (R1-F8): arg > LOOK_HEADLESS presence > auto-lane default 1."""
+    assert _parse_dryrun(_auto(["--headful"], tmpdir=str(tmp_path)).stdout)[0]["headless"] == "0"
+    assert _parse_dryrun(_auto(env_override={"LOOK_HEADLESS": "0"}, tmpdir=str(tmp_path)).stdout)[0]["headless"] == "0"
+    assert _parse_dryrun(_auto(env_override={"LOOK_HEADLESS": "1"}, tmpdir=str(tmp_path)).stdout)[0]["headless"] == "1"
+    assert _parse_dryrun(_auto(tmpdir=str(tmp_path)).stdout)[0]["headless"] == "1"
+
+
+@pytest.mark.parametrize("port", ["9350", "9333", "0", ""])
+def test_auto_lane_rejects_env_cdp_port_with_attribution(port, tmp_path):
+    """§8.1.5 (R2-F2): presence semantics — every legacy-surviving value errors
+    with the AUTO-LANE text, not the SP4 ephemeral-gate text."""
+    r = _auto(env_override={"CDP_PORT": port}, tmpdir=str(tmp_path))
+    assert r.returncode != 0
+    assert "--auto-lane" in r.stderr, r.stderr
+    assert "ephemeral lane" not in r.stderr.split("--auto-lane")[0], \
+        "SP4 gate fired before the auto-lane exclusion:\n" + r.stderr
+
+
+def test_auto_lane_garbage_port_keeps_legacy_error(tmp_path):
+    """§8.1.5 carve-out: legacy-invalid CDP_PORT dies in legacy validation
+    (pinned accepted outcome — the invariant is no-launch)."""
+    r = _auto(env_override={"CDP_PORT": "abc"}, tmpdir=str(tmp_path))
+    assert r.returncode != 0
+    assert "CDP_PORT must be an integer" in r.stderr
+
+
+def test_auto_lane_combined_daily_override_keeps_legacy_gate(tmp_path):
+    """§8.1.5 carve-out (R2-F2 v3): combined valid port + daily profile trips the
+    unconditional #160 SAFETY gate pre-parser; legacy diagnostic pinned."""
+    r = _auto(env_override={"CDP_PORT": "9350", "LOOK_PROFILE_DIR": DAILY_PROFILE},
+              tmpdir=str(tmp_path))
+    assert r.returncode != 0
+    assert "DAILY" in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("profile", ["/tmp/x", ""])
+def test_auto_lane_rejects_env_profile_dir(profile, tmp_path):
+    r = _auto(env_override={"LOOK_PROFILE_DIR": profile}, tmpdir=str(tmp_path))
+    assert r.returncode != 0
+    assert "--auto-lane" in r.stderr, r.stderr
+
+
+def test_auto_lane_rejects_automation(tmp_path):
+    """§8.1.5: both spellings; error points at the CfT ephemeral path."""
+    r = _auto(["--automation"], tmpdir=str(tmp_path))
+    assert r.returncode != 0 and "CDP_PORT=0 --automation" in r.stderr
+    r = _auto(env_override={"LOOK_AUTOMATION": "1"}, tmpdir=str(tmp_path))
+    assert r.returncode != 0 and "CDP_PORT=0 --automation" in r.stderr
+
+
+def test_auto_lane_composes_with_insecure_and_cert(tmp_path):
+    """§8.1.6: the auto-lane profile satisfies the isolated-lane gates."""
+    r = _auto(["--insecure"], tmpdir=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert _parse_dryrun(r.stdout)[0]["insecure"] == "1"
+    pin = "A" * 43 + "="
+    r = _auto(["--cert-spki=" + pin], tmpdir=str(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert _parse_dryrun(r.stdout)[0]["cert_spki"] == pin
+
+
+def test_auto_lane_backslash_tmpdir_rejected(tmp_path):
+    bad = str(tmp_path) + "/bad\\dir"
+    os.makedirs(bad, exist_ok=True)
+    r = _auto(tmpdir=bad)
+    assert r.returncode != 0
+    assert "backslash" in r.stderr
+
+
+def test_auto_lane_daily_alias_fail_closed(tmp_path):
+    """§8.1.7 (R1-F3): a TMPDIR whose derived profile resolves into the daily
+    profile must die in the arm's re-check, not launch."""
+    (tmp_path / ("look-lane-" + _key8(_SENTINEL))).symlink_to(DAILY_PROFILE)
+    r = _auto(tmpdir=str(tmp_path))
+    assert r.returncode != 0
+    assert "daily" in r.stderr.lower()
+
+
+@pytest.mark.parametrize("case", ["shape", "exclusion", "golden"])
+def test_auto_lane_bash32(case, tmp_path):
+    """§8.1.8: macOS system bash 3.2 runs the same arms."""
+    if case == "shape":
+        r = _auto(tmpdir=str(tmp_path), bash="/bin/bash")
+        assert r.returncode == 0 and _parse_dryrun(r.stdout)[0]["auto_lane"] == "1"
+    elif case == "exclusion":
+        r = _auto(env_override={"CDP_PORT": "9350"}, tmpdir=str(tmp_path), bash="/bin/bash")
+        assert r.returncode != 0 and "--auto-lane" in r.stderr
+    else:
+        r = _auto(tmpdir=str(tmp_path), bash="/bin/bash")
+        assert _parse_dryrun(r.stdout)[0]["profile"].endswith(_key8(_SENTINEL))
+
+
+def test_auto_lane_lane_fail_log_carries_marker(tmp_path):
+    """§8.1.9: auto-lane failure line carries auto_lane=1; no-flag line does not."""
+    log = tmp_path / "drive.log"
+    r = _auto(dry_run=False, tmpdir=str(tmp_path),
+              env_override={"CHROME_BIN": "/nonexistent-chrome",
+                            "BULLDOZER_DRIVE_LOG": str(log)})
+    assert r.returncode != 0
+    text = log.read_text()
+    assert "lane-fail" in text and "auto_lane=1" in text
+
+    log2 = tmp_path / "drive2.log"
+    r = _run_launch(dry_run=False,
+                    env_override={"CDP_PORT": "9350", "TMPDIR": str(tmp_path),
+                                  "CHROME_BIN": "/nonexistent-chrome",
+                                  "BULLDOZER_DRIVE_LOG": str(log2)})
+    assert r.returncode != 0
+    assert "auto_lane" not in log2.read_text()
+
+
+def test_auto_lane_headful_window_position_from_key8(tmp_path):
+    """§8.1.10 (R1-F3): headful placement derives from key8 (pre-launch input),
+    pinned at dry-run AND argv level."""
+    r = _auto(["--headful"], tmpdir=str(tmp_path))
+    cfg, argv = _parse_dryrun(r.stdout)
+    off = _cksum_of(_SENTINEL) % 1200
+    want = "{},{}".format(100 + off, 100 + off)
+    assert cfg["window_position"] == want
+    assert "--window-position=" + want in argv
+
+
+def test_auto_lane_stale_devtools_file_fail_closed(tmp_path):
+    """§8.1.11 (R1-F1): un-removable stale DevToolsActivePort → exit 1 BEFORE any
+    spawn, stderr names the stale file."""
+    profile = tmp_path / ("look-lane-" + _key8(_SENTINEL))
+    profile.mkdir()
+    (profile / "DevToolsActivePort").write_text("9999\n/devtools/browser/x")
+    profile.chmod(0o555)
+    try:
+        r = _auto(dry_run=False, tmpdir=str(tmp_path),
+                  env_override={"CHROME_BIN": "/usr/bin/true",
+                                "BULLDOZER_DRIVE_LOG": str(tmp_path / "d.log")})
+        assert r.returncode != 0
+        assert "DevToolsActivePort" in r.stderr
+    finally:
+        profile.chmod(0o755)
+
+
+def _decoy(profile, extra_args):
+    """A main-process decoy: argv carries the profile + signature flags, no --type=."""
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)",
+         "--user-data-dir=" + str(profile)] + extra_args)
+
+
+@pytest.mark.parametrize("decoy_flags,reason", [
+    ([], "config-mismatch"),                                   # headless-only diff (request defaults headless=1)
+    (["--headless=new", "--disable-web-security"], "config-mismatch"),  # insecure-only diff
+    (["--headless=new", "--ignore-certificate-errors-spki-list=" + "A" * 43 + "="], "config-mismatch"),  # cert-only diff
+    (["--headless=new", "--type=renderer"], "no-process"),     # child process, not main
+    (["--headless=new"], "unhealthy"),                         # full match, no DevToolsActivePort
+])
+def test_auto_lane_pass0_signature_arms(decoy_flags, reason, tmp_path):
+    """§8.1.12 (R2-F1): per-field cmdline-signature classification via
+    auto_lane_reuse_reason; argv[0] is NOT compared (§4.4)."""
+    profile = tmp_path / ("look-lane-" + _key8(_SENTINEL))
+    profile.mkdir()
+    proc = _decoy(profile, decoy_flags)
+    try:
+        import time as _t
+        _t.sleep(0.3)  # let the decoy appear in the process table
+        r = _auto(tmpdir=str(tmp_path))
+        assert r.returncode == 0, r.stderr
+        cfg = _parse_dryrun(r.stdout)[0]
+        assert cfg["auto_lane_reuse"] == "0"
+        assert cfg["auto_lane_reuse_reason"] == reason, r.stdout
+    finally:
+        proc.kill()
+
+
+def _fake_json_version(uuid, port_holder):
+    """Test-owned /json/version endpoint (§8.1.13)."""
+    import http.server, threading, json as _json
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = _json.dumps({"webSocketDebuggerUrl":
+                                "ws://localhost:{}/devtools/browser/{}".format(
+                                    self.server.server_address[1], uuid)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    port_holder.append(srv.server_address[1])
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+@pytest.mark.parametrize("uuid_matches,reuse,reason", [
+    (False, "0", "identity-mismatch"),
+    (True, "1", "ok"),
+])
+def test_auto_lane_pass0_identity_binding(uuid_matches, reuse, reason, tmp_path):
+    """§8.1.13 (R1-F1): the answering endpoint's browser uuid must equal the
+    file's line 2 — a recycled-port impostor is never reused, a match is."""
+    profile = tmp_path / ("look-lane-" + _key8(_SENTINEL))
+    profile.mkdir()
+    ports = []
+    srv = _fake_json_version("uuid-real" if uuid_matches else "uuid-impostor", ports)
+    (profile / "DevToolsActivePort").write_text(
+        "{}\n/devtools/browser/uuid-real".format(ports[0]))
+    proc = _decoy(profile, ["--headless=new"])
+    try:
+        import time as _t
+        _t.sleep(0.3)
+        r = _auto(tmpdir=str(tmp_path))
+        assert r.returncode == 0, r.stderr
+        cfg = _parse_dryrun(r.stdout)[0]
+        assert cfg["auto_lane_reuse"] == reuse, r.stdout
+        assert cfg["auto_lane_reuse_reason"] == reason, r.stdout
+    finally:
+        proc.kill()
+        srv.shutdown()
+
+
+def test_port_registry_untouched_by_auto_lane():
+    """§8.5: the port-0 model claims ZERO registry edits — pin it."""
+    conftest_src = (Path(__file__).parent / "conftest.py").read_text()
+    assert "9340-9349" in conftest_src and "DRIVE_TEST_PORT = 9359" in conftest_src
+    lanes_src = (Path(__file__).parent / "test_e2e_lanes.py").read_text()
+    assert "range(9330, 9370)" in lanes_src
+
+
+def test_auto_lane_signature_ignores_url_substring(tmp_path):
+    """codex-review F1: switch detection must be token-boundary — a URL argv
+    token CONTAINING '--disable-web-security' is not a Chrome switch."""
+    profile = tmp_path / ("look-lane-" + _key8(_SENTINEL))
+    profile.mkdir()
+    proc = _decoy(profile, ["--headless=new", "http://x.test/?q=--disable-web-security"])
+    try:
+        import time as _t
+        _t.sleep(0.3)
+        r = _auto(tmpdir=str(tmp_path))
+        assert r.returncode == 0, r.stderr
+        cfg = _parse_dryrun(r.stdout)[0]
+        assert cfg["auto_lane_reuse_reason"] != "config-mismatch", \
+            "URL substring misread as a real switch:\n" + r.stdout
+        assert cfg["auto_lane_reuse_reason"] == "unhealthy"  # full sig match, no DevToolsActivePort
+    finally:
+        proc.kill()
+
+
+def test_auto_lane_reuse_revalidates_before_contract(tmp_path):
+    """codex-review F2: between pass 0 and the contract print another call can
+    kill/relaunch the lane — the reuse exit must revalidate identity and fail
+    loud instead of printing a dead port. Modeled with a one-shot endpoint:
+    pass 0 consumes the only answer, revalidation gets nothing."""
+    import http.server, threading, json as _json
+
+    class OneShot(http.server.BaseHTTPRequestHandler):
+        served = [0]
+        def do_GET(self):
+            if self.served[0]:
+                self.send_response(404); self.end_headers(); return
+            self.served[0] = 1
+            body = _json.dumps({"webSocketDebuggerUrl":
+                                "ws://localhost:{}/devtools/browser/uuid-real".format(
+                                    self.server.server_address[1])}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), OneShot)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    profile = tmp_path / ("look-lane-" + _key8(_SENTINEL))
+    profile.mkdir()
+    (profile / "DevToolsActivePort").write_text(
+        "{}\n/devtools/browser/uuid-real".format(port))
+    proc = _decoy(profile, ["--headless=new"])
+    try:
+        import time as _t
+        _t.sleep(0.3)
+        r = _auto(dry_run=False, tmpdir=str(tmp_path),
+                  env_override={"BULLDOZER_DRIVE_LOG": str(tmp_path / "d.log")})
+        assert r.returncode != 0, \
+            "reuse printed a contract without revalidation:\n" + r.stdout
+        assert "LANE_REUSED=1" not in r.stdout
+    finally:
+        proc.kill()
+        srv.shutdown()
+
+
+def test_auto_lane_whitespace_tmpdir_rejected(tmp_path):
+    """codex-review r2 F3: ps flattens argv, so a PROFILE_DIR containing
+    whitespace could embed switch-shaped text inside one argv element and
+    confuse the cmdline signature. Refuse fail-loud (backslash-guard mirror)."""
+    bad = str(tmp_path) + "/has space"
+    os.makedirs(bad, exist_ok=True)
+    r = _auto(tmpdir=bad)
+    assert r.returncode != 0
+    assert "whitespace" in r.stderr, r.stderr

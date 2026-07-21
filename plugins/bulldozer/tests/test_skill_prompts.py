@@ -954,3 +954,107 @@ class TestE1AnchorContractInEnvelope:
             assert key in after, "per-class anchor key {} undocumented".format(key)
         assert "e1-evidence-schema.json" in after, \
             "no pointer to the schema that defines anchor_by_class"
+
+
+class TestAutoLaneQuickInvoke:
+    """#187 Proposal A §8.3: Quick Invoke is route-first with two complete
+    branches; the auto-lane branch is structurally bounded and port-pinned."""
+
+    def _look(self):
+        return (PLUGIN_ROOT / "skills" / "look" / "SKILL.md").read_text()
+
+    def _auto_branch(self):
+        text = self._look()
+        m = re.search(r"### Auto-lane branch.*?(?=\n##)", text, re.DOTALL)
+        assert m, "auto-lane branch heading missing — the extraction marker is part of the contract"
+        return m.group(0)
+
+    def test_routing_before_any_status_probe(self):
+        """R1-F4: the routing decision precedes the first cdp.py status call."""
+        text = self._look()
+        route = text.find("Shared or isolated")
+        status = text.find('"$CDP" status')
+        assert route != -1 and status != -1
+        assert route < status, "routing decision must come before the 9333 status probe"
+
+    def test_both_branch_headings_exist(self):
+        text = self._look()
+        assert "### 9333 branch" in text
+        assert "### Auto-lane branch" in text
+
+    def test_auto_branch_every_cdp_call_is_port_pinned(self):
+        """R1-F4 v2: EVERY "$CDP" invocation inside the branch carries the
+        literal CDP_PORT= prefix — any unprefixed call fails this."""
+        branch = self._auto_branch()
+        cdp_lines = [ln for ln in branch.splitlines() if '"$CDP"' in ln]
+        assert len(cdp_lines) >= 2, "branch too thin to be executable:\n" + branch
+        for ln in cdp_lines:
+            assert re.search(r'CDP_PORT=\S+ python3 "\$CDP"', ln), \
+                "unpinned $CDP call in the auto-lane branch: " + ln
+
+    def test_auto_branch_launch_line(self):
+        """R1-F5 v2 + R3-F3: literal --headless, no URL argument on the launch
+        line; navigation is explicit, loader-aware, and skippable without URL."""
+        branch = self._auto_branch()
+        launch_lines = [ln for ln in branch.splitlines() if "--auto-lane" in ln and "$LAUNCH" in ln]
+        assert launch_lines, "no launch line in the auto-lane branch"
+        assert any("--headless" in ln for ln in launch_lines)
+        for ln in launch_lines:
+            assert "http" not in ln and "<parsed URL" not in ln, \
+                "launch line must not carry a URL: " + ln
+        assert re.search(r'navigate "<parsed URL>" --wait', branch), \
+            "navigate must be loader-aware (--wait)"
+        assert "skip" in branch and "about:blank" in branch, \
+            "no explicit no-URL path in the branch"
+
+    def test_routing_table_pins_all_three_classes(self):
+        """R1-F4 v3: user-context/headful → 9333; agent-own → auto-lane;
+        ambiguous → auto-lane + announce."""
+        text = self._look()
+        m = re.search(r"## Quick Invoke.*?(?=\n### 9333 branch)", text, re.DOTALL)
+        assert m, "routing rule section missing"
+        rule = m.group(0)
+        for kw in ("логин", "co-brows", "headful"):
+            assert kw in rule.lower(), "9333-class keyword missing from routing: " + kw
+        for kw in ("file://", "localhost"):
+            assert kw in rule, "agent-own keyword missing from routing: " + kw
+        assert re.search(r"[Aa]mbiguous.*auto-lane|[Нн]еоднозначн.*auto-lane", rule, re.DOTALL), \
+            "ambiguous→auto-lane default not stated"
+        assert "изолированной lane" in rule or "announce" in rule.lower(), \
+            "port announcement instruction missing"
+
+    def test_9333_branch_survived_restructure(self):
+        """PR #337 rules stay: open-own-tab + pin every command."""
+        text = self._look()
+        m = re.search(r"### 9333 branch.*?(?=\n### Auto-lane branch)", text, re.DOTALL)
+        assert m, "9333 branch heading missing"
+        branch = m.group(0)
+        assert '"$CDP" open' in branch
+        assert "--target" in branch
+        assert "active tab is never yours" in self._look()
+
+    def test_frontmatter_mentions_auto_lane(self):
+        text = self._look()
+        frontmatter = text.split("---", 2)[1]
+        desc = [ln for ln in frontmatter.splitlines() if ln.startswith("description:")]
+        assert desc and "--auto-lane" in desc[0], \
+            "frontmatter description must point at the mechanism"
+
+    def test_quick_reference_has_zsh_hint_example(self):
+        """§5: the one-line zsh word-splitting example lands in Quick Reference."""
+        assert "${=VAR}" in self._look()
+
+
+class TestAutoLaneDocCoherence:
+    """codex-review F3: the older 'Shared or isolated' section must route
+    agent-own /look tasks to --auto-lane, not to the CfT automation lane."""
+
+    def test_shared_section_names_auto_lane(self):
+        text = (PLUGIN_ROOT / "skills" / "look" / "SKILL.md").read_text()
+        m = re.search(r"\n## Shared or isolated.*?(?=\n## )", text, re.DOTALL)
+        assert m, "'Shared or isolated' section missing"
+        section = m.group(0)
+        assert "--auto-lane" in section, \
+            "agent-own tasks in this section must point at the auto-lane path"
+        assert "CDP_PORT=0 --automation" not in section, \
+            "conflicting CfT-automation recipe still offered for /look tasks"

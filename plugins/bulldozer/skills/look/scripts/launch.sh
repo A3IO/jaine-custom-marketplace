@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # writer (sanitization/rotation/session); fail-open — never blocks the launch.
 _log_lane() {
   [[ "${CDP_PORT:-9333}" == "9333" ]] && return 0
+  # #187: auto-lane lines carry the marker; no-flag lines stay byte-compatible.
+  if (( ${AUTO_LANE:-0} )); then set -- "$@" "auto_lane=1"; fi
   python3 "$SCRIPT_DIR/../../../lib/bulldozer_log.py"     "${BULLDOZER_DRIVE_LOG:-${HOME:-}/.claude/hooks/bulldozer-drive.log}" "$@" || true
 }
 
@@ -61,6 +63,11 @@ PY
 }
 
 # ── Config ──
+# #187 Phase A: presence snapshot BEFORE the defaulting line below destroys the
+# unset-vs-set distinction (the auto-lane exclusions are presence-based; a
+# set-but-empty value still counts as set — spec §4.1).
+_CDP_PORT_WAS_SET=${CDP_PORT+x}
+_LOOK_PROFILE_DIR_WAS_SET=${LOOK_PROFILE_DIR+x}
 CDP_PORT="${CDP_PORT:-9333}"
 
 # Port must be an integer in 1..65535. The {1,5} digit bound rejects non-numeric AND
@@ -175,6 +182,7 @@ fi
 HEADLESS_ARG=""    # "", "0" (headful) or "1" (headless)
 INSECURE_ARG=0
 AUTOMATION_ARG=0
+AUTO_LANE_ARG=0
 CERT_SPKI_ARG=""
 URL=""
 URL_SET=0
@@ -190,15 +198,43 @@ for a in "$@"; do
     --headful)  HEADLESS_ARG=0 ;;
     --insecure) INSECURE_ARG=1 ;;
     --automation) AUTOMATION_ARG=1 ;;
+    --auto-lane) AUTO_LANE_ARG=1 ;;
     --cert-spki=*) CERT_SPKI_ARG="${a#--cert-spki=}" ;;
     --*)
-      echo "ERROR: unknown flag '$a' (look launcher accepts --headless/--headful/--insecure/--automation/--cert-spki=<PIN>)" >&2
+      echo "ERROR: unknown flag '$a' (look launcher accepts --headless/--headful/--insecure/--automation/--auto-lane/--cert-spki=<PIN>)" >&2
       exit 1
       ;;
     *) if (( ! URL_SET )); then URL="$a"; URL_SET=1; fi ;;
   esac
 done
 if (( ! URL_SET )); then URL="about:blank"; fi
+
+# ── #187 Phase B: auto-lane exclusion preflight — BEFORE the ephemeral and
+#    automation gates, so a conflicting request dies with AUTO-LANE attribution
+#    (spec §4.1: `CDP_PORT=0 --auto-lane` must not surface the SP4 gate text,
+#    and `--automation --auto-lane` must not run the automation arm first).
+#    The automation request is computed LOCALLY here — the canonical
+#    AUTOMATION_REQUESTED resolution runs later, after the ephemeral block. ──
+if (( AUTO_LANE_ARG )); then
+  if [[ -n "$_CDP_PORT_WAS_SET" ]]; then
+    echo "ERROR: --auto-lane owns port selection (OS-assigned via port 0) — unset CDP_PORT." >&2
+    echo "       (env CDP_PORT was set; any value, including empty, conflicts with --auto-lane)" >&2
+    exit 1
+  fi
+  if [[ -n "$_LOOK_PROFILE_DIR_WAS_SET" ]]; then
+    echo "ERROR: --auto-lane owns the lane profile (session-keyed temp dir) — unset LOOK_PROFILE_DIR." >&2
+    exit 1
+  fi
+  shopt -s nocasematch
+  _alb_env_auto=0
+  [[ "${LOOK_AUTOMATION:-}" =~ ^(1|true|yes)$ ]] && _alb_env_auto=1
+  shopt -u nocasematch
+  if (( AUTOMATION_ARG )) || (( _alb_env_auto )); then
+    echo "ERROR: --auto-lane is the stock-Chrome /look lane; the CfT automation path has its" >&2
+    echo "       own isolated-lane mechanics — use CDP_PORT=0 --automation instead." >&2
+    exit 1
+  fi
+fi
 
 # #60: normalize a bare absolute path to a file:// URL. Delegate to
 # `cdp.py normalize-url` — the SINGLE source of truth. Cheap-skip non-slash URLs.
@@ -310,6 +346,62 @@ if (( AUTOMATION_REQUESTED )); then
   fi
 fi
 
+# ── #187 Phase C: auto-lane mutation arm (spec §4.2/§4.3). Sits AFTER the
+#    automation arm (its exclusions already rejected composition) and BEFORE the
+#    insecure/cert gates (PROFILE_OVERRIDDEN=1 lets them pass on the isolated
+#    profile). Recomputes EVERY profile/port-dependent value the config section
+#    resolved with vacuous defaults. ──
+AUTO_LANE=0
+AUTO_LANE_REUSE=0
+AUTO_LANE_REUSE_REASON=""
+AUTO_LANE_REUSE_PORT=""
+if (( AUTO_LANE_ARG )); then
+  AUTO_LANE=1
+  CDP_PORT=0            # internal port-0 launch; NOT the SP4 ephemeral arm (EPHEMERAL stays 0)
+  _al_key="${CLAUDE_CODE_SESSION_ID:-}"
+  if [[ -z "$_al_key" ]]; then _al_key="$PPID"; fi
+  _al_crc=$(printf '%s' "$_al_key" | cksum | cut -d' ' -f1)
+  _al_key8=$(printf '%08x' "$_al_crc")
+  PROFILE_DIR="${TMPDIR:-/tmp}/look-lane-${_al_key8}"
+  # Mirror of the top-of-file guard: this path is derived AFTER it ran (§4.3.3).
+  if [[ "$PROFILE_DIR" == *\\* || "$PROFILE_DIR" == *$'\n'* ]]; then
+    echo "ERROR: TMPDIR-derived auto-lane profile must not contain a backslash or newline (got: $PROFILE_DIR)" >&2
+    exit 1
+  fi
+  # Whitespace guard (codex-review r2): ps -o command= flattens argv, so a
+  # profile path containing spaces could embed switch-shaped text inside ONE
+  # argv element and confuse the token-boundary signature derivation (§4.4).
+  # Refuse fail-loud — the whole confusion class dies here (macOS TMPDIRs are
+  # whitespace-free; spaced ones are exotic).
+  if [[ "$PROFILE_DIR" == *[[:space:]]* ]]; then
+    echo "ERROR: TMPDIR-derived auto-lane profile must not contain whitespace (got: $PROFILE_DIR)" >&2
+    exit 1
+  fi
+  # Daily-profile re-check, fail-closed (§4.3.4): the config-time #160 gate ran
+  # BEFORE this arm and checked the wrong values; a TMPDIR alias/symlink that
+  # resolves into the daily profile must die here, not launch.
+  if [[ "$(_resolves_to_daily_profile "$PROFILE_DIR")" != "0" ]]; then
+    echo "ERROR: auto-lane profile resolves to the DAILY browser's profile" >&2
+    echo "       ($PROFILE_DIR). Refusing (daily-profile fail-closed re-check)." >&2
+    exit 1
+  fi
+  PROFILE_OVERRIDDEN=1
+  LOG="$PROFILE_DIR/chrome.log"
+  # Headless default ON for auto-lane (§4.6): arg > LOOK_HEADLESS PRESENCE >
+  # auto-default 1. The earlier resolution already applied arg/env; only the
+  # both-absent case flips.
+  if [[ -z "$HEADLESS_ARG" && -z "${LOOK_HEADLESS+x}" ]]; then
+    HEADLESS=1
+  fi
+  # Window position from key8 (§4.3.6): the OS port is unknown pre-launch, while
+  # --window-position must be in CHROME_ARGV before Chrome starts (R1-F3).
+  _al_off=$(( 16#$_al_key8 % 1200 ))
+  _al_norm=$(( ((_al_off % 1200) + 1200) % 1200 ))
+  WINDOW_X=$(( 100 + _al_norm ))
+  WINDOW_Y=$(( 100 + _al_norm ))
+  WINDOW_POSITION="${WINDOW_X},${WINDOW_Y}"
+fi
+
 # ── Web-security relax (D, #93): opt-in --insecure / LOOK_INSECURE, gated to a
 #    provably-isolated lane. The D.1 spike confirmed --disable-web-security unblocks a
 #    file:// page fetching http://<LAN>; it needs a non-default --user-data-dir, which
@@ -398,6 +490,95 @@ fi
 #    `…/profile` never kills `…/profile-9334` (A.5) ──
 KILL_MATCH="--user-data-dir=$(_escape_ere "$PROFILE_DIR")(\$|[[:space:]])"
 
+# ── #187 pass 0 (spec §4.4): reuse detection for the auto-lane. Pure reads
+#    (pgrep/ps/file/curl) — runs in dry-run too, reported via the
+#    auto_lane_reuse_reason key. Sits AFTER the insecure/cert gates so the
+#    REQUEST signature (headless/insecure/cert) is final. ──
+
+# Cmdline-derived config signature (§4.4): the one artifact a parallel-launch
+# race cannot falsify. argv[0] is deliberately NOT a field.
+_al_sig_of_cmd() {  # $1 = full command line
+  # Token-boundary matching (codex-review F1): a URL argv token can CONTAIN
+  # switch text (`?q=--disable-web-security`) without BEING the switch —
+  # substring scans would misclassify it. Chrome switches are always
+  # whitespace-delimited tokens; padding both sides gives every token a boundary.
+  local h=0 i=0 c="" _padded=" $1 " _re='(^|[[:space:]])--ignore-certificate-errors-spki-list=([^[:space:]]*)'
+  [[ "$_padded" == *" --headless=new "* ]] && h=1
+  [[ "$_padded" == *" --disable-web-security "* ]] && i=1
+  if [[ "$1" =~ $_re ]]; then c="${BASH_REMATCH[2]}"; fi
+  printf 'headless=%s|insecure=%s|cert=%s' "$h" "$i" "$c"
+}
+
+_al_request_sig() {
+  printf 'headless=%s|insecure=%s|cert=%s' "$HEADLESS" "$INSECURE" "$CERT_SPKI"
+}
+
+# Main browser process for the profile: pgrep match WITHOUT a --type= flag
+# (Chromium convention: every child carries --type=…). Echoes "pid|cmdline"
+# lines.
+_al_main_processes() {
+  local _pid _cmd
+  pgrep -f -- "$KILL_MATCH" 2>/dev/null | while read -r _pid; do
+    [[ -n "$_pid" ]] || continue
+    _cmd=$(ps -o command= -p "$_pid" 2>/dev/null)
+    [[ -n "$_cmd" ]] || continue
+    [[ "$_cmd" == *" --type="* ]] && continue
+    printf '%s|%s\n' "$_pid" "$_cmd"
+  done
+}
+
+# Browser websocket path of the endpoint answering /json/version on $1 —
+# the identity half of the reuse check (§4.4: must equal DevToolsActivePort
+# line 2 exactly).
+_al_ws_path() {
+  curl -s -m 2 "http://localhost:$1/json/version" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    u = json.load(sys.stdin)["webSocketDebuggerUrl"]
+    print("/" + u.split("/", 3)[3])
+except Exception:
+    pass'
+}
+
+if (( AUTO_LANE )); then
+  _al_mains=$(_al_main_processes)
+  _al_main_count=0
+  if [[ -n "$_al_mains" ]]; then
+    _al_main_count=$(printf '%s\n' "$_al_mains" | grep -c .)
+  fi
+  if (( _al_main_count == 0 )); then
+    AUTO_LANE_REUSE_REASON="no-process"
+  elif (( _al_main_count > 1 )); then
+    AUTO_LANE_REUSE_REASON="unhealthy"
+  else
+    _al_main_cmd="${_al_mains#*|}"
+    if [[ "$(_al_sig_of_cmd "$_al_main_cmd")" != "$(_al_request_sig)" ]]; then
+      AUTO_LANE_REUSE_REASON="config-mismatch"
+    else
+      _al_dtap="$PROFILE_DIR/DevToolsActivePort"
+      _al_line1=""; _al_line2=""
+      if [[ -s "$_al_dtap" ]]; then
+        { IFS= read -r _al_line1; IFS= read -r _al_line2; } < "$_al_dtap"
+      fi
+      if ! [[ "$_al_line1" =~ ^[0-9]{1,5}$ ]] || [[ "$_al_line2" != /devtools/browser/* ]]; then
+        AUTO_LANE_REUSE_REASON="unhealthy"
+      else
+        _al_ws=$(_al_ws_path "$_al_line1")
+        if [[ -z "$_al_ws" ]]; then
+          AUTO_LANE_REUSE_REASON="unhealthy"
+        elif [[ "$_al_ws" != "$_al_line2" ]]; then
+          # A recycled port answered — an UNRELATED CDP endpoint, never reusable.
+          AUTO_LANE_REUSE_REASON="identity-mismatch"
+        else
+          AUTO_LANE_REUSE_REASON="ok"
+          AUTO_LANE_REUSE=1
+          AUTO_LANE_REUSE_PORT="$_al_line1"
+        fi
+      fi
+    fi
+  fi
+fi
+
 # ── Single Chrome argv array: one source for dry-run AND the real launch ──
 CHROME_ARGV=(
   "$CHROME_BIN"
@@ -449,6 +630,13 @@ if [[ "${LOOK_DRY_RUN:-}" == "1" ]]; then
   echo "automation=$AUTOMATION"
   echo "ephemeral=$EPHEMERAL"
   echo "cert_spki=$CERT_SPKI"
+  if (( AUTO_LANE )); then
+    # #187: flag-only keys — the no-flag dry-run stdout stays byte-identical
+    # (pinned by test_default_dryrun_full_stdout_is_byte_identical).
+    echo "auto_lane=1"
+    echo "auto_lane_reuse=$AUTO_LANE_REUSE"
+    echo "auto_lane_reuse_reason=$AUTO_LANE_REUSE_REASON"
+  fi
   echo "local_state_patch=$local_state_patch"
   echo "osascript=$osascript_steps"
   echo "window_position=$WINDOW_POSITION"
@@ -465,6 +653,38 @@ if [[ "${LOOK_DRY_RUN:-}" == "1" ]]; then
 fi
 
 # ── Real launch ──
+
+# ── #187 reuse exit (spec §4.4): a healthy, config-matching, identity-bound
+#    lane is returned WITHOUT pkill/relaunch — the browser keeps its tabs and
+#    page state. The URL argument is NOT applied (SKILL.md's branch always
+#    navigates via cdp.py). ──
+if (( AUTO_LANE )) && [[ "$AUTO_LANE_REUSE_REASON" == "ok" ]]; then
+  CDP_PORT="$AUTO_LANE_REUSE_PORT"
+  # Revalidate identity IMMEDIATELY before the contract (codex-review F2): a
+  # concurrent same-session call can kill/relaunch this lane between pass 0 and
+  # here — printing the pass-0 port then would hand the caller a dead lane with
+  # exit 0. Re-read the file + re-bind the endpoint; any change → fail loud.
+  _al_rv_line1=""; _al_rv_line2=""
+  if [[ -s "$PROFILE_DIR/DevToolsActivePort" ]]; then
+    { IFS= read -r _al_rv_line1; IFS= read -r _al_rv_line2; } < "$PROFILE_DIR/DevToolsActivePort"
+  fi
+  if [[ "$_al_rv_line1" != "$AUTO_LANE_REUSE_PORT" ]] || \
+     [[ "$(_al_ws_path "$AUTO_LANE_REUSE_PORT")" != "$_al_rv_line2" ]]; then
+    echo "LANE_FAIL: lane changed underneath between reuse check and contract" >&2
+    echo "           (a concurrent call restarted it) — re-invoke." >&2
+    _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=lane changed underneath reuse"
+    exit 1
+  fi
+  echo "JAINE Browser reused (CDP :$CDP_PORT, profile $PROFILE_DIR)"
+  _log_lane lane-reuse "port=$CDP_PORT" "profile=$PROFILE_DIR"
+  echo "LANE_REUSED=1"
+  echo "CDP_PORT=$CDP_PORT"
+  echo "LANE_PROFILE=$PROFILE_DIR"
+  echo "LANE_KILL_MATCH=$KILL_MATCH"
+  echo "LANE_BROWSER_BIN=$CHROME_BIN"
+  exit 0
+fi
+
 # Binary preflight: fail loud with an actionable hint instead of a silent
 # chrome.log-only death (the automation default points at the CfT pin, which may
 # simply not be installed yet).
@@ -483,6 +703,20 @@ mkdir -p "$PROFILE_DIR" "$(dirname "$LOG")"
 # mktemp profile did not exist moments ago, so no process can match — the pkill
 # would always no-op and the sleep would waste 1s per lane (code-review, PR #178).
 if (( ! EPHEMERAL )); then
+  _stop_reason="replaced by new launch"
+  if (( AUTO_LANE )) && [[ "$AUTO_LANE_REUSE_REASON" == "config-mismatch" ]]; then
+    _stop_reason="config-mismatch"
+  fi
+  # The stop record must carry the OLD lane's actual port (codex-review r3):
+  # phase C already reset CDP_PORT to 0 for auto-lanes, and the new port is not
+  # assigned until after this event — port=0 would break start/stop correlation.
+  _stop_port="$CDP_PORT"
+  if (( AUTO_LANE )) && [[ -s "$PROFILE_DIR/DevToolsActivePort" ]]; then
+    IFS= read -r _al_old_port < "$PROFILE_DIR/DevToolsActivePort"
+    if [[ "$_al_old_port" =~ ^[0-9]{1,5}$ ]]; then
+      _stop_port="$_al_old_port"
+    fi
+  fi
   if pkill -f -- "$KILL_MATCH" 2>/dev/null; then
     # a prior lane on this profile was signaled — close its lifecycle so it does
     # not read as leaked (#328 r7), but only once the process is CONFIRMED gone:
@@ -492,10 +726,31 @@ if (( ! EPHEMERAL )); then
       sleep 0.3
     done
     if ! pgrep -f -- "$KILL_MATCH" >/dev/null 2>&1; then
-      _log_lane lane-stop "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=replaced by new launch"
+      _log_lane lane-stop "port=$_stop_port" "profile=$PROFILE_DIR" "reason=$_stop_reason"
+    elif (( AUTO_LANE )); then
+      # #187 fail-closed on a survivor (spec §4.4): a surviving old-config
+      # Chrome would win the user-data-dir singleton and silently BE the lane.
+      echo "LANE_FAIL: old lane on $PROFILE_DIR would not terminate; refusing to" >&2
+      echo "           launch (the survivor would win the profile singleton)." >&2
+      _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=old lane would not terminate"
+      exit 1
     fi
   fi
   sleep 1
+fi
+
+# ── #187 stale-evidence guard (spec §4.5, R1-F1): the FIRST profile mutation of
+#    the fresh-launch path. rm is NOT trusted (no `set -e`): a surviving stale
+#    DevToolsActivePort would let readiness read a STALE port whose endpoint may
+#    be answered by an UNRELATED browser. Fail-closed BEFORE spawn. ──
+if (( AUTO_LANE )); then
+  rm -f "$PROFILE_DIR/DevToolsActivePort" 2>/dev/null
+  if [[ -e "$PROFILE_DIR/DevToolsActivePort" ]]; then
+    echo "LANE_FAIL: stale $PROFILE_DIR/DevToolsActivePort could not be removed —" >&2
+    echo "           refusing pre-spawn (a stale file must not satisfy readiness)." >&2
+    _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=stale DevToolsActivePort not removable"
+    exit 1
+  fi
 fi
 
 # Pre-patch Local State to enable AppleScript JS (headful only — no GUI when headless)
@@ -558,9 +813,79 @@ if (( EPHEMERAL )); then
     exit 1
   fi
 fi
+# ── #187 auto-lane readiness (spec §4.5): SP4 mechanics on the deterministic
+#    profile. DevToolsActivePort is written by port-0 launches (NOT fixed-port —
+#    R1-F1, empirically confirmed); the pre-spawn rm makes its presence
+#    attributable to THIS launch generation. The profile is NOT removed on
+#    failure (deterministic + reusable, unlike SP4's mktemp lanes). ──
+AL_VERIFIED=0
+if (( AUTO_LANE )); then
+  _dtap="$PROFILE_DIR/DevToolsActivePort"
+  _al_deadline=$(( SECONDS + 10 ))
+  while (( SECONDS < _al_deadline )) && [[ ! -s "$_dtap" ]]; do
+    sleep 0.2
+  done
+  if [[ ! -s "$_dtap" ]]; then
+    echo "LANE_FAIL: DevToolsActivePort not written within 10s (profile $PROFILE_DIR)" >&2
+    _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=DevToolsActivePort not written within 10s"
+    kill "$CHROME_PID" 2>/dev/null
+    exit 1
+  fi
+  IFS= read -r CDP_PORT < "$_dtap"
+  if ! [[ "$CDP_PORT" =~ ^[0-9]{1,5}$ ]]; then
+    echo "LANE_FAIL: DevToolsActivePort line 1 is not a port (got: $CDP_PORT)" >&2
+    _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=DevToolsActivePort line 1 not a port"
+    kill "$CHROME_PID" 2>/dev/null
+    exit 1
+  fi
+  _al_ok=0
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -s -m 2 "http://localhost:$CDP_PORT/json/version" >/dev/null 2>&1; then
+      _al_ok=1; break
+    fi
+    sleep 0.3
+  done
+  if (( ! _al_ok )); then
+    echo "LANE_FAIL: CDP on port $CDP_PORT never answered /json/version" >&2
+    _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=CDP never answered /json/version"
+    kill "$CHROME_PID" 2>/dev/null
+    exit 1
+  fi
+  # Post-readiness effective-config verification (spec §4.5, R2-F1 v3):
+  # readiness proved "a browser with OUR profile is up", not "OUR configuration
+  # is up" — in the parallel-launch race the survivor can be the OTHER call's.
+  # Never print a contract that misdescribes the running browser. Grace-poll
+  # while TWO mains are visible (the singleton loser takes a moment to exit) —
+  # without it the WINNER can spuriously fail on the transient count, and the
+  # loser would fail on count instead of the deciding signature compare.
+  _al_mains=""
+  _al_main_count=0
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    _al_mains=$(_al_main_processes)
+    _al_main_count=0
+    if [[ -n "$_al_mains" ]]; then
+      _al_main_count=$(printf '%s\n' "$_al_mains" | grep -c .)
+    fi
+    (( _al_main_count == 1 )) && break
+    sleep 0.3
+  done
+  if (( _al_main_count != 1 )) || \
+     [[ "$(_al_sig_of_cmd "${_al_mains#*|}")" != "$(_al_request_sig)" ]]; then
+    echo "LANE_FAIL: a different launch won this profile (effective config does not" >&2
+    echo "           match this request); re-invoke to reuse or restart it." >&2
+    _log_lane lane-fail "port=$CDP_PORT" "profile=$PROFILE_DIR" "reason=effective config mismatch after launch"
+    kill "$CHROME_PID" 2>/dev/null
+    exit 1
+  fi
+  # The verified survivor IS the lane — adopt its pid (a same-config racer's
+  # own child may have handed off to the singleton winner and exited).
+  CHROME_PID="${_al_mains%%|*}"
+  AL_VERIFIED=1
+fi
 # Ephemeral lanes already proved CDP liveness above — the blind settle sleep would
-# waste 3s per lane (× every calibration run; code-review, PR #178).
-if (( ! EPHEMERAL )); then
+# waste 3s per lane (× every calibration run; code-review, PR #178). Auto-lanes
+# proved it via their own readiness block (#187).
+if (( ! EPHEMERAL )) && (( ! AUTO_LANE )); then
   sleep 3
 fi
 
@@ -614,6 +939,14 @@ if kill -0 "$CHROME_PID" 2>/dev/null; then
     "automation=$AUTOMATION" "ephemeral=$EPHEMERAL" "insecure=$INSECURE" "pid=$CHROME_PID"
   if (( EPHEMERAL )); then
     # SP4 §2.1 contract — parseable final lines for delegation consumers.
+    echo "CDP_PORT=$CDP_PORT"
+    echo "LANE_PROFILE=$PROFILE_DIR"
+    echo "LANE_KILL_MATCH=$KILL_MATCH"
+    echo "LANE_BROWSER_BIN=$CHROME_BIN"
+  fi
+  if (( AUTO_LANE )); then
+    # #187 §4.6 contract — SP4 grammar + LANE_REUSED (fresh launch → 0).
+    echo "LANE_REUSED=0"
     echo "CDP_PORT=$CDP_PORT"
     echo "LANE_PROFILE=$PROFILE_DIR"
     echo "LANE_KILL_MATCH=$KILL_MATCH"

@@ -2621,6 +2621,12 @@ def main(argv):
     cmd = rest[0]
     if cmd not in COMMANDS:
         print("Unknown: {}. Available: {}".format(cmd, ", ".join(sorted(COMMANDS))), file=sys.stderr)
+        if cmd.startswith("--"):
+            # #187: zsh does not word-split $VAR — `T="--target <id>"; cdp.py $T js`
+            # arrives as ONE flag-like token and lands here, not in the flag parser.
+            print("Hint: flag-like token received as the command. In zsh, $VAR does "
+                  "not word-split — pass flags inline (python3 cdp.py --target ID "
+                  "js ...) or use ${=VAR}.", file=sys.stderr)
         return 1
     if TARGET is not None and not has_websocket():
         print("ERROR: --target requires the CDP/websocket channel (the AppleScript/native "

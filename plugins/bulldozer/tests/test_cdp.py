@@ -2340,3 +2340,29 @@ class TestAssertStructural:
         for token in ("assert", "--actionable", "--gate", "--wait",
                       "--require-trusted", "--bind"):
             assert token in doc, "verify-core surface {!r} missing from cdp.py docstring".format(token)
+
+
+class TestFlagLikeTokenHint:
+    """#187 Proposal A §5: a flag-like token received as the COMMAND (the zsh
+    `$VAR` no-word-split trap delivers `--target <id>` as ONE argv element)
+    prints a hint after the byte-identical Unknown line."""
+
+    def test_combined_flag_token_gets_hint(self):
+        r = run_cdp(["--target abc123def456", "js", "1"])
+        assert r.returncode == 1
+        lines = r.stderr.splitlines()
+        assert lines[0].startswith("Unknown: --target abc123def456. Available:"), r.stderr
+        assert any("word-split" in ln and "${=VAR}" in ln for ln in lines[1:]), \
+            "no zsh hint after the Unknown line:\n" + r.stderr
+
+    def test_non_flag_unknown_command_no_hint(self):
+        r = run_cdp(["frobnicate"])
+        assert r.returncode == 1
+        assert r.stderr.splitlines()[0].startswith("Unknown: frobnicate.")
+        assert "word-split" not in r.stderr
+
+    def test_bare_target_keeps_missing_selector_error(self):
+        r = run_cdp(["--target"])
+        assert r.returncode == 1
+        assert "requires a selector argument" in r.stderr
+        assert "word-split" not in r.stderr

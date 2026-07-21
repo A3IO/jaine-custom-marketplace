@@ -918,3 +918,189 @@ def test_js_log_hashes_expression(test_page_url, tmp_path):
     assert "hunter2" not in text, "JS source leaked into the log"
     assert "expr_len={}".format(len(expr)) in text
     assert "expr_sha=" in text
+
+
+# ── #187 Proposal A: auto-lane lifecycle (spec §8.4) ──
+# Self-managed lanes on per-test TMPDIR (R6-F1) — independent of jaine_browser.
+
+import re as _re
+
+
+def _auto_launch(tmpdir, extra_args=None, env_extra=None, timeout=40):
+    env = test_env()
+    for k in LANE_ENV_VARS:
+        env.pop(k, None)
+    env["TMPDIR"] = str(tmpdir)
+    env.update(env_extra or {})
+    return subprocess.run(
+        ["bash", LAUNCH_SCRIPT, "--auto-lane"] + (extra_args or []),
+        capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def _contract(stdout):
+    c = {}
+    for ln in stdout.splitlines():
+        m = _re.match(r"^(LANE_REUSED|CDP_PORT|LANE_PROFILE|LANE_KILL_MATCH|LANE_BROWSER_BIN)=(.*)$", ln)
+        if m:
+            c[m.group(1)] = m.group(2)
+    return c
+
+
+def _main_browser_pid(profile):
+    out = subprocess.run(["pgrep", "-f", "--", "--user-data-dir=" + str(profile)],
+                         capture_output=True, text=True).stdout.split()
+    mains = []
+    for pid in out:
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", pid],
+                             capture_output=True, text=True).stdout
+        if cmd and "--type=" not in cmd:
+            mains.append((int(pid), cmd))
+    return mains
+
+
+def _teardown(contract):
+    if contract.get("LANE_KILL_MATCH"):
+        subprocess.run(["pkill", "-f", "--", contract["LANE_KILL_MATCH"]])
+        _wait_port_release(int(contract["CDP_PORT"]))
+
+
+class TestAutoLaneLifecycle:
+    def test_fresh_reuse_mismatch_unhealthy_teardown(self, tmp_path, test_page_url):
+        """§8.4.1-6 as one ordered lifecycle on one lane (launch cost paid once)."""
+        log = tmp_path / "drive.log"
+        env_log = {"BULLDOZER_DRIVE_LOG": str(log)}
+        c1 = None
+        try:
+            # 1. fresh
+            r1 = _auto_launch(tmp_path, env_extra=env_log)
+            assert r1.returncode == 0, r1.stderr
+            c1 = _contract(r1.stdout)
+            assert c1["LANE_REUSED"] == "0"
+            port = int(c1["CDP_PORT"])
+            assert port not in range(9330, 9370)
+            s = run_cdp(["status"], env_override={"CDP_PORT": str(port)})
+            assert "ONLINE" in s.stdout, s.stdout + s.stderr
+            n = run_cdp(["navigate", test_page_url, "--wait", "load"],
+                        env_override={"CDP_PORT": str(port)})
+            assert n.returncode == 0, n.stderr
+            pid1 = _main_browser_pid(c1["LANE_PROFILE"])
+            assert len(pid1) == 1, pid1
+
+            # 2. reuse — same PID, page state kept
+            r2 = _auto_launch(tmp_path, env_extra=env_log)
+            assert r2.returncode == 0, r2.stderr
+            c2 = _contract(r2.stdout)
+            assert c2["LANE_REUSED"] == "1"
+            assert c2["CDP_PORT"] == c1["CDP_PORT"]
+            pid2 = _main_browser_pid(c1["LANE_PROFILE"])
+            assert pid2 == pid1, "reuse must not restart the browser"
+            t = run_cdp(["title"], env_override={"CDP_PORT": str(port)})
+            assert "Test Page" in t.stdout or "test" in t.stdout.lower(), \
+                "page state lost across reuse: " + t.stdout
+
+            # 3. config-mismatch restart, both insecure directions (R2-F1)
+            r3 = _auto_launch(tmp_path, extra_args=["--insecure"], env_extra=env_log)
+            assert r3.returncode == 0, r3.stderr
+            c3 = _contract(r3.stdout)
+            assert c3["LANE_REUSED"] == "0"
+            pid3 = _main_browser_pid(c1["LANE_PROFILE"])
+            assert len(pid3) == 1 and pid3 != pid1
+            assert "--disable-web-security" in pid3[0][1]
+            r4 = _auto_launch(tmp_path, env_extra=env_log)
+            assert r4.returncode == 0, r4.stderr
+            c4 = _contract(r4.stdout)
+            assert c4["LANE_REUSED"] == "0"
+            pid4 = _main_browser_pid(c1["LANE_PROFILE"])
+            assert len(pid4) == 1 and pid4 != pid3
+            assert "--disable-web-security" not in pid4[0][1], \
+                "stale insecure flag survived into a plain lane"
+            c1 = c4
+
+            # 4. unhealthy-relaunch: kill Chrome, keep the stale file
+            subprocess.run(["pkill", "-f", "--", c4["LANE_KILL_MATCH"]])
+            _wait_port_release(int(c4["CDP_PORT"]))
+            r5 = _auto_launch(tmp_path, env_extra=env_log)
+            assert r5.returncode == 0, r5.stderr
+            c5 = _contract(r5.stdout)
+            assert c5["LANE_REUSED"] == "0"
+            assert _main_browser_pid(c4["LANE_PROFILE"]), "no fresh browser after unhealthy lane"
+            c1 = c5
+
+            # 6. log markers
+            text = log.read_text()
+            assert "auto_lane=1" in text
+            assert "lane-reuse" in text
+            stop_lines = [ln for ln in text.splitlines()
+                          if "lane-stop" in ln and "reason=config-mismatch" in ln]
+            assert stop_lines, "no config-mismatch lane-stop line"
+            # codex-review r3: the stop record must carry the OLD lane's actual
+            # port (phase C reset CDP_PORT to 0 — port=0 breaks correlation)
+            assert "port={}".format(port) in stop_lines[0], stop_lines[0]
+        finally:
+            if c1:
+                _teardown(c1)
+
+    def test_concurrent_first_launch_race_is_honest(self, tmp_path):
+        """§8.4.7 (R2-F1 v6): spawn-barrier race — exactly one honest contract."""
+        real = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        wrapper = tmp_path / "chrome-wrapper.sh"
+        gate = tmp_path / "go"
+        wrapper.write_text(
+            "#!/bin/bash\n"
+            "touch \"{d}/spawn-reached-$$\"\n"
+            "while [ ! -e \"{d}/go\" ]; do sleep 0.05; done\n"
+            "exec \"{real}\" \"$@\"\n".format(d=tmp_path, real=real))
+        wrapper.chmod(0o755)
+        env_extra = {"CHROME_BIN": str(wrapper),
+                     "BULLDOZER_DRIVE_LOG": str(tmp_path / "race.log")}
+
+        import threading
+        results = {}
+
+        def go(name, args):
+            env = test_env()
+            for k in LANE_ENV_VARS:
+                env.pop(k, None)
+            env["TMPDIR"] = str(tmp_path)
+            env.update(env_extra)
+            results[name] = subprocess.run(
+                ["bash", LAUNCH_SCRIPT, "--auto-lane"] + args,
+                capture_output=True, text=True, timeout=60, env=env)
+
+        t1 = threading.Thread(target=go, args=("plain", []))
+        t2 = threading.Thread(target=go, args=("insecure", ["--insecure"]))
+        t1.start(); t2.start()
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if len(list(tmp_path.glob("spawn-reached-*"))) >= 2:
+                break
+            time.sleep(0.05)
+        assert len(list(tmp_path.glob("spawn-reached-*"))) >= 2, \
+            "both launchers must reach the spawn barrier"
+        gate.write_text("")
+        t1.join(); t2.join()
+
+        contracts = {k: _contract(v.stdout) for k, v in results.items()}
+        winners = [k for k, c in contracts.items() if c.get("CDP_PORT")]
+        try:
+            assert len(winners) == 1, "exactly one contract expected; got {}: {}".format(
+                winners, {k: v.stdout + v.stderr for k, v in results.items()})
+            w = winners[0]
+            loser = "insecure" if w == "plain" else "plain"
+            mains = _main_browser_pid(contracts[w]["LANE_PROFILE"])
+            assert len(mains) == 1
+            has_insecure = "--disable-web-security" in mains[0][1]
+            assert has_insecure == (w == "insecure"), \
+                "contract does not describe the surviving browser"
+            assert results[loser].returncode != 0
+            assert not contracts[loser].get("CDP_PORT")
+
+            # follow-up plain never reuses an insecure survivor
+            r = _auto_launch(tmp_path, env_extra=env_extra)
+            assert r.returncode == 0, r.stderr
+            mains = _main_browser_pid(contracts[w]["LANE_PROFILE"])
+            assert len(mains) == 1 and "--disable-web-security" not in mains[0][1]
+        finally:
+            for c in contracts.values():
+                if c.get("LANE_KILL_MATCH"):
+                    subprocess.run(["pkill", "-f", "--", c["LANE_KILL_MATCH"]])

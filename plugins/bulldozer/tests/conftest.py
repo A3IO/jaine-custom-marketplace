@@ -349,6 +349,9 @@ CENTRAL_ALLOWLIST = {
         ("BULLDOZER_DRIVE_LOG", "test_drive_logging_pr5.py",
          "intentional DRIVE_LOG-absent fallback routing through "
          "BULLDOZER_INVOKE_LOG_DIR under a scratch HOME (R10-F1)"),
+        ("CLAUDE_CODE_SESSION_ID", "test_launch.py",
+         "auto-lane PPID-fallback derivation (#187 §8.1.3) — dry-run only, "
+         "no log writer runs in the child"),
     ),
     "env_forward_helpers": (
         ("_env", "test_check_logging_pr4.py",

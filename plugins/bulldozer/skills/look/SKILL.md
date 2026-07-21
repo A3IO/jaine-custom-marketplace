@@ -1,6 +1,6 @@
 ---
 name: look
-description: Use when you need to see a web page, verify UI visually, take a screenshot, capture a region of the page, execute JS in a real browser, click elements, fill forms, check console errors, or monitor network requests. Triggers on "open in browser", "take screenshot", "capture region", "check if X is aligned", "what does this look like", "захватить область", "run JS", "click button", "fill form", visual verification, UI detail check. Port 9333 is the USER'S LIVE browser — use it only when the task needs their cookies/logins/co-browsing, and pin every command with --target; an agent-own task (file://, localhost preview, UI iteration) ALWAYS goes to an isolated lane instead.
+description: Use when you need to see a web page, verify UI visually, take a screenshot, capture a region of the page, execute JS in a real browser, click elements, fill forms, check console errors, or monitor network requests. Triggers on "open in browser", "take screenshot", "capture region", "check if X is aligned", "what does this look like", "захватить область", "run JS", "click button", "fill form", visual verification, UI detail check. Port 9333 is the USER'S LIVE browser — use it only when the task needs their cookies/logins/co-browsing, and pin every command with --target; an agent-own task (file://, localhost preview, UI iteration) ALWAYS goes to an isolated lane instead (launch.sh --auto-lane).
 argument-hint: "[URL] [task description]"
 allowed-tools: ["Bash", "Read"]
 ---
@@ -18,6 +18,25 @@ Example: `/bulldozer:look file:///tmp/page.html — проверить ренд�
 - Task description (your own note, not passed to scripts) = `проверить рендеринг таблицы`
 
 Why: `launch.sh` reads `$1` verbatim as the URL and `cdp.py navigate` does the same. Passing the full `$ARGUMENTS` produces a malformed URL whenever the user adds a description.
+
+**Shared or isolated — route BEFORE any command** (#187 Proposal A; the full
+rationale lives in the "Shared or isolated" section below). Pick the branch
+FIRST — the 9333 status probe belongs INSIDE the 9333 branch, not before the
+decision:
+
+1. **9333 branch** — any of: explicit user context («у меня» / «мой браузер» /
+   нужны его куки-логины [cookies/login] / co-browse — «посмотри со мной» /
+   «как под моим аккаунтом»), the task needs the user's session state, OR the
+   task is headful/human-watching — the user will WATCH the browser; the
+   headful-only `window upper/lower/activate` commands live on 9333.
+2. **Auto-lane branch** — agent-own signals: `file://`, `localhost`/127.0.0.1
+   preview, UI iteration, screenshots for your own verification.
+3. **Ambiguous → auto-lane** (default-to-isolated), and ANNOUNCE the choice in
+   your reply: «работаю в изолированной lane :<port>» — the user redirects
+   with one word if they wanted co-browsing; cheap to reverse, unlike JS
+   already executed in their tab.
+
+### 9333 branch (user context / co-browsing / headful)
 
 1. Resolve the scripts, then check browser status. `$CLAUDE_PLUGIN_ROOT` is **not** exported to the Bash tool (#221), so resolve the plugin dir from the cache (honoring the var if it IS set). Shell state doesn't persist across Bash calls — re-run this resolver in any later Bash call that uses `$CDP`/`$LAUNCH` (it's a cheap filesystem lookup):
 ```bash
@@ -57,6 +76,46 @@ Then Read the screenshot file to see it.
 
 5. Report what you see to the user.
 
+### Auto-lane branch (agent-own tasks)
+
+One flag yields a session-owned isolated lane: OS-assigned port, session-keyed
+temp profile, stock Chrome, headless. Re-invoking in the same session REUSES
+the running lane (same browser, tabs kept — `LANE_REUSED=1`); a changed config
+(`--insecure`/`--cert-spki=`) restarts it.
+
+```bash
+BULLDOZER_DIR=$( { [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -d "$CLAUDE_PLUGIN_ROOT/skills/look" ] \
+  && printf '%s\n' "$CLAUDE_PLUGIN_ROOT"; } || ls -dt ~/.claude/plugins/cache/*/bulldozer/*/ 2>/dev/null | head -1 )
+CDP="$BULLDOZER_DIR/skills/look/scripts/cdp.py"
+LAUNCH="$BULLDOZER_DIR/skills/look/scripts/launch.sh"
+"$LAUNCH" --auto-lane --headless   # literal --headless: a Quick-Invoke lane is ALWAYS
+                                   # headless; no URL argument — navigate explicitly below
+```
+
+Parse the contract lines from its stdout — `CDP_PORT=<port>` is your lane
+handle; carry it as a literal env prefix on EVERY cdp.py call (shell state does
+not persist across Bash calls — #221; there is no env fallback):
+
+```bash
+# skip ONLY the navigate line when no URL was parsed (the lane sits at
+# about:blank); the screenshot is unconditional — it is your visual
+# confirmation of the lane state:
+CDP_PORT=<port> python3 "$CDP" navigate "<parsed URL>" --wait load
+CDP_PORT=<port> python3 "$CDP" screenshot /tmp/jaine-look-<port>.jpg
+```
+
+Then Read the screenshot and report. The screenshot path carries the lane
+port — a shared `/tmp/jaine-look.jpg` could be clobbered by a CONCURRENT
+session's auto-lane between your capture and your Read. `--target` pinning is NOT required in the
+lane — no user tabs exist there; that rule's weight belongs to 9333. Announce
+the lane in your reply (routing rule 3). Teardown is optional (the lane is
+reused across invocations; TMPDIR is reboot-cleaned) — when asked to clean up:
+`pkill -f -- "<LANE_KILL_MATCH from the contract>"`. If `launch.sh` prints
+`LANE_FAIL: a different launch won this profile`, a parallel call with another
+config raced you — re-invoke once. Same recovery if a just-printed `CDP_PORT`
+turns out dead on the first cdp.py call (a concurrent invocation restarted the
+lane): re-invoke `--auto-lane` and use the fresh contract.
+
 ## Channels
 
 | Channel | When | Capabilities |
@@ -76,7 +135,7 @@ Auto-detected: `cdp.py status` shows active channel. Fallback is transparent —
 
 **Port 9333** = the user's live browser (cookies, logins, co-browsing). `open` your own tab, note its id, then pin EVERY command with `--target <id>` — **the active tab is never yours**: the user can switch it between your calls. Both live recurrences of this bug were routine unpinned commands, not navigation — a `reload` and a `js location.hash=…` executed in the user's page (#187). `navigate` without `--target` is the same bug at its loudest: it yanks the user's active tab to your URL.
 
-**Your own task** (file://, localhost preview, UI iteration) → launch an **isolated lane** (`CDP_PORT=0 --automation` for ephemeral, or a named port). This keeps you from touching the user's session.
+**Your own task** (file://, localhost preview, UI iteration) → the **auto-lane** (`"$LAUNCH" --auto-lane --headless` — see the Auto-lane branch in Quick Invoke): session-owned isolated lane, reused across invocations. This keeps you from touching the user's session. (Subagent /drive delegation keeps its own ephemeral CfT lanes — that recipe lives in the drive skill, not here.)
 
 ## Quick Reference
 
@@ -90,6 +149,8 @@ LAUNCH="$BULLDOZER_DIR/skills/look/scripts/launch.sh"
 # Global flag — pin every command in the call to one tab (CDP/websocket only):
 #   python3 "$CDP" --target SEL CMD ...   SEL = full target id, its 12-char prefix
 #   (as shown by `tabs`/`status`), or a url substring. Ambiguous/unknown → fail loud.
+# zsh trap: $VAR does NOT word-split — T="--target abc"; python3 "$CDP" $T js …
+#   delivers ONE token and fails. Pass flags inline, or use ${=VAR} (#187).
 # All examples below are shown UNPINNED for brevity — that form is safe on an
 # isolated lane only. On shared 9333, prepend --target per the shared-mode rule.
 
