@@ -585,6 +585,17 @@ def build_codex_cmd(wrapped: str, effort: str = "medium", web: bool = False) -> 
     return cmd
 
 
+# grok CLI 0.2.107 grew -m/--reasoning-effort (verified live 2026-07-21: -m grok-4.5
+# resolves — modelUsage shows grok-4.5-build; effort enum = high|medium|low). Pinned so
+# a CLI default change never silently moves the leg; same override lever as _AGY_MODEL
+# (C10) — an xai-side rename gets an env fix, not a code change. A bad value fails loud
+# (grok's own enum/id error) → the leg degrades per the panel contract. REQUIRES grok
+# CLI >= 0.2.107 (older CLIs reject the flags with an instant parse error — the leg
+# fails loud with a self-describing reason; upgrade grok, r4 P2 documented requirement).
+_GROK_MODEL = os.environ.get("BULLDOZER_GROK_MODEL") or "grok-4.5"
+_GROK_EFFORT = os.environ.get("BULLDOZER_GROK_EFFORT") or "high"
+
+
 def build_grok_cmd(wrapped: str, web: bool = False) -> tuple[list[str], dict[str, str]]:
     """grok on the REAL HOME (no override) + JSON out, ALWAYS ``--permission-mode plan``
     (read-only — plan blocks write tools). A HOME-sandbox broke grok's informed-mode
@@ -592,8 +603,10 @@ def build_grok_cmd(wrapped: str, web: bool = False) -> tuple[list[str], dict[str
     through the panel, sandbox → 0/3). Env override is empty so run_model's allowlist
     passes the real HOME through. Isolated (default): also ``--no-subagents
     --disable-web-search``. ``web``: drop those two → web search/fetch + parallel
-    subagents, still read-only (plan). ``--no-memory`` always."""
-    cmd = ["grok", "-p", wrapped, "--no-memory"]
+    subagents, still read-only (plan). ``--no-memory`` always. Model/effort pinned
+    via ``_GROK_MODEL``/``_GROK_EFFORT`` (read at call time)."""
+    cmd = ["grok", "-p", wrapped, "--no-memory",
+           "-m", _GROK_MODEL, "--reasoning-effort", _GROK_EFFORT]
     if not web:
         cmd += ["--no-subagents", "--disable-web-search"]
     cmd += ["--permission-mode", "plan", "--output-format", "json"]
@@ -603,6 +616,41 @@ def build_grok_cmd(wrapped: str, web: bool = False) -> tuple[list[str], dict[str
 # Overridable so an agy-side model rename doesn't permanently break the leg with no
 # lever (code-review C10): set BULLDOZER_AGY_MODEL to an `agy models` label.
 _AGY_MODEL = os.environ.get("BULLDOZER_AGY_MODEL") or "Gemini 3.1 Pro (High)"
+
+# agy >=1.1.2 print mode HARD-FAILS when --model can't be resolved against the SERVER
+# model catalog (display labels only resolve there; the local config knows none of them).
+# A transient catalog/auth hiccup at leg start therefore kills the leg in ~4s even though
+# the label is valid (#359 — the same binary resolved it before and after the incident);
+# a genuinely renamed label fails identically. Both recover the same way: retry ONCE
+# without --model, letting agy fall back to its own default model (fallback-with-warning
+# path — never hard-fails). Detection reads ModelResult.stderr (FULL sanitized stderr —
+# review P1: with the catalog UP agy appends an 8-entry "Available models:" list after the
+# error line, 362 chars live, so run_model's 200-char reason tail starts MID-LIST and
+# carries neither marker); reason is the degraded fallback for stderr-less results.
+_AGY_MODEL_FAIL_MARKERS = ("invalid --model", "Available models")
+# Set by _run_one when the fallback retry SURVIVED — _log_completion then marks
+# agy_model= so the line never claims the requested label ran verbatim. Reset per
+# run_panel call (single agy leg per run → single writer thread).
+_AGY_MODEL_FELL_BACK = False
+
+
+def _agy_model_unresolved(reason: "str | None") -> bool:
+    return any(m in (reason or "") for m in _AGY_MODEL_FAIL_MARKERS)
+
+
+def _strip_model_flag(cmd: list[str]) -> list[str]:
+    """``cmd`` without its ``--model <value>`` pair (input untouched)."""
+    out: list[str] = []
+    skip = False
+    for arg in cmd:
+        if skip:
+            skip = False
+            continue
+        if arg == "--model":
+            skip = True
+            continue
+        out.append(arg)
+    return out
 
 
 def build_agy_cmd(
@@ -704,11 +752,15 @@ def _seed_readonly_hook(workdir: Path, web: bool = False) -> None:
 
 @dataclass
 class ModelResult:
-    """Outcome of one model subprocess. ``output`` is raw stdout on success."""
+    """Outcome of one model subprocess. ``output`` is raw stdout on success.
+    ``stderr`` (failures only) is the FULL sanitized stderr, capped — ``reason``
+    keeps only a 200-char tail, which truncates away the agy model-resolution
+    error line when the "Available models:" list follows it (#359 review P1)."""
 
     ok: bool
     output: str | None
     reason: str | None
+    stderr: str | None = None
 
 
 # A runner: (argv, env_overrides, cwd, timeout) -> ModelResult. Injectable for tests.
@@ -787,8 +839,13 @@ def run_model(
             pass
         return ModelResult(False, None, "timeout")
     if proc.returncode != 0:
-        tail = _sanitize(err)[-200:]
-        return ModelResult(False, None, f"exit {proc.returncode}: {tail}")
+        s = _sanitize(err)
+        # reason stays the compact tail (log/display); stderr carries the full text
+        # (bounded) so failure CLASSIFICATION never depends on the tail window (#359 P1).
+        # HEAD + TAIL, not head-only: an error block at the END behind >4KB of noise
+        # must not fall into a blind middle window (r5 P2 — agy prints its error last).
+        bounded = s if len(s) <= 4400 else s[:4000] + "\n…[stderr truncated]…\n" + s[-400:]
+        return ModelResult(False, None, f"exit {proc.returncode}: {s[-200:]}", bounded)
     return ModelResult(True, out, None)
 
 
@@ -886,12 +943,49 @@ def _run_one(
             # visual/IDE session's), inject a unique nonce into the prompt and afterward
             # remove only the new brain dir whose transcript carries it (#189, F2).
             nonce = f"{_AGY_NONCE_TAG}:{secrets.token_hex(16)}"
-            cmd, env = spec.prepare(f"[{nonce}]\n{wrapped}", repo, timeout, web)
+            nonce_prompt = f"[{nonce}]\n{wrapped}"
+            cmd, env = spec.prepare(nonce_prompt, repo, timeout, web)
             before = _agy_brain_ids()
             with tempfile.TemporaryDirectory(prefix=f"panel-{name}-") as mt:
                 _seed_readonly_hook(Path(mt), web)
                 try:
                     result = runner(cmd, env, mt, timeout)
+                    # Both stderr WINDOWS checked independently (r4 P2): stderr is
+                    # HEAD-capped (s[:4000]) while reason is TAIL-capped (s[-200:])
+                    # — either alone can lose the marker (>4KB of diagnostics before
+                    # the error line, or the "Available models" list after it).
+                    # ONE remaining-budget measurement shared by the guard and the
+                    # retry timeout (r5 P3 — a second clock read between them can
+                    # silently shrink or race past the granted budget).
+                    remaining = int(timeout - (time.perf_counter() - t_leg))
+                    if not result.ok and (
+                            _agy_model_unresolved(result.stderr)
+                            or _agy_model_unresolved(result.reason)) and remaining >= 1:
+                        # #359: --model resolution hard-fail (transient catalog outage
+                        # OR renamed label) — retry once WITHOUT --model in the SAME
+                        # hook-seeded cwd (read-only gate intact); same nonce'd prompt,
+                        # so the cleanup below covers the retry's transcript too. The
+                        # retry inherits the leg's REMAINING budget (review P2 — one
+                        # leg must never run ~2x the advertised per-model limit; an
+                        # EXHAUSTED budget skips the retry outright — max() must not
+                        # mint a fresh second past the limit, r4 P2), and rebuilding
+                        # via spec.prepare re-derives --print-timeout.
+                        try:
+                            print(
+                                f"[panel] agy: --model {_AGY_MODEL!r} did not resolve"
+                                " — retrying once on agy's default model (#359)",
+                                file=sys.stderr,
+                            )
+                        except Exception:
+                            pass  # warning is best-effort — a closed/broken stderr
+                            # (detached panel, #326 contract) must not kill the retry
+                            # it announces (review r2 P2)
+                        retry_cmd, _ = spec.prepare(nonce_prompt, repo, remaining, web)
+                        result = runner(
+                            _strip_model_flag(retry_cmd), env, mt, remaining)
+                        if result.ok:
+                            global _AGY_MODEL_FELL_BACK
+                            _AGY_MODEL_FELL_BACK = True
                 finally:
                     _agy_clean_new_by_nonce(before, nonce)
         elif repo is not None:
@@ -1111,7 +1205,13 @@ def _log_completion(
             fields["legtimes"] = ",".join(
                 f"{l.display}:{l.elapsed_s}" for l in legs if l.elapsed_s is not None)
         if "agy" in selected:
-            fields["agy_model"] = re.sub(r"[^A-Za-z0-9._()-]", "_", _AGY_MODEL)
+            # fallback marker (#359): after a successful retry without --model the leg
+            # ran on agy's default, not the requested label — the line must say so.
+            label = _AGY_MODEL + (" (fallback-default)" if _AGY_MODEL_FELL_BACK else "")
+            fields["agy_model"] = re.sub(r"[^A-Za-z0-9._()-]", "_", label)
+        if "grok" in selected:
+            fields["grok_model"] = re.sub(r"[^A-Za-z0-9._()-]", "_", _GROK_MODEL)
+            fields["grok_effort"] = re.sub(r"[^A-Za-z0-9._()-]", "_", _GROK_EFFORT)
         if "codex" in selected:
             fields["codex_effort"] = "medium"  # build_codex_cmd's default — not threaded through
         fields["project"] = _project_root()
@@ -1149,6 +1249,8 @@ def run_panel(
     deletes it by nonce afterward (consult statelessness, visual-safe, #189).
     """
     t0 = time.perf_counter()
+    global _AGY_MODEL_FELL_BACK
+    _AGY_MODEL_FELL_BACK = False  # per-run flag (#359) — stale True would mislabel the log
     if repo is not None:
         repo = Path(repo)
         if not repo.is_dir():

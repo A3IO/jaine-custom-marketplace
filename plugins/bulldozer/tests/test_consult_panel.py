@@ -2269,3 +2269,351 @@ def test_help_exit_writes_no_error_line():
     with _pytest.raises(SystemExit):
         panel.main(["-h"], runner=_make_fake_runner([]))
     assert not panel.CONSULT_LOG.exists(), "help is a successful exit, not telemetry"
+
+
+# ── #359: agy --model hard-fail (unresolved label) → one retry without --model ──
+#
+# agy >=1.1.2 print mode HARD-FAILS when --model can't be resolved against the
+# SERVER model catalog (display labels only resolve there). A transient catalog/
+# auth hiccup at leg start killed the leg in ~4s while the label itself was valid
+# (#359: the same binary resolved "Gemini 3.1 Pro (High)" before and after the
+# incident). A genuinely renamed label fails the same way. Both recover the same
+# way: retry ONCE without --model — agy then falls back to its own default model
+# (fallback-with-warning path, never hard-fail).
+
+_AGY_INVALID_MODEL_REASON = (
+    'exit 1: Error: invalid --model "Gemini 3.1 Pro (High)": model Gemini 3.1 Pro '
+    "(High) is not recognized as a known model or custom model in settings"
+)
+# run_model keeps only the LAST 200 stderr chars; with the catalog UP agy appends
+# an "Available models:" list AFTER the error line, which can push "invalid
+# --model" out of the tail — detection must catch this shape too.
+_AGY_TRUNCATED_TAIL_REASON = (
+    "exit 1: settings\nAvailable models:\n  Gemini 3.5 Flash (Medium)\n"
+    "  Gemini 3.5 Flash (High)\n  Gemini 3.1 Pro (Low)\n  Gemini 3.1 Pro (High)"
+)
+
+
+def _scripted_agy_runner(calls, first_reason, retry_ok=True):
+    def runner(cmd, env, cwd, timeout):
+        calls.append({"cmd": list(cmd), "cwd": cwd,
+                      "has_hook": (Path(cwd) / ".agents" / "hooks.json").is_file()})
+        if len(calls) == 1:
+            return panel.ModelResult(False, None, first_reason)
+        if retry_ok:
+            return panel.ModelResult(True, "retry-findings", None)
+        return panel.ModelResult(False, None, "exit 1: retry also failed")
+    return runner
+
+
+def test_run_one_agy_invalid_model_retries_without_model_flag(tmp_path, monkeypatch):
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    calls = []
+    leg = panel._run_one(
+        "agy", "W", None, 60, _scripted_agy_runner(calls, _AGY_INVALID_MODEL_REASON))
+    assert len(calls) == 2, "invalid --model must trigger exactly one retry"
+    assert "--model" in calls[0]["cmd"]
+    assert "--model" not in calls[1]["cmd"], "retry must drop the --model pair"
+    assert leg.output == "retry-findings" and leg.reason is None
+
+
+def test_run_one_agy_retry_keeps_seeded_readonly_cwd(tmp_path, monkeypatch):
+    """The retry must run in the SAME hook-seeded temp cwd — dropping --model must
+    not drop the read-only PreToolUse gate (#189 security invariant)."""
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    calls = []
+    panel._run_one(
+        "agy", "W", None, 60, _scripted_agy_runner(calls, _AGY_INVALID_MODEL_REASON))
+    assert calls[1]["cwd"] == calls[0]["cwd"]
+    assert calls[1]["has_hook"], "retry cwd must still contain .agents/hooks.json"
+
+
+def test_run_one_agy_truncated_tail_shape_also_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    calls = []
+    leg = panel._run_one(
+        "agy", "W", None, 60, _scripted_agy_runner(calls, _AGY_TRUNCATED_TAIL_REASON))
+    assert len(calls) == 2, "Available-models tail (error line truncated) must retry too"
+    assert leg.output == "retry-findings"
+
+
+def test_run_one_agy_unrelated_failure_does_not_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    calls = []
+    leg = panel._run_one(
+        "agy", "W", None, 60,
+        _scripted_agy_runner(calls, "exit 1: something else exploded"))
+    assert len(calls) == 1, "only model-resolution failures may retry"
+    assert leg.output is None and "something else" in leg.reason
+
+
+def test_run_one_agy_failed_retry_fails_leg_no_loop(tmp_path, monkeypatch):
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    calls = []
+    leg = panel._run_one(
+        "agy", "W", None, 60,
+        _scripted_agy_runner(calls, _AGY_INVALID_MODEL_REASON, retry_ok=False))
+    assert len(calls) == 2, "exactly one retry — never a loop"
+    assert leg.output is None and leg.reason
+
+
+def test_strip_model_flag_removes_pair_keeps_rest():
+    cmd = ["agy", "-p", "W", "--model", "Gemini 3.1 Pro (High)",
+           "--print-timeout", "45s", "--add-dir", "/repo"]
+    assert panel._strip_model_flag(cmd) == [
+        "agy", "-p", "W", "--print-timeout", "45s", "--add-dir", "/repo"]
+    assert "--model" in cmd, "input must not be mutated"
+
+
+def test_completion_line_marks_agy_model_fallback(tmp_path, monkeypatch):
+    """After a successful fallback retry the completion line must NOT claim the
+    requested label ran verbatim — agy_model= carries a fallback marker (log
+    honesty: these lines are the record mined during exactly this kind of debug)."""
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    agy_calls = []
+
+    def runner(cmd, env, cwd, timeout):
+        if cmd[0] == "agy":
+            agy_calls.append(list(cmd))
+            if len(agy_calls) == 1:
+                return panel.ModelResult(False, None, _AGY_INVALID_MODEL_REASON)
+            return panel.ModelResult(True, "agy-finding", None)
+        return _make_fake_runner([])(cmd, env, cwd, timeout)
+
+    panel.run_panel("Q", runner=runner)
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "survivors=3/3" in line, line
+    assert re.search(r"agy_model=\S*fallback", line), line
+
+
+def test_completion_line_no_fallback_marker_on_clean_run():
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "fallback" not in line, line
+
+
+# ── #359 post-review (codex xhigh P1/P2): full-stderr detection + shared budget ──
+#
+# P1 (CONFIRMED live): with the catalog UP agy prints the error line + an 8-entry
+# "Available models:" list — 362 chars total, so run_model's reason tail[-200:]
+# starts MID-LIST and contains NEITHER marker. Detection must therefore see the
+# FULL stderr: ModelResult grows a `stderr` field populated by run_model on
+# failure; _run_one checks it first (reason stays the degraded fallback).
+# P2: the retry must inherit the leg's REMAINING budget, not a fresh timeout —
+# one leg must never run ~2x the advertised per-model limit.
+
+# The real 362-char shape captured live 2026-07-21 (Nonexistent Model X probe).
+_AGY_REAL_FULL_STDERR = (
+    'Error: invalid --model "Gemini 3.1 Pro (High)": model Gemini 3.1 Pro (High) '
+    "is not recognized as a known model or custom model in settings\n"
+    "Available models:\n"
+    "  Gemini 3.5 Flash (Medium)\n  Gemini 3.5 Flash (High)\n"
+    "  Gemini 3.5 Flash (Low)\n  Gemini 3.1 Pro (Low)\n  Gemini 3.1 Pro (High)\n"
+    "  Claude Sonnet 4.6 (Thinking)\n  Claude Opus 4.6 (Thinking)\n"
+    "  GPT-OSS 120B (Medium)"
+)
+_AGY_REAL_MIDLIST_REASON = "exit 1: " + _AGY_REAL_FULL_STDERR[-200:]
+assert "invalid --model" not in _AGY_REAL_MIDLIST_REASON
+assert "Available models" not in _AGY_REAL_MIDLIST_REASON
+
+
+def test_run_one_agy_full_catalog_shape_detected_via_stderr(tmp_path, monkeypatch):
+    """The REAL catalog-up error shape: reason tail is mid-list (no marker), but the
+    full stderr carries both — detection must use ModelResult.stderr (review P1)."""
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    calls = []
+
+    def runner(cmd, env, cwd, timeout):
+        calls.append(list(cmd))
+        if len(calls) == 1:
+            return panel.ModelResult(
+                False, None, _AGY_REAL_MIDLIST_REASON, _AGY_REAL_FULL_STDERR)
+        return panel.ModelResult(True, "retry-findings", None)
+
+    leg = panel._run_one("agy", "W", None, 60, runner)
+    assert len(calls) == 2, "mid-list reason with full stderr must still retry"
+    assert leg.output == "retry-findings"
+
+
+def test_run_model_failure_carries_full_stderr():
+    """run_model must expose the FULL (sanitized) stderr on failure, not only the
+    200-char reason tail — real subprocess, stderr longer than the tail window."""
+    marker_head = "HEAD-MARKER-invalid --model"
+    filler = "x" * 400
+    res = panel.run_model(
+        ["sh", "-c", f"echo '{marker_head}\n{filler}' >&2; exit 1"], {}, "/tmp", 10)
+    assert not res.ok
+    assert marker_head not in (res.reason or ""), "precondition: head truncated from reason"
+    assert marker_head in (res.stderr or ""), "full stderr must preserve the head"
+
+
+def test_run_one_agy_retry_gets_remaining_budget_not_fresh_timeout(tmp_path, monkeypatch):
+    """A slow first attempt must not grant the retry a FRESH timeout — the leg's
+    total wall stays within the advertised per-model limit (review P2). First
+    attempt burns 40 of 60s → retry gets ~20s and a re-derived --print-timeout."""
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    clock = {"t": 0.0}
+    monkeypatch.setattr(panel.time, "perf_counter", lambda: clock["t"])
+    calls = []
+
+    def runner(cmd, env, cwd, timeout):
+        calls.append({"cmd": list(cmd), "timeout": timeout})
+        if len(calls) == 1:
+            clock["t"] += 40.0
+            return panel.ModelResult(
+                False, None, _AGY_INVALID_MODEL_REASON, _AGY_REAL_FULL_STDERR)
+        return panel.ModelResult(True, "retry-findings", None)
+
+    leg = panel._run_one("agy", "W", None, 60, runner)
+    assert leg.output == "retry-findings"
+    assert calls[1]["timeout"] == 20, calls[1]
+    i = calls[1]["cmd"].index("--print-timeout")
+    assert calls[1]["cmd"][i + 1] == "5s", "soft print-timeout must be re-derived from remaining"
+    # same nonce'd prompt → the nonce cleanup still covers the retry's transcript
+    assert calls[1]["cmd"][2] == calls[0]["cmd"][2], "retry must reuse the nonce'd prompt"
+
+
+def test_run_one_agy_retry_survives_closed_stderr(tmp_path, monkeypatch):
+    """Detached panel (closed/broken stderr): the diagnostic print sits BEFORE the
+    retry — it must be best-effort, never suppressing the recovery it announces
+    (review r2 P2; same supported scenario as _log_completion's #326 contract)."""
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+
+    class _Broken:
+        def write(self, *a):
+            raise ValueError("I/O operation on closed file")
+
+        def flush(self):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(panel.sys, "stderr", _Broken())
+    calls = []
+    leg = panel._run_one(
+        "agy", "W", None, 60, _scripted_agy_runner(calls, _AGY_INVALID_MODEL_REASON))
+    assert len(calls) == 2, "broken stderr must not disable the retry"
+    assert leg.output == "retry-findings" and leg.reason is None
+# ── grok model/effort pin (2026-07-21): grok CLI 0.2.107 grew -m / --reasoning-effort ──
+
+
+def test_grok_cmd_pins_model_and_high_effort():
+    """The grok leg pins -m grok-4.5 + --reasoning-effort high (verified live on
+    grok 0.2.107: modelUsage shows grok-4.5-build, effort enum = high|medium|low).
+    A CLI default change must not silently move the leg off the pinned model."""
+    cmd, env = panel.build_grok_cmd("W")
+    assert cmd[cmd.index("-m") + 1] == "grok-4.5"
+    assert cmd[cmd.index("--reasoning-effort") + 1] == "high"
+    assert env == {}
+
+
+def test_grok_cmd_web_mode_keeps_pin():
+    cmd, _ = panel.build_grok_cmd("W", web=True)
+    assert cmd[cmd.index("-m") + 1] == "grok-4.5"
+    assert cmd[cmd.index("--reasoning-effort") + 1] == "high"
+
+
+def test_grok_cmd_model_and_effort_overridable(monkeypatch):
+    """Same C10 lever as agy: module constants from BULLDOZER_GROK_MODEL /
+    BULLDOZER_GROK_EFFORT so an xai-side rename never bricks the leg."""
+    monkeypatch.setattr(panel, "_GROK_MODEL", "g4-reason")
+    monkeypatch.setattr(panel, "_GROK_EFFORT", "low")
+    cmd, _ = panel.build_grok_cmd("W")
+    assert cmd[cmd.index("-m") + 1] == "g4-reason"
+    assert cmd[cmd.index("--reasoning-effort") + 1] == "low"
+
+
+def test_completion_line_carries_grok_model_and_effort():
+    """Log honesty (#322 PR3 pattern): the pin must be minable from the completion
+    line, like agy_model=/codex_effort= already are."""
+    panel.run_panel("Q", runner=_make_fake_runner([]))
+    line = panel.CONSULT_LOG.read_text().splitlines()[0]
+    assert "grok_model=grok-4.5" in line, line
+    assert "grok_effort=high" in line, line
+
+
+# ── #359 r4 (codex xhigh): both stderr windows + no retry on exhausted budget ──
+
+
+def test_run_one_agy_marker_only_in_reason_tail_still_retries(tmp_path, monkeypatch):
+    """run_model caps stderr from the HEAD (s[:4000]) but reason from the TAIL
+    (s[-200:]) — >4KB of diagnostics before the error line loses the marker from
+    stderr while reason still carries it. Both windows must be checked
+    independently (r4 P2)."""
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    noise_stderr = "diagnostic noise without any marker " * 120  # >4000 chars, no marker
+    calls = []
+
+    def runner(cmd, env, cwd, timeout):
+        calls.append(list(cmd))
+        if len(calls) == 1:
+            return panel.ModelResult(
+                False, None, _AGY_INVALID_MODEL_REASON, noise_stderr[:4000])
+        return panel.ModelResult(True, "retry-findings", None)
+
+    leg = panel._run_one("agy", "W", None, 60, runner)
+    assert len(calls) == 2, "marker in reason tail alone must still trigger the retry"
+    assert leg.output == "retry-findings"
+
+
+def test_run_one_agy_no_retry_when_budget_exhausted(tmp_path, monkeypatch):
+    """When the first attempt consumed (almost) the whole leg budget, the retry
+    must be SKIPPED — max(..., 1) must not mint a fresh second past the advertised
+    limit (r4 P2). First attempt burns 59.5 of 60s → no second call."""
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    clock = {"t": 0.0}
+    monkeypatch.setattr(panel.time, "perf_counter", lambda: clock["t"])
+    calls = []
+
+    def runner(cmd, env, cwd, timeout):
+        calls.append(list(cmd))
+        clock["t"] += 59.5
+        return panel.ModelResult(False, None, _AGY_INVALID_MODEL_REASON)
+
+    leg = panel._run_one("agy", "W", None, 60, runner)
+    assert len(calls) == 1, "no usable budget left — retry must be skipped"
+    assert leg.output is None and "invalid --model" in (leg.reason or "")
+
+
+# ── #359 r5 (codex xhigh): no blind middle stderr window + single budget read ──
+
+
+def test_run_model_stderr_keeps_tail_beyond_4k():
+    """The error block sits at the END of agy's stderr (it exits right after
+    printing it). With >4KB of diagnostics before it, a head-only s[:4000] cap
+    loses BOTH markers while reason's s[-200:] starts mid-list — a deterministic
+    blind middle window (r5 P2). run_model must keep head + tail."""
+    noise = "n" * 5000
+    res = panel.run_model(
+        ["sh", "-c",
+         f"printf '%s' '{noise}' >&2; "
+         "printf '\\nError: invalid --model \"X\": model X is not recognized"
+         "\\nAvailable models:\\n  A\\n  B\\n' >&2; exit 1"],
+        {}, "/tmp", 10)
+    assert not res.ok
+    assert "invalid --model" in (res.stderr or ""), "tail of stderr must be preserved"
+
+
+def test_run_one_agy_retry_budget_measured_once(tmp_path, monkeypatch):
+    """Guard and retry-timeout must share ONE remaining-budget measurement — a
+    second clock read between them can silently shrink (or race past) the granted
+    budget (r5 P3). Clock advances 1.0s per read: with a single measurement the
+    retry gets int(60-1)=59; a second read would yield 58."""
+    monkeypatch.setattr(panel, "_AGY_STATE_DIR", tmp_path / "agystate")
+    clock = {"t": 0.0}
+
+    def fake_perf():
+        v = clock["t"]
+        clock["t"] += 1.0
+        return v
+
+    monkeypatch.setattr(panel.time, "perf_counter", fake_perf)
+    calls = []
+
+    def runner(cmd, env, cwd, timeout):
+        calls.append({"cmd": list(cmd), "timeout": timeout})
+        if len(calls) == 1:
+            return panel.ModelResult(False, None, _AGY_INVALID_MODEL_REASON)
+        return panel.ModelResult(True, "retry-findings", None)
+
+    leg = panel._run_one("agy", "W", None, 60, runner)
+    assert leg.output == "retry-findings"
+    assert calls[1]["timeout"] == 59, calls[1]
