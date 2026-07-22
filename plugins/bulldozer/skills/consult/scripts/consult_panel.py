@@ -615,7 +615,7 @@ def build_grok_cmd(wrapped: str, web: bool = False) -> tuple[list[str], dict[str
 
 # Overridable so an agy-side model rename doesn't permanently break the leg with no
 # lever (code-review C10): set BULLDOZER_AGY_MODEL to an `agy models` label.
-_AGY_MODEL = os.environ.get("BULLDOZER_AGY_MODEL") or "Gemini 3.1 Pro (High)"
+_AGY_MODEL = os.environ.get("BULLDOZER_AGY_MODEL") or "gemini-3.6-flash-high"
 
 # agy >=1.1.2 print mode HARD-FAILS when --model can't be resolved against the SERVER
 # model catalog (display labels only resolve there; the local config knows none of them).

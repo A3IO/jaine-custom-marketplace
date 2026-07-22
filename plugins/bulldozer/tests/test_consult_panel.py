@@ -300,7 +300,7 @@ def test_parse_grok_nested_field_does_not_override_top_level():
 
 
 def test_agy_cmd_informed_has_add_dir_model_and_print_timeout(tmp_path):
-    """Informed (--repo): agy reads the real code via --add-dir; a Gemini Pro model;
+    """Informed (--repo): agy reads the real code via --add-dir; a Gemini-family model;
     --print-timeout tracks the subprocess timeout. Read-only = NO
     --dangerously-skip-permissions. Real HOME (keychain auth) = env {} / no sandbox."""
     cmd, env = panel.build_agy_cmd("WRAPPED_PROMPT", repo=tmp_path, timeout=180)
@@ -308,7 +308,7 @@ def test_agy_cmd_informed_has_add_dir_model_and_print_timeout(tmp_path):
     assert cmd[1] == "-p" and cmd[2] == "WRAPPED_PROMPT"  # prompt right after -p (parse seam)
     assert "--add-dir" in cmd and str(tmp_path) in cmd
     i = cmd.index("--model")
-    assert "Gemini" in cmd[i + 1]
+    assert "gemini" in cmd[i + 1].lower()
     assert "--print-timeout" in cmd
     assert "--dangerously-skip-permissions" not in cmd  # read-only (no auto-approve)
     assert "--sandbox" not in cmd                       # --sandbox resets cwd; not used
