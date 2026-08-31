@@ -609,6 +609,51 @@ def cmd_tabs(args):
             t["id"][:12], t.get("title", "?")[:40], t.get("url", "?")[:60]))
     log("tabs", count=len(pages))
 
+def cmd_close(args):
+    """Close a tab by SEL. Opening without closing is how a browser fills up.
+
+    Why this exists: cdp.py could open tabs but not close them, so every caller had
+    to remember cleanup — and nobody did. Twelve dead tabs accumulated on one port
+    in a single day, and measurements degraded run over run, reddening on healthy
+    code. A tool that can only grow its own state makes cleanup a memory problem.
+
+    Why /json/close and NOT window.close(): window.close() on the last (or an
+    unopened-by-script) tab tears down the whole browser, taking every OTHER
+    session's tabs with it. The HTTP endpoint closes exactly one target.
+
+    Last-tab guard: closing the only remaining page ends the browser process on
+    most builds. That is almost never what a cleanup step wants, so it needs
+    --even-if-last said out loud.
+    """
+    args = list(args)
+    force_last = "--even-if-last" in args
+    if force_last:
+        args.remove("--even-if-last")
+    tabs = cdp_get("/json/list")
+    if tabs is None:
+        print("ERROR: Browser not running on CDP port " + str(CDP_PORT), file=sys.stderr)
+        return 1
+    pages = [t for t in tabs if t.get("type") == "page"]
+    tab = get_tab(args[0] if args else None)
+    if len(pages) <= 1 and not force_last:
+        print("REFUSED: {} is the only page on port {} — closing it ends the browser."
+              .format(tab["id"][:12], CDP_PORT), file=sys.stderr)
+        print("         Say --even-if-last if that is what you want.", file=sys.stderr)
+        return 1
+    if cdp_get("/json/close/" + tab["id"]) is None:
+        # /json/close answers with the bare word "Target is closing", which is not
+        # JSON — so cdp_get returns None on SUCCESS too. Settle it by looking at
+        # the tab list, i.e. by the WORLD, not by the reply.
+        pass
+    after = cdp_get("/json/list") or []
+    if any(t["id"] == tab["id"] for t in after):
+        print("ERROR: tab {} still present after close".format(tab["id"][:12]),
+              file=sys.stderr)
+        return 1
+    log("close", tab=tab["id"][:12], left=len([t for t in after if t.get("type") == "page"]))
+    return 0
+
+
 def _image_dimensions(path):
     """Read W×H from a JPEG or PNG file by parsing its header. Returns (w, h) or None.
 
@@ -2566,6 +2611,7 @@ def cmd_ax(args):
 COMMANDS = {
     "status": cmd_status,
     "tabs": cmd_tabs,
+    "close": cmd_close,
     "screenshot": cmd_screenshot,
     "js": cmd_js,
     "navigate": cmd_navigate,
