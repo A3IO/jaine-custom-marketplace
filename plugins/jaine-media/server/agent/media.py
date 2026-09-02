@@ -1,6 +1,14 @@
 """ffmpeg/ffprobe helpers for the media-processing tools (extract_frame first;
 prepare_media / fetch_media later). Pure timecode math lives here too so it can be
-tested without spawning ffmpeg."""
+tested without spawning ffmpeg.
+
+Every spawn here passes `-nostdin` (ffmpeg) and `stdin=subprocess.DEVNULL` (both
+binaries) ON PURPOSE. This runs inside an MCP **stdio** server, so a child that
+inherits our stdin reads bytes off the JSON-RPC pipe: ffmpeg treats them as its
+own keyboard input, and a stray `q` means "quit now". Measured: one such byte cut
+a 20-second clip to 8.2 seconds and ffmpeg still exited 0 — so `trim`/`compress`
+would hand back a truncated file that looks like a success by every signal we check
+(return code, output file exists). Silent corruption, no error anywhere."""
 from __future__ import annotations
 
 import math
@@ -21,7 +29,7 @@ def probe_duration(path: Path | str) -> float:
         [shutil.which("ffprobe") or "ffprobe", "-v", "error",
          "-show_entries", "format=duration",
          "-of", "default=nokey=1:noprint_wrappers=1", str(path)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
     )
     raw = out.stdout.strip()
     if out.returncode != 0 or not raw or raw == "N/A":
@@ -41,9 +49,9 @@ def extract_png(input_path: Path | str, timecode: float, output_path: Path | str
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(
-        [shutil.which("ffmpeg") or "ffmpeg", "-y", "-ss", str(timecode),
+        [shutil.which("ffmpeg") or "ffmpeg", "-nostdin", "-y", "-ss", str(timecode),
          "-i", str(input_path), "-frames:v", "1", "-q:v", "2", str(output_path)],
-        capture_output=True, timeout=60,
+        capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
     )
     return r.returncode == 0 and output_path.exists()
 
@@ -53,7 +61,7 @@ def probe_dimensions(path: Path | str) -> tuple[int, int]:
     out = subprocess.run(
         [shutil.which("ffprobe") or "ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
     )
     w, h = out.stdout.strip().split("x")
     return int(w), int(h)
@@ -87,10 +95,10 @@ def trim(input_path: Path | str, output_path: Path | str, *, start: float, end: 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(
-        [shutil.which("ffmpeg") or "ffmpeg", "-y", "-i", str(input_path),
+        [shutil.which("ffmpeg") or "ffmpeg", "-nostdin", "-y", "-i", str(input_path),
          "-ss", str(start), "-to", str(end),
          "-c:v", "libx264", "-c:a", "aac", str(output_path)],
-        capture_output=True, timeout=600,
+        capture_output=True, timeout=600, stdin=subprocess.DEVNULL,
     )
     return r.returncode == 0 and output_path.exists()
 
@@ -102,10 +110,10 @@ def compress(input_path: Path | str, output_path: Path | str, *,
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(
-        [shutil.which("ffmpeg") or "ffmpeg", "-y", "-i", str(input_path),
+        [shutil.which("ffmpeg") or "ffmpeg", "-nostdin", "-y", "-i", str(input_path),
          "-vf", f"scale=-2:{height}", "-b:v", video_bitrate,
          "-c:v", "libx264", "-c:a", "aac", str(output_path)],
-        capture_output=True, timeout=600,
+        capture_output=True, timeout=600, stdin=subprocess.DEVNULL,
     )
     return r.returncode == 0 and output_path.exists()
 
