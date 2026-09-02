@@ -38,16 +38,6 @@
       "category": "development"
     },
     {
-      "name": "ask",
-      "description": "Track and query industry experts — news aggregation, Q&A from public sources, configurable search sequences",
-      "author": {
-        "name": "JAINE",
-        "email": "jaine@local"
-      },
-      "source": "./plugins/ask",
-      "category": "research"
-    },
-    {
       "name": "swift-lsp",
       "description": "Swift/Objective-C language server (sourcekit-lsp)",
       "author": {
