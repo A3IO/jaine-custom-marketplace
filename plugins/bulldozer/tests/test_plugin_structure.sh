@@ -189,9 +189,6 @@ check_content "check SKILL.md has Feedback section" "$PLUGIN_ROOT/skills/check/S
 check_content "check SKILL.md has gh issue create" "$PLUGIN_ROOT/skills/check/SKILL.md" "gh issue create"
 check_content "look SKILL.md has Feedback section" "$PLUGIN_ROOT/skills/look/SKILL.md" "## Feedback"
 check_content "look SKILL.md has gh issue create" "$PLUGIN_ROOT/skills/look/SKILL.md" "gh issue create"
-check_content "workflow-swarms SKILL.md has Feedback section" "$PLUGIN_ROOT/skills/workflow-swarms/SKILL.md" "## Feedback"
-check_content "workflow-swarms SKILL.md has gh issue create" "$PLUGIN_ROOT/skills/workflow-swarms/SKILL.md" "gh issue create"
-check_content "workflow-swarms Feedback uses correct label" "$PLUGIN_ROOT/skills/workflow-swarms/SKILL.md" "feedback,bulldozer,workflow-swarms"
 
 echo
 echo "--- Check skill scripts ---"

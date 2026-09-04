@@ -30,7 +30,7 @@ from urllib.request import urlopen
 # ── Test-log isolation, D1 (#357) ────────────────────────────────────────────
 # MODULE level, not a fixture: conftest imports BEFORE collection imports test
 # modules, so producers that freeze their log path at import time (spec F2 —
-# cdp.py, require-workflow-skill.py, consult_panel.py) capture the redirect,
+# cdp.py, consult_panel.py) capture the redirect,
 # and every subprocess inherits it via os.environ. Restore runs via atexit,
 # which also covers the xdist controller / zero-selected / collection-error
 # paths where no fixture ever executes (spec F8).
@@ -42,9 +42,8 @@ _KNOB_TO_LOG_NAME = {
     "BULLDOZER_LOOK_LOG": "bulldozer-look.log",
     "BULLDOZER_CONSULT_LOG": "bulldozer-consult.log",
     "BULLDOZER_DRIVE_LOG": "bulldozer-drive.log",
-    "WORKFLOW_HOOK_LOG": "require-workflow-skill.log",
 }
-# Full override surface is 7 knobs (spec F1): 6 files + one DIRECTORY.
+# Full override surface is 6 knobs: 5 files + one DIRECTORY.
 LOG_ISOLATION_KNOBS = tuple(_KNOB_TO_LOG_NAME) + ("BULLDOZER_INVOKE_LOG_DIR",)
 PRODUCTION_LOG_DIR = Path.home() / ".claude" / "hooks"
 PRODUCTION_LOG_NAMES = tuple(_KNOB_TO_LOG_NAME.values())
@@ -233,10 +232,9 @@ LEAK_MARKERS = [
     str(TEST_LOG_DIR),         # this process's private redirect dir
 ]
 
-# The three producers that freeze their log path at IMPORT time (spec F2).
+# The producers that freeze their log path at IMPORT time (spec F2).
 _IMPORT_FROZEN_PRODUCERS = (
     ("skills/look/scripts/cdp.py", "LOG_FILE"),
-    ("hooks/require-workflow-skill.py", "LOG"),
     ("skills/consult/scripts/consult_panel.py", "CONSULT_LOG"),
 )
 

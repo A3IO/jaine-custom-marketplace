@@ -710,7 +710,7 @@ class TestFeedbackRecipeConvention:
     Feedback section at all — i.e. the headline example of the issue was itself the gap.
     """
 
-    SKILLS = ["check", "look", "drive", "consult", "workflow-swarms"]
+    SKILLS = ["check", "look", "drive", "consult"]
 
     def _skill(self, name):
         return (PLUGIN_ROOT / "skills" / name / "SKILL.md").read_text()
@@ -800,7 +800,7 @@ class TestReadmeLogFormat:
     be built against, so it has to be true."""
 
     LOGS = ["bulldozer.log", "bulldozer-codex.log", "bulldozer-consult.log",
-            "bulldozer-look.log", "bulldozer-drive.log", "require-workflow-skill.log"]
+            "bulldozer-look.log", "bulldozer-drive.log"]
 
     def _readme(self):
         return (PLUGIN_ROOT / "README.md").read_text()

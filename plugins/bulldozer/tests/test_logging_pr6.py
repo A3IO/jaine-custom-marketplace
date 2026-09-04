@@ -1,6 +1,5 @@
-"""#322 PR6 (tails): D2 redaction (cdp.py js/url values), D4/F6/C5 (require-
-workflow-skill.log → shared pipe-KV helper, project=/session=, all fail-open
-paths logged), D7 (pivot exit-10 + E1 audit-effectiveness durable lines).
+"""#322 PR6 (tails): D2 redaction (cdp.py js/url values), D7 (pivot exit-10 +
+E1 audit-effectiveness durable lines).
 
 Behavioral, subprocess-based where a writer exists; unit-level for the pure
 redaction helpers (loaded from cdp.py via importlib — test_e2e.py convention).
@@ -18,7 +17,6 @@ from conftest import test_env
 
 PLUGIN_ROOT = Path(__file__).parent.parent
 CDP_SCRIPT = PLUGIN_ROOT / "skills" / "look" / "scripts" / "cdp.py"
-HOOK = PLUGIN_ROOT / "hooks" / "require-workflow-skill.py"
 VERIFY_AUDIT = PLUGIN_ROOT / "skills" / "check" / "scripts" / "verify-audit-findings.py"
 
 
@@ -161,96 +159,6 @@ class TestNoVerbatimValuesInLogCalls:
         # redacted twin (what_log), while stdout keeps the readable original
         src = CDP_SCRIPT.read_text()
         assert "what=what_log" in src
-
-
-# ── D4 + F6 + C5: require-workflow-skill.log on the shared helper ──
-
-
-FANOUT_NO_ROUTING = (
-    'await parallel(items.map(i => () => agent(i, {schema: S})));'
-)
-
-
-def run_hook(stdin_text, log_path, extra_env=None):
-    env = test_env()
-    env.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
-    env.pop("BULLDOZER_ENFORCE_WORKFLOW_ROUTING", None)
-    env["WORKFLOW_HOOK_LOG"] = str(log_path)
-    env["CLAUDE_CODE_SESSION_ID"] = "cafebabe99"
-    if extra_env:
-        env.update(extra_env)
-    return subprocess.run(
-        [sys.executable, str(HOOK)], input=stdin_text,
-        capture_output=True, text=True, timeout=10, env=env,
-    )
-
-
-def wf_payload(script, cwd):
-    return json.dumps(
-        {"tool_name": "Workflow", "tool_input": {"script": script}, "cwd": str(cwd)})
-
-
-def hook_lines(log_path):
-    p = Path(log_path)
-    return p.read_text().splitlines() if p.exists() else []
-
-
-class TestWorkflowHookLogGrammar:
-    def test_decision_line_pipe_grammar_session_project(self, tmp_path):
-        log = tmp_path / "wf.log"
-        r = run_hook(wf_payload(FANOUT_NO_ROUTING, tmp_path), log)
-        assert r.returncode == 0, r.stderr
-        (line,) = hook_lines(log)
-        assert " | event=decision | " in line
-        assert " | session=cafebabe | " in line
-        assert " | decision=ADVISORY | " in line
-        assert " | fanout=1 | " in line
-        assert " | project={} | ".format(tmp_path) in line + " | "
-        # C5 resolved: pipe-KV, not YAML records
-        assert not line.startswith("---")
-        assert "timestamp:" not in line
-
-    def test_deny_decision_logged_and_emitted(self, tmp_path):
-        log = tmp_path / "wf.log"
-        r = run_hook(wf_payload(FANOUT_NO_ROUTING, tmp_path), log,
-                     extra_env={"BULLDOZER_ENFORCE_WORKFLOW_ROUTING": "1"})
-        assert r.returncode == 0, r.stderr
-        assert '"permissionDecision": "deny"' in r.stdout
-        (line,) = hook_lines(log)
-        assert " | decision=DENY | " in line
-
-    def test_parse_error_logged(self, tmp_path):
-        # D4: unparseable stdin used to return with NO line, falsifying the
-        # docstring's "each fail-open path logs a DISTINCT decision"
-        log = tmp_path / "wf.log"
-        r = run_hook("not json{{{", log)
-        assert r.returncode == 0, r.stderr
-        assert r.stdout.strip() == ""  # behavior unchanged: silent allow
-        (line,) = hook_lines(log)
-        assert " | decision=ALLOW_PARSE_ERROR | " in line
-
-    def test_not_workflow_logged(self, tmp_path):
-        # D4: the tool_name mismatch branch is dead under the hooks.json
-        # matcher — a line here means a misrouted registration, worth seeing
-        log = tmp_path / "wf.log"
-        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
-        r = run_hook(payload, log)
-        assert r.returncode == 0, r.stderr
-        assert r.stdout.strip() == ""
-        (line,) = hook_lines(log)
-        assert " | decision=SKIP_NOT_WORKFLOW | " in line
-
-    def test_unreadable_scriptpath_still_distinct(self, tmp_path):
-        log = tmp_path / "wf.log"
-        payload = json.dumps({
-            "tool_name": "Workflow",
-            "tool_input": {"scriptPath": str(tmp_path / "missing.js")},
-            "cwd": str(tmp_path),
-        })
-        r = run_hook(payload, log)
-        assert r.returncode == 0, r.stderr
-        (line,) = hook_lines(log)
-        assert " | decision=ALLOW_UNREADABLE | " in line
 
 
 # ── D7: pivot (exit 10) durable line ──

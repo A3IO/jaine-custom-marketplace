@@ -29,14 +29,13 @@ from conftest import (
 
 PLUGIN_ROOT = Path(__file__).parent.parent
 
-# The full env-override surface producers honor (spec §3 F1): 6 file knobs + 1 dir.
+# The full env-override surface producers honor: 5 file knobs + 1 dir.
 LOG_KNOBS = (
     "BULLDOZER_LOG",
     "BULLDOZER_CODEX_LOG",
     "BULLDOZER_LOOK_LOG",
     "BULLDOZER_CONSULT_LOG",
     "BULLDOZER_DRIVE_LOG",
-    "WORKFLOW_HOOK_LOG",
     "BULLDOZER_INVOKE_LOG_DIR",
 )
 
@@ -141,7 +140,7 @@ def test_t1_ignores_fresh_foreign_line(tmp_path):
 
 def test_t1_empty_dir_passes(tmp_path):
     baselines = {n: None for n in (
-        "bulldozer.log", "bulldozer-codex.log", "require-workflow-skill.log")}
+        "bulldozer.log", "bulldozer-codex.log", "bulldozer-look.log")}
     assert scan_for_leaks(tmp_path, SENTINEL, time.time(), baselines, []) == []
 
 
@@ -338,7 +337,7 @@ def test_t5_start_assert_names_repointed_knob(monkeypatch):
 
 def test_r11f1_engine_child_env_forwards_log_knobs():
     """R11-F1 (spec §2 amendment): the engine's fail-closed child-env allowlist
-    forwards the 7 BULLDOZER_* knobs WHEN PRESENT — without this, a codex
+    forwards the 6 BULLDOZER_* knobs WHEN PRESENT — without this, a codex
     descendant loses the redirect and a stable-log producer it runs falls back
     to the real $HOME. The fail-closed property must stay intact (secrets still
     dropped), and absent knobs must not be invented."""

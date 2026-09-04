@@ -1043,7 +1043,7 @@ _CHILD_ENV_ALLOW_EXACT = frozenset({
     # still get shell_environment_policy inherit=core — the residual there is
     # covered by codex's own sandbox: no test runs danger-full-access.)
     "BULLDOZER_LOG", "BULLDOZER_CODEX_LOG", "BULLDOZER_LOOK_LOG",
-    "BULLDOZER_CONSULT_LOG", "BULLDOZER_DRIVE_LOG", "WORKFLOW_HOOK_LOG",
+    "BULLDOZER_CONSULT_LOG", "BULLDOZER_DRIVE_LOG",
     "BULLDOZER_INVOKE_LOG_DIR",
 })
 _CHILD_ENV_ALLOW_PREFIX = ("LC_",)

@@ -244,7 +244,6 @@ wiped on every update):
 | `bulldozer-consult.log` | consult + panel legs | per-leg outcomes, resolved model ids |
 | `bulldozer-look.log` | `cdp.py` | per-command outcomes (`port=`, `target=`; URLs and JS are **redacted** — origin+path only, `expr_sha=` for JS) |
 | `bulldozer-drive.log` | drive lanes | lane lifecycle, cookie-seed audit, tripped circuit-breakers |
-| `require-workflow-skill.log` | the Workflow guardrail hook | routing decisions (`project=`, `session=`) |
 
 **Redaction — honest scope (#334).** Three channels URL-redact, each with its own
 boundary; do NOT read this as "no secrets in the logs":
@@ -274,8 +273,7 @@ Full grammar + rationale: `docs/superpowers/specs/2026-07-11-bulldozer-log-gramm
 > **Note (2026-07-12, upd. #334):** no log miner or HTML report exists in this repo yet.
 > This section is the contract to build one against — not a description of an existing
 > consumer. Legacy shapes persist in history per the per-producer cutovers above;
-> `require-workflow-skill.log` additionally has a YAML-era prefix. A miner must tolerate
-> all of them, or start at its channel's cutover.
+> a miner must tolerate all of them, or start at its channel's cutover.
 
 ## How It Works
 
