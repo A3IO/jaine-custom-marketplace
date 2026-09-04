@@ -2492,22 +2492,23 @@ def test_run_one_agy_retry_survives_closed_stderr(tmp_path, monkeypatch):
         "agy", "W", None, 60, _scripted_agy_runner(calls, _AGY_INVALID_MODEL_REASON))
     assert len(calls) == 2, "broken stderr must not disable the retry"
     assert leg.output == "retry-findings" and leg.reason is None
-# ── grok model/effort pin (2026-07-21): grok CLI 0.2.107 grew -m / --reasoning-effort ──
+# ── grok model/effort pin (upd. 2026-09-04: grok-4.5 → grok-4.6) ──
 
 
 def test_grok_cmd_pins_model_and_high_effort():
-    """The grok leg pins -m grok-4.5 + --reasoning-effort high (verified live on
-    grok 0.2.107: modelUsage shows grok-4.5-build, effort enum = high|medium|low).
-    A CLI default change must not silently move the leg off the pinned model."""
+    """The grok leg pins -m grok-4.6 + --reasoning-effort high (verified live
+    2026-09-04 on grok 1.0.17: modelUsage shows grok-4.6-build, reasoning_tokens
+    non-zero at effort high). A CLI default change must not silently move the leg
+    off the pinned model."""
     cmd, env = panel.build_grok_cmd("W")
-    assert cmd[cmd.index("-m") + 1] == "grok-4.5"
+    assert cmd[cmd.index("-m") + 1] == "grok-4.6"
     assert cmd[cmd.index("--reasoning-effort") + 1] == "high"
     assert env == {}
 
 
 def test_grok_cmd_web_mode_keeps_pin():
     cmd, _ = panel.build_grok_cmd("W", web=True)
-    assert cmd[cmd.index("-m") + 1] == "grok-4.5"
+    assert cmd[cmd.index("-m") + 1] == "grok-4.6"
     assert cmd[cmd.index("--reasoning-effort") + 1] == "high"
 
 
@@ -2526,7 +2527,7 @@ def test_completion_line_carries_grok_model_and_effort():
     line, like agy_model=/codex_effort= already are."""
     panel.run_panel("Q", runner=_make_fake_runner([]))
     line = panel.CONSULT_LOG.read_text().splitlines()[0]
-    assert "grok_model=grok-4.5" in line, line
+    assert "grok_model=grok-4.6" in line, line
     assert "grok_effort=high" in line, line
 
 

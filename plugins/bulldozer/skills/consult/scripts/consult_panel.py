@@ -585,14 +585,15 @@ def build_codex_cmd(wrapped: str, effort: str = "medium", web: bool = False) -> 
     return cmd
 
 
-# grok CLI 0.2.107 grew -m/--reasoning-effort (verified live 2026-07-21: -m grok-4.5
-# resolves — modelUsage shows grok-4.5-build; effort enum = high|medium|low). Pinned so
+# grok CLI 0.2.107 grew -m/--reasoning-effort. Pin moved 4.5 → 4.6 on 2026-09-04
+# (verified live on grok 1.0.17: -m grok-4.6 resolves — modelUsage shows
+# grok-4.6-build, reasoning_tokens non-zero at effort high). Pinned so
 # a CLI default change never silently moves the leg; same override lever as _AGY_MODEL
 # (C10) — an xai-side rename gets an env fix, not a code change. A bad value fails loud
 # (grok's own enum/id error) → the leg degrades per the panel contract. REQUIRES grok
 # CLI >= 0.2.107 (older CLIs reject the flags with an instant parse error — the leg
 # fails loud with a self-describing reason; upgrade grok, r4 P2 documented requirement).
-_GROK_MODEL = os.environ.get("BULLDOZER_GROK_MODEL") or "grok-4.5"
+_GROK_MODEL = os.environ.get("BULLDOZER_GROK_MODEL") or "grok-4.6"
 _GROK_EFFORT = os.environ.get("BULLDOZER_GROK_EFFORT") or "high"
 
 
