@@ -157,6 +157,9 @@ LAUNCH="$BULLDOZER_DIR/skills/look/scripts/launch.sh"
 # Status & tabs
 python3 "$CDP" status                    # ONLINE/OFFLINE + channel info
 python3 "$CDP" tabs                      # list all tabs
+python3 "$CDP" close [SEL] [--even-if-last]  # close a tab (SEL, else the --target pin)
+  # Opening without closing is how a lane fills up and measurements rot. Refuses the
+  # LAST page unless --even-if-last — closing it ends the browser.
 
 # Navigation
 python3 "$CDP" navigate URL              # go to URL

@@ -491,7 +491,7 @@ def test_all_commands_registered():
         "title", "html", "reload", "wait", "assert", "click", "fill",
         "console", "network", "pdf", "viewport", "window",
         "normalize-url",
-        "ax", "hover", "key", "drag",
+        "ax", "hover", "key", "drag", "close",
     }
     source = Path(CDP_SCRIPT).read_text()
     for cmd in expected:
@@ -1947,21 +1947,64 @@ def test_cmd_title_pins_target_tab():
         "cmd_title must use the pinned tab's ws_url, got {!r}".format(seen.get("ws_url"))
 
 
+def test_close_function_exists_and_registered():
+    """bbb4d57 shipped `close` with none of the four mandated artifacts. This is
+    artifact 2 (function exists + registered); artifact 3 lives in test_e2e.py."""
+    source = Path(CDP_SCRIPT).read_text()
+    assert "def cmd_close(" in source, "cmd_close not defined"
+    assert '"close": cmd_close' in source, "close not wired into COMMANDS"
+
+
+def test_close_falls_back_to_pinned_tab_not_first_page():
+    """`close` without a positional SEL must close the PINNED tab, never `pages[0]`.
+
+    The one command where drifting to an implicit tab is destructive rather than
+    merely wrong: it closes a tab the caller never named. Reads the AST rather
+    than the text so a comment mentioning TARGET cannot satisfy it."""
+    import ast as _ast
+    tree = _ast.parse(Path(CDP_SCRIPT).read_text())
+    fn = next(n for n in _ast.walk(tree)
+              if isinstance(n, _ast.FunctionDef) and n.name == "cmd_close")
+    calls = [n for n in _ast.walk(fn)
+             if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+             and n.func.id == "get_tab"]
+    assert calls, "cmd_close no longer resolves a tab — did the command change?"
+    for c in calls:
+        assert c.args and _resolves_to_target(c.args[0]), (
+            "cmd_close resolves a tab that can fall back to an implicit page "
+            "(@L{})".format(c.lineno))
+
+
+def _resolves_to_target(arg):
+    """True when `arg` can only ever resolve to the pinned tab or an explicit
+    caller selector — never to an implicit one. `TARGET`, or an if-expression
+    whose fallback is `TARGET`. A bare None/literal is neither."""
+    if isinstance(arg, ast.Name) and arg.id == "TARGET":
+        return True
+    if isinstance(arg, ast.IfExp):
+        return _resolves_to_target(arg.orelse)
+    return False
+
+
 def test_no_unpinned_tab_resolution():
-    """C-acceptance: every get_tab( CALL passes the global TARGET selector, and every
-    cdp_js( CALL threads an explicit ws_url — no cmd_* resolves a tab without the pin.
-    Arity alone is too weak: get_tab(None) or get_tab(<literal>) would satisfy a count
-    check yet still drift to the wrong tab (R1-F1), so get_tab must be called with the
-    Name `TARGET`. AST-based (not text) so a comment can't self-defeat it."""
+    """C-acceptance: no cmd_* resolves a tab without the pin, and every cdp_js( CALL
+    threads an explicit ws_url. Arity alone is too weak: get_tab(None) or
+    get_tab(<literal>) would satisfy a count check yet still drift to the wrong tab
+    (R1-F1). AST-based (not text) so a comment can't self-defeat it.
+
+    Accepted shapes are the ones that CANNOT drift: the Name `TARGET`, or a
+    conditional whose fallback is `TARGET` (`get_tab(sel if sel else TARGET)` —
+    a caller-supplied selector is explicit targeting, the opposite of drift; what
+    the guard forbids is falling back to an IMPLICIT tab). `cmd_close` is the one
+    caller with its own positional SEL, and its `else None` was exactly the hole
+    this test caught after bbb4d57."""
     source = Path(CDP_SCRIPT).read_text()
     tree = ast.parse(source)
     offenders = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id == "get_tab":
-                pinned = (len(node.args) >= 1
-                          and isinstance(node.args[0], ast.Name)
-                          and node.args[0].id == "TARGET")
+                pinned = len(node.args) >= 1 and _resolves_to_target(node.args[0])
                 if not pinned:
                     offenders.append("get_tab() not threaded with TARGET @L{}".format(node.lineno))
             if node.func.id == "cdp_js" and (len(node.args) + len(node.keywords)) < 2:

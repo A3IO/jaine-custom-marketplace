@@ -634,7 +634,9 @@ def cmd_close(args):
         print("ERROR: Browser not running on CDP port " + str(CDP_PORT), file=sys.stderr)
         return 1
     pages = [t for t in tabs if t.get("type") == "page"]
-    tab = get_tab(args[0] if args else None)
+    # No positional SEL → the GLOBAL pin, never an implicit first page: `close`
+    # is the one command where drifting to an unnamed tab destroys it (R1-F1).
+    tab = get_tab(args[0] if args else TARGET)
     if len(pages) <= 1 and not force_last:
         print("REFUSED: {} is the only page on port {} — closing it ends the browser."
               .format(tab["id"][:12], CDP_PORT), file=sys.stderr)

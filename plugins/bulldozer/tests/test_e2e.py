@@ -59,6 +59,35 @@ def test_open_creates_new_tab(jaine_browser, test_server):
     assert after_count > before_count, "Tab count did not increase"
 
 
+def test_close_removes_the_tab_it_opened(jaine_browser, test_server):
+    """Mandated artifact 3 for `close`, missing since bbb4d57.
+
+    Settles success by the WORLD, not by the reply: /json/close answers with the
+    bare word "Target is closing", which is not JSON — so a caller reading the
+    response cannot tell success from failure. The tab list can.
+
+    Closes only the tab this test opened, by its own id, so it can never take a
+    tab that belongs to someone else on the shared 9333 browser."""
+    url = "http://localhost:{}/test-page.html".format(test_server)
+    r = run_cdp(["open", url])
+    assert r.returncode == 0, "open failed: {}".format(r.stderr)
+    tab_id = r.stdout.strip().rsplit(" ", 1)[-1]
+    assert len(tab_id) == 12, "could not parse tab id from {!r}".format(r.stdout)
+
+    assert tab_id in run_cdp(["tabs"]).stdout, "opened tab absent from the list"
+
+    r = run_cdp(["close", tab_id])
+    assert r.returncode == 0, "close failed: {}".format(r.stderr)
+    assert tab_id not in run_cdp(["tabs"]).stdout, "tab survived close"
+
+
+def test_close_rejects_an_unknown_selector(jaine_browser):
+    """A selector matching nothing must fail loud, not silently close something else."""
+    r = run_cdp(["close", "definitely-not-a-tab-id-9f3c"])
+    assert r.returncode != 0, "close accepted a selector that matches no tab"
+    assert "matched no tab" in r.stderr, r.stderr
+
+
 def test_reload_succeeds(test_page_url):
     r = run_cdp(["reload"])
     assert r.returncode == 0, "reload failed: {}".format(r.stderr)
